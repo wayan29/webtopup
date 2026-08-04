@@ -94,8 +94,10 @@ temp/
 *.mov
 *.m4v
 
-# Runtime uploaded user/media content
-uploads/
+# Runtime uploaded user/media content (do NOT use a bare "uploads/" rule:
+# that also ignores the Rust source module rust-api/src/routes/uploads/).
+/uploads/
+/server/uploads/
 
 # Keep screenshots and ad-hoc captures out of the repo root.
 /*.png
