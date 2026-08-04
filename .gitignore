@@ -1,0 +1,120 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build outputs
+dist/
+build/
+dist-ssr/
+rust-api/target/
+
+# Environment variables and generated local verification state
+.dev-verification/
+.env
+.env.*
+!.env.example
+!.env.*.example
+server/.env
+
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Editor directories and files
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+*.sublime-workspace
+*.sublime-project
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Testing / QA artifacts
+coverage/
+.nyc_output/
+tests/*
+!tests/e2e/
+tests/e2e/*
+!tests/e2e/admin-notifications.spec.ts
+test-results/
+playwright-report/
+playwright/.auth/
+playwright.config.ts
+!tools/dev-verification/playwright.config.ts
+server/src/**/*.test.ts
+server/src/**/*.spec.ts
+client/src/**/*.test.tsx
+client/src/**/*.spec.tsx
+scripts/smoke/
+
+# Misc
+*.local
+*.pem
+.cache/
+.worktrees/
+
+# TypeScript
+*.tsbuildinfo
+
+# Optional npm cache directory
+.npm
+
+# Optional eslint cache
+.eslintcache
+
+# Debug files
+*.log
+debug.log*
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Local media captures / recordings
+*.webm
+*.mp4
+*.mov
+*.m4v
+
+# Runtime uploaded user/media content
+uploads/
+
+# Keep screenshots and ad-hoc captures out of the repo root.
+/*.png
+
+# Playwright auth state
+playwright/.auth/
+
+# Local AI / coding-agent tooling and session artifacts (never publish)
+.agents/
+.codex/
+.cursor/
+.pi/
+.pi-subagents/
+.pi-task-reports/
+.superpowers/
+CLAUDE.md
+AGENTS.md
+.claude/
+skills/
+docs/ai/
+docs/superpowers/
+server/.tmp-correlation-*/

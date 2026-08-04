@@ -1,0 +1,120 @@
+name: API v2 mutation smoke
+
+on:
+  workflow_dispatch:
+
+jobs:
+  mutation-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ ping: 1 })'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      API_BASE_URL: http://127.0.0.1:9005
+      API_V2_DIRECT_URL: http://127.0.0.1:9010
+      API_V2_UPSTREAM_URL: http://127.0.0.1:9010
+      API_V2_PROXY_SECRET: ci-api-v2-proxy-secret
+      JWT_SECRET: ci-jwt-secret
+      MONGO_URI: mongodb://127.0.0.1:27017/webtopup_ci
+      MONGO_DB: webtopup_ci
+      SMOKE_MONGO_URI: mongodb://127.0.0.1:27017/webtopup_ci
+      SMOKE_MONGO_DB: webtopup_ci
+      SMOKE_EMAIL: api-v2-ci-admin@example.com
+      SMOKE_PASSWORD: ApiV2CiAdmin2909!
+      SMOKE_MEMBER_EMAIL: api-v2-member-smoke@example.com
+      SMOKE_MEMBER_PASSWORD: ApiV2MemberSmoke2909!
+      PROVIDER_MODE: sandbox
+      PROVIDER_SANDBOX_DIGIFLAZZ_BASE_URL: http://127.0.0.1:9020
+      PROVIDER_SANDBOX_TOKOVOUCHER_BASE_URL: http://127.0.0.1:9020
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install server dependencies
+        working-directory: server
+        run: npm ci
+
+      - name: Install client dependencies
+        working-directory: client
+        run: npm ci
+
+      - name: Build services
+        run: npm run api-v2:build && npm run build
+
+      - name: Seed smoke fixtures
+        run: npm run api-v2:seed:ci
+
+      - name: Start Rust API
+        run: >-
+          setsid ./rust-api/target/debug/webtopup-rust-api
+          >/tmp/webtopup-rust-api.log 2>&1 < /dev/null &
+        env:
+          PORT: 9010
+
+      - name: Start Node gateway
+        run: >-
+          setsid node server/dist/index.js
+          >/tmp/webtopup-node-gateway.log 2>&1 < /dev/null &
+        env:
+          PORT: 9005
+          NODE_ENV: test
+
+      - name: Wait for services
+        run: |
+          for url in http://127.0.0.1:9010/health http://127.0.0.1:9005/api/v2/health; do
+            for attempt in {1..30}; do
+              if node -e "fetch(process.argv[1]).then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))" "$url"; then
+                break
+              fi
+              if [ "$attempt" = "30" ]; then
+                echo "Timed out waiting for $url"
+                exit 1
+              fi
+              sleep 1
+            done
+          done
+
+      - name: Run guarded mutation smoke
+        run: npm run api-v2:verify:local:mutations
+        env:
+          SMOKE_REPORT_PATH: /tmp/api-v2-mutation-smoke-report.json
+
+      - name: Write smoke summary
+        if: always()
+        run: node scripts/smoke/write-smoke-step-summary.js /tmp/api-v2-mutation-smoke-report.json
+
+      - name: Upload smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-v2-mutation-smoke-evidence-${{ github.sha }}
+          path: |
+            /tmp/api-v2-mutation-smoke-report.json
+            /tmp/webtopup-rust-api.log
+            /tmp/webtopup-node-gateway.log
+          if-no-files-found: ignore
+
+      - name: Print service logs on failure
+        if: failure()
+        run: |
+          printf '%s\n' '--- Rust API log ---'
+          test -f /tmp/webtopup-rust-api.log && tail -n 200 /tmp/webtopup-rust-api.log || true
+          printf '%s\n' '--- Node gateway log ---'
+          test -f /tmp/webtopup-node-gateway.log && tail -n 200 /tmp/webtopup-node-gateway.log || true

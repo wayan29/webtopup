@@ -1,0 +1,45 @@
+name: API v2 build check
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install root dependencies
+        run: npm ci
+
+      - name: Install server dependencies
+        working-directory: server
+        run: npm ci
+
+      - name: Install client dependencies
+        working-directory: client
+        run: npm ci
+
+      - name: Check Rust API v2
+        run: npm run api-v2:check
+
+      - name: Check whitespace
+        run: git diff --check
+
+      - name: Check API v2 gateway route order
+        run: npm run api-v2:gateway-order:check
+
+      - name: Build client and server
+        run: npm run build

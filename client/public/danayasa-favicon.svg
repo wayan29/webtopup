@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title description">
+  <title id="title">Danayasa</title>
+  <desc id="description">Huruf D, tanda identitas Danayasa</desc>
+  <rect width="64" height="64" rx="16" fill="#7c3aed"/>
+  <path fill="#ffffff" d="M17 13h15c12.2 0 22 7.7 22 19s-9.8 19-22 19H17V13Zm12 10v18h3c6.2 0 10.5-3.1 10.5-9S38.2 23 32 23h-3Z"/>
+</svg>

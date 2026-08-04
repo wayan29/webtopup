@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 72" role="img" aria-labelledby="title description">
+  <title id="title">Danayasa</title>
+  <desc id="description">Logo Danayasa dengan tanda D</desc>
+  <rect x="4" y="4" width="64" height="64" rx="18" fill="#7c3aed"/>
+  <path fill="#ffffff" d="M20 17h15c12.2 0 22 7.7 22 19s-9.8 19-22 19H20V17Zm12 10v18h3c6.2 0 10.5-3.1 10.5-9S41.2 27 35 27h-3Z"/>
+  <text x="82" y="47" fill="#111827" font-family="Arial, sans-serif" font-size="36" font-weight="700">Danayasa</text>
+</svg>

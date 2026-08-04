@@ -1,0 +1,46 @@
+[package]
+name = "webtopup-rust-api"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "ensure_product_id_integrity"
+path = "src/bin/ensure_product_id_integrity.rs"
+
+[[bin]]
+name = "ensure_staff_2fa_deadlines"
+path = "src/bin/ensure_staff_2fa_deadlines.rs"
+
+[dependencies]
+ammonia = "=4.1.2"
+base64 = "=0.22.1"
+chacha20poly1305 = "=0.10.1"
+zeroize = "=1.8.1"
+anyhow = "1.0"
+axum = { version = "0.8", features = ["multipart"] }
+bcrypt = "0.16"
+chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
+url = "2.5.4"
+dotenvy = "0.15"
+futures-util = "0.3"
+jsonwebtoken = "9.3"
+md5 = "0.7"
+hmac = "0.12"
+mongodb = "3.4"
+rand = "0.8"
+regex = "1.11"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha1 = "0.10"
+sha2 = "=0.10.9"
+subtle = "=2.6.1"
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+opentelemetry = "0.32.0"
+opentelemetry_sdk = "0.32.0"
+opentelemetry-otlp = "0.32.0"
+tracing-opentelemetry = "0.33.0"

@@ -1,0 +1,56 @@
+name: webtopup-task14-dev
+services:
+  mongo:
+    image: mongo:7
+    network_mode: host
+    command: ["mongod", "--replSet", "rs0", "--port", "27018", "--bind_ip", "127.0.0.1"]
+    restart: unless-stopped
+    volumes:
+      - mongo-data:/data/db
+      - ./infra/dev-verification/mongo-healthcheck.js:/opt/dev-verification/mongo-healthcheck.js:ro
+    healthcheck:
+      test: ["CMD", "mongosh", "mongodb://127.0.0.1:27018/admin?directConnection=true", "--quiet", "--file", "/opt/dev-verification/mongo-healthcheck.js"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 5s
+
+  mongo-init:
+    image: mongo:7
+    network_mode: host
+    depends_on:
+      mongo:
+        condition: service_started
+    restart: "no"
+    entrypoint: ["bash", "-ec"]
+    command:
+      - |
+        uri='mongodb://127.0.0.1:27018/admin?directConnection=true'
+        until mongosh "$${uri}" --quiet --eval 'db.adminCommand({ping:1}).ok' | grep -q 1; do sleep 1; done
+        mongosh "$${uri}" --quiet --eval '
+          try { rs.status().ok }
+          catch (error) {
+            if (error.codeName === "NotYetInitialized") {
+              rs.initiate({_id:"rs0",members:[{_id:0,host:"127.0.0.1:27018"}]})
+            } else { throw error }
+          }'
+        until mongosh "$${uri}" --quiet --eval 'db.hello().isWritablePrimary' | grep -q true; do sleep 1; done
+
+  caddy:
+    image: caddy:2
+    network_mode: host
+    depends_on:
+      mongo:
+        condition: service_healthy
+      mongo-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    environment:
+      DEV_VERIFY_NODE_PORT: "${DEV_VERIFY_NODE_PORT:-19005}"
+      DEV_VERIFY_VITE_PORT: "${DEV_VERIFY_VITE_PORT:-19006}"
+    volumes:
+      - ./infra/dev-verification/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./.dev-verification/certs:/certs:ro
+
+volumes:
+  mongo-data:

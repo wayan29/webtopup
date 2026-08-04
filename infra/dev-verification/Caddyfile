@@ -1,0 +1,20 @@
+{
+  auto_https off
+  log {
+    output stdout
+    format json
+  }
+}
+
+https://webtopup.local.test:9443 {
+  tls /certs/webtopup.local.test.pem /certs/webtopup.local.test-key.pem
+
+  @node path /api/* /auth/* /uploads/* /health*
+  reverse_proxy @node 127.0.0.1:{$DEV_VERIFY_NODE_PORT} {
+    header_up X-Forwarded-Proto https
+  }
+
+  reverse_proxy 127.0.0.1:{$DEV_VERIFY_VITE_PORT} {
+    header_up X-Forwarded-Proto https
+  }
+}

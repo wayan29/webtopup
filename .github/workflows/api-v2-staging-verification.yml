@@ -1,0 +1,105 @@
+name: API v2 staging verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_mutation_smoke:
+        description: Run mutation smoke against staging
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      run_provider_smoke:
+        description: Run provider readiness smoke against staging sandbox
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      run_transaction_dry_run:
+        description: Run guarded transaction-create dry run
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      API_BASE_URL: ${{ secrets.STAGING_API_BASE_URL }}
+      API_V2_DIRECT_URL: ${{ secrets.STAGING_API_V2_DIRECT_URL }}
+      SMOKE_EMAIL: ${{ secrets.STAGING_SMOKE_EMAIL }}
+      SMOKE_PASSWORD: ${{ secrets.STAGING_SMOKE_PASSWORD }}
+      SMOKE_MEMBER_EMAIL: ${{ secrets.STAGING_SMOKE_MEMBER_EMAIL }}
+      SMOKE_MEMBER_PASSWORD: ${{ secrets.STAGING_SMOKE_MEMBER_PASSWORD }}
+      MONGO_URI: ${{ secrets.STAGING_MONGO_URI }}
+      MONGO_DB: ${{ secrets.STAGING_MONGO_DB }}
+      SMOKE_MONGO_URI: ${{ secrets.STAGING_MONGO_URI }}
+      SMOKE_MONGO_DB: ${{ secrets.STAGING_MONGO_DB }}
+      RUN_API_V2_MUTATION_SMOKE: ${{ inputs.run_mutation_smoke == 'true' && '1' || '' }}
+      RUN_PROVIDER_SMOKE: ${{ inputs.run_provider_smoke == 'true' && '1' || '' }}
+      PROVIDER_MODE: sandbox
+      CONFIRM_PROVIDER_BACKEND_SANDBOX: ${{ inputs.run_provider_smoke == 'true' && '1' || '' }}
+      CONFIRM_GAME_VALIDATION_SANDBOX: ${{ inputs.run_provider_smoke == 'true' && '1' || '' }}
+      PROVIDER_SANDBOX_DIGIFLAZZ_BASE_URL: ${{ secrets.STAGING_PROVIDER_SANDBOX_DIGIFLAZZ_BASE_URL }}
+      PROVIDER_SANDBOX_TOKOVOUCHER_BASE_URL: ${{ secrets.STAGING_PROVIDER_SANDBOX_TOKOVOUCHER_BASE_URL }}
+      GAME_VALIDATION_CODASHOP_BASE_URL: ${{ secrets.STAGING_GAME_VALIDATION_CODASHOP_BASE_URL }}
+      GAME_VALIDATION_GOPAY_BASE_URL: ${{ secrets.STAGING_GAME_VALIDATION_GOPAY_BASE_URL }}
+      RUN_TRANSACTION_CREATE_DRY_RUN: ${{ inputs.run_transaction_dry_run == 'true' && '1' || '' }}
+      CONFIRM_TRANSACTION_CREATE_DRY_RUN_BALANCE_CHANGE: ${{ inputs.run_transaction_dry_run == 'true' && '1' || '' }}
+      DRY_RUN_MEMBER_EMAIL: ${{ secrets.STAGING_DRY_RUN_MEMBER_EMAIL }}
+      DRY_RUN_MEMBER_PASSWORD: ${{ secrets.STAGING_DRY_RUN_MEMBER_PASSWORD }}
+      DRY_RUN_ADMIN_EMAIL: ${{ secrets.STAGING_DRY_RUN_ADMIN_EMAIL }}
+      DRY_RUN_ADMIN_PASSWORD: ${{ secrets.STAGING_DRY_RUN_ADMIN_PASSWORD }}
+      DRY_RUN_PRODUCT_CODE: ${{ secrets.STAGING_DRY_RUN_PRODUCT_CODE }}
+      DRY_RUN_TARGET: ${{ secrets.STAGING_DRY_RUN_TARGET }}
+      DRY_RUN_SERVER_ID: ${{ secrets.STAGING_DRY_RUN_SERVER_ID }}
+      DRY_RUN_OUTPUT_PATH: /tmp/webtopup-staging-transaction-create-dry-run.json
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: npm run install:all
+
+      - name: Build client and server
+        run: npm run build
+
+      - name: Check Rust API
+        run: npm run api-v2:check
+
+      - name: Run staging read smoke
+        run: npm run staging:smoke
+
+      - name: Run staging mutation smoke
+        if: ${{ inputs.run_mutation_smoke == 'true' }}
+        run: npm run staging:smoke:mutations
+
+      - name: Run staging provider readiness smoke
+        if: ${{ inputs.run_provider_smoke == 'true' }}
+        run: npm run staging:smoke:providers
+
+      - name: Run staging transaction create dry run
+        if: ${{ inputs.run_transaction_dry_run == 'true' }}
+        run: npm run staging:dry-run:transaction-create
+
+      - name: Upload dry-run evidence
+        if: ${{ inputs.run_transaction_dry_run == 'true' && always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: transaction-create-dry-run
+          path: /tmp/webtopup-staging-transaction-create-dry-run.json
+          if-no-files-found: ignore
