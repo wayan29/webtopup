@@ -61,7 +61,7 @@ server/src/**/*.test.ts
 server/src/**/*.spec.ts
 client/src/**/*.test.tsx
 client/src/**/*.spec.tsx
-# scripts/smoke/  # tracked harness (mock/read smoke)
+# # scripts/smoke/  # tracked harness  # tracked harness (mock/read smoke)
 
 # Misc
 *.local
