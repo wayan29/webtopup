@@ -34,6 +34,7 @@ type Campaign = {
     createdBy?: { name?: string; email?: string };
     winners?: Winner[];
     allocatedTotal?: number;
+    executionAvailable?: boolean;
 };
 
 type Preview = {
@@ -46,6 +47,7 @@ type Preview = {
     eligibleMembers: number;
     winners: Winner[];
     allocatedTotal: number;
+    executionAvailable: boolean;
 };
 
 const formatCurrency = (value: number) => `Rp${Math.max(0, value || 0).toLocaleString('id-ID')}`;
@@ -65,6 +67,7 @@ const fieldClass = 'w-full rounded-xl border px-3 py-2.5 text-sm ui-field';
 export default function BalanceGiveawayPanel() {
     const stepUp = useStepUpOrchestration();
     const [campaigns, setCampaigns] = useState<Campaign[]>([]);
+    const [executionAvailable, setExecutionAvailable] = useState(false);
     const [loading, setLoading] = useState(true);
     const [previewing, setPreviewing] = useState(false);
     const [executing, setExecuting] = useState(false);
@@ -89,6 +92,8 @@ export default function BalanceGiveawayPanel() {
         try {
             const response = await apiV2.get('/vouchers/giveaways', { params: { page: 1, limit: 30 } });
             setCampaigns(response.data?.items || []);
+            // Fail closed when an older backend omits the capability field.
+            setExecutionAvailable(response.data?.executionAvailable === true);
         } catch (error: any) {
             setMessage({ type: 'error', text: error.response?.data?.message || 'Gagal memuat campaign' });
         } finally {
@@ -141,6 +146,9 @@ export default function BalanceGiveawayPanel() {
         try {
             const response = await apiV2.post('/vouchers/giveaways/preview', payload);
             setPreview(response.data);
+            // Preview remains usable even when execution is unavailable, but never enable
+            // financial execution unless the backend explicitly advertises transaction support.
+            setExecutionAvailable(response.data?.executionAvailable === true);
             if (response.data?.seed) setLockedSeed(String(response.data.seed));
         } catch (error: any) {
             setMessage({ type: 'error', text: error.response?.data?.message || 'Gagal preview undian' });
@@ -156,6 +164,13 @@ export default function BalanceGiveawayPanel() {
         }
         if (!preview) {
             setMessage({ type: 'error', text: 'Jalankan preview dulu sebelum mengeksekusi' });
+            return;
+        }
+        if (!executionAvailable) {
+            setMessage({
+                type: 'error',
+                text: 'Eksekusi giveaway sementara tidak tersedia karena MongoDB transaction belum aktif.',
+            });
             return;
         }
         setExecuting(true);
@@ -378,13 +393,19 @@ export default function BalanceGiveawayPanel() {
                             <button
                                 type="button"
                                 onClick={handleExecute}
-                                disabled={executing || !preview || Boolean(validationError)}
+                                disabled={executing || !preview || !executionAvailable || Boolean(validationError)}
                                 className="inline-flex flex-1 items-center justify-center gap-2 rounded-xl ui-accent-solid px-4 py-3 text-sm font-semibold disabled:opacity-50"
                             >
                                 {executing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Users className="h-4 w-4" />}
                                 Eksekusi & kredit
                             </button>
                         </div>
+                        {!executionAvailable ? (
+                            <div className="rounded-xl border ui-border ui-danger-chip px-3 py-2.5 text-xs">
+                                Eksekusi sementara tidak tersedia karena MongoDB transaction belum aktif.
+                                Preview dan riwayat tetap dapat digunakan.
+                            </div>
+                        ) : null}
                         <p className="text-xs ui-text-muted">
                             Preview menampilkan undian simulasi (tidak mengkredit). Eksekusi mengundi ulang dan langsung menambah saldo member.
                         </p>

@@ -79,11 +79,17 @@ struct GiveawayPreviewResponse {
     #[serde(rename = "maxAmount")]
     max_amount: i64,
     note: String,
+    #[serde(rename = "participantFilter")]
+    participant_filter: String,
     #[serde(rename = "eligibleMembers")]
     eligible_members: i64,
     winners: Vec<WinnerPreview>,
     #[serde(rename = "allocatedTotal")]
     allocated_total: i64,
+    #[serde(rename = "seed")]
+    seed: String,
+    #[serde(rename = "executionAvailable")]
+    execution_available: bool,
 }
 
 #[derive(Serialize)]
@@ -144,6 +150,8 @@ struct GiveawayDetail {
 struct GiveawayListResponse {
     items: Vec<GiveawayListItem>,
     meta: Meta,
+    #[serde(rename = "executionAvailable")]
+    execution_available: bool,
 }
 
 #[derive(Serialize)]
@@ -672,6 +680,7 @@ pub async fn giveaway_list(
             total,
             total_pages: std::cmp::max(1, (total + limit - 1) / limit),
         },
+        execution_available: giveaway_execution_available(state.mongo_transactions_enabled),
     })
     .into_response()
 }
@@ -744,19 +753,20 @@ pub async fn giveaway_preview(
         Err(response) => return response,
     };
     let allocated_total: i64 = winners.iter().map(|winner| winner.amount).sum();
-    Json(serde_json::json!({
-        "name": normalized.name,
-        "totalPool": normalized.total_pool,
-        "winnerCount": normalized.winner_count,
-        "minAmount": normalized.min_amount,
-        "maxAmount": normalized.max_amount,
-        "note": normalized.note,
-        "participantFilter": normalized.participant_filter,
-        "eligibleMembers": members.len() as i64,
-        "winners": winners,
-        "allocatedTotal": allocated_total,
-        "seed": seed.to_string(),
-    }))
+    Json(GiveawayPreviewResponse {
+        name: normalized.name,
+        total_pool: normalized.total_pool,
+        winner_count: normalized.winner_count,
+        min_amount: normalized.min_amount,
+        max_amount: normalized.max_amount,
+        note: normalized.note,
+        participant_filter: normalized.participant_filter,
+        eligible_members: members.len() as i64,
+        winners,
+        allocated_total,
+        seed: seed.to_string(),
+        execution_available: giveaway_execution_available(state.mongo_transactions_enabled),
+    })
     .into_response()
 }
 
@@ -979,8 +989,9 @@ async fn rollback_credits(users: &mongodb::Collection<Document>, credited: &[(Ob
 mod tests {
     use super::{
         allocate_random_amounts, decide_idempotency, giveaway_execution_available,
-        giveaway_idempotency_key, giveaway_request_digest, IdempotencyDecision,
-        NormalizedGiveaway,
+        giveaway_idempotency_key, giveaway_request_digest, GiveawayListResponse,
+        GiveawayPreviewResponse, IdempotencyDecision, Meta, NormalizedGiveaway,
+        WinnerPreview,
     };
     use axum::http::{HeaderMap, HeaderValue};
     use mongodb::bson::oid::ObjectId;
@@ -1038,6 +1049,47 @@ mod tests {
     fn giveaway_capability_is_false_when_transactions_are_disabled() {
         assert!(!giveaway_execution_available(false));
         assert!(giveaway_execution_available(true));
+    }
+
+    #[test]
+    fn giveaway_list_response_includes_execution_available_boolean() {
+        let response = GiveawayListResponse {
+            items: Vec::new(),
+            meta: Meta {
+                page: 1,
+                limit: 20,
+                total: 0,
+                total_pages: 1,
+            },
+            execution_available: false,
+        };
+        let json = serde_json::to_value(response).expect("list response json");
+        assert_eq!(json["executionAvailable"], false);
+    }
+
+    #[test]
+    fn giveaway_preview_response_includes_execution_available_boolean() {
+        let response = GiveawayPreviewResponse {
+            name: "Promo".to_string(),
+            total_pool: 10_000,
+            winner_count: 1,
+            min_amount: 10_000,
+            max_amount: 10_000,
+            note: String::new(),
+            participant_filter: "all".to_string(),
+            eligible_members: 1,
+            winners: vec![WinnerPreview {
+                user_id: ObjectId::from_bytes([1; 12]).to_hex(),
+                name: "Member".to_string(),
+                email: "member@example.com".to_string(),
+                amount: 10_000,
+            }],
+            allocated_total: 10_000,
+            seed: "42".to_string(),
+            execution_available: true,
+        };
+        let json = serde_json::to_value(response).expect("preview response json");
+        assert_eq!(json["executionAvailable"], true);
     }
 
     #[test]
