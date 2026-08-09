@@ -207,6 +207,14 @@ pub(super) struct OperatorItem {
     pub(super) status: bool,
     #[serde(rename = "isCustomProduct")]
     pub(super) is_custom_product: bool,
+    #[serde(rename = "validationType")]
+    pub(super) validation_type: String,
+    #[serde(rename = "checkUsername")]
+    pub(super) check_username: bool,
+    #[serde(rename = "usernameLabel")]
+    pub(super) username_label: String,
+    #[serde(rename = "userIdLabel")]
+    pub(super) user_id_label: String,
     #[serde(rename = "directProductCount")]
     pub(super) direct_product_count: i64,
     #[serde(rename = "legacyProductCount")]
@@ -219,6 +227,10 @@ pub(super) struct OperatorItem {
     pub(super) dependency_count: i64,
     #[serde(rename = "canDelete")]
     pub(super) can_delete: bool,
+    #[serde(rename = "createdAt")]
+    pub(super) created_at: String,
+    #[serde(rename = "updatedAt")]
+    pub(super) updated_at: String,
 }
 
 #[derive(Serialize)]
@@ -235,9 +247,21 @@ pub(super) struct ProductTypeItem {
     pub(super) operator_id: Option<OperatorBrief>,
     pub(super) icon: String,
     pub(super) cover: String,
+    #[serde(rename = "openTime")]
+    pub(super) open_time: String,
+    #[serde(rename = "closeTime")]
+    pub(super) close_time: String,
+    #[serde(rename = "open24Hours")]
+    pub(super) open_24_hours: bool,
+    #[serde(rename = "processType")]
+    pub(super) process_type: String,
     #[serde(rename = "sortOrder")]
     pub(super) sort_order: i64,
     pub(super) status: bool,
+    #[serde(rename = "createdAt")]
+    pub(super) created_at: String,
+    #[serde(rename = "updatedAt")]
+    pub(super) updated_at: String,
     #[serde(rename = "productCount")]
     pub(super) product_count: i64,
     #[serde(rename = "dependencyCount")]

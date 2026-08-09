@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import {
     apiV2,
     attachIdempotencyKey,
@@ -24,15 +24,17 @@ import {
     Copy,
     Download,
     Edit,
+    ExternalLink,
     Eye,
     Filter,
     Loader2,
     RefreshCw,
     RotateCcw,
     Search,
-
+    ShieldAlert,
+    Timer,
     X,
-    XCircle
+    XCircle,
 } from 'lucide-react';
 
 type TransactionStatus = 'pending' | 'processing' | 'success' | 'failed';
@@ -75,6 +77,10 @@ interface AdminTransaction {
         email?: string;
         role?: string;
     };
+    discountVoucherCode?: string;
+    discountAmount?: number;
+    baseAmount?: number;
+    flashSale?: string;
 }
 
 interface AdminTransactionsResponse {
@@ -119,6 +125,32 @@ type FilterState = {
     endDate: string;
 };
 
+type TaxonomyOption = { _id: string; name: string };
+type VendorOption = { _id: string; name: string };
+
+type StuckTransaction = {
+    _id: string;
+    target: string;
+    amount: number;
+    status: string;
+    vendorTrxId?: string;
+    customerRefId?: string;
+    source: string;
+    createdAt: string;
+    updatedAt: string;
+    ageMinutes: number;
+    user?: { _id?: string; name?: string; email?: string };
+    product?: { _id?: string; name?: string; code?: string; category?: string; brand?: string; vendor?: string };
+};
+
+type StuckResponse = {
+    thresholdMinutes: number;
+    total: number;
+    items: StuckTransaction[];
+};
+
+type DatePresetId = 'today' | '7d' | 'pending' | 'processing' | 'failed_today' | 'stuck';
+
 const defaultFilters: FilterState = {
     search: '',
     status: '',
@@ -127,10 +159,30 @@ const defaultFilters: FilterState = {
     brand: '',
     vendor: '',
     startDate: '',
-    endDate: ''
+    endDate: '',
 };
 
 const filterKeys: Array<keyof FilterState> = ['search', 'status', 'source', 'category', 'brand', 'vendor', 'startDate', 'endDate'];
+
+const wibDateParts = (date = new Date()) => {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Jakarta',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+    }).formatToParts(date);
+    const year = parts.find((part) => part.type === 'year')?.value || '1970';
+    const month = parts.find((part) => part.type === 'month')?.value || '01';
+    const day = parts.find((part) => part.type === 'day')?.value || '01';
+    return { year, month, day, iso: `${year}-${month}-${day}` };
+};
+
+const shiftWibDate = (iso: string, deltaDays: number) => {
+    const [year, month, day] = iso.split('-').map(Number);
+    // Anchor at UTC noon so WIB day boundaries stay stable when shifting.
+    const shifted = new Date(Date.UTC(year, month - 1, day, 12) + deltaDays * 86_400_000);
+    return wibDateParts(shifted).iso;
+};
 
 const filtersFromSearchParams = (params: URLSearchParams): FilterState => ({
     search: params.get('search') || '',
@@ -140,8 +192,38 @@ const filtersFromSearchParams = (params: URLSearchParams): FilterState => ({
     brand: params.get('brand') || '',
     vendor: params.get('vendor') || '',
     startDate: params.get('startDate') || '',
-    endDate: params.get('endDate') || ''
+    endDate: params.get('endDate') || '',
 });
+
+const buildPresetFilters = (preset: DatePresetId): FilterState => {
+    const today = wibDateParts().iso;
+    if (preset === 'today') {
+        return { ...defaultFilters, startDate: today, endDate: today };
+    }
+    if (preset === '7d') {
+        return { ...defaultFilters, startDate: shiftWibDate(today, -6), endDate: today };
+    }
+    if (preset === 'pending') {
+        return { ...defaultFilters, status: 'pending' };
+    }
+    if (preset === 'failed_today') {
+        return { ...defaultFilters, status: 'failed', startDate: today, endDate: today };
+    }
+    if (preset === 'processing') {
+        return { ...defaultFilters, status: 'processing' };
+    }
+    // stuck: open stuck queue (not a list filter)
+    return { ...defaultFilters };
+};
+
+const PRESET_CHIPS: Array<{ id: DatePresetId; label: string }> = [
+    { id: 'today', label: 'Hari ini' },
+    { id: '7d', label: '7 hari' },
+    { id: 'pending', label: 'Pending saja' },
+    { id: 'processing', label: 'Proses saja' },
+    { id: 'failed_today', label: 'Gagal hari ini' },
+    { id: 'stuck', label: 'Stuck queue' },
+];
 
 const formatCurrency = (value: number) => `Rp${value.toLocaleString('id-ID')}`;
 const formatDateTime = (value?: string) => (
@@ -159,6 +241,48 @@ const formatDateTime = (value?: string) => (
 const getSourceLabel = (source: TransactionSource) => (
     source === 'api' ? 'API' : 'Web'
 );
+
+const buildTimeline = (trx: AdminTransaction) => {
+    const events: Array<{ at: string; label: string; detail?: string; tone: string }> = [];
+    if (trx.createdAt) {
+        events.push({
+            at: trx.createdAt,
+            label: 'Dibuat',
+            detail: `Sumber ${getSourceLabel(trx.source)}`,
+            tone: 'ui-info-text',
+        });
+    }
+    if (trx.statusUpdatedAt) {
+        events.push({
+            at: trx.statusUpdatedAt,
+            label: 'Update manual',
+            detail: [trx.statusUpdatedBy?.name, trx.statusUpdateNote].filter(Boolean).join(' · ') || undefined,
+            tone: 'ui-warning-text',
+        });
+    }
+    if (trx.refundedAt) {
+        events.push({
+            at: trx.refundedAt,
+            label: 'Refund saldo',
+            detail: trx.refundReason || undefined,
+            tone: 'ui-success-text',
+        });
+    }
+    if (
+        trx.updatedAt
+        && trx.updatedAt !== trx.createdAt
+        && trx.updatedAt !== trx.statusUpdatedAt
+        && trx.updatedAt !== trx.refundedAt
+    ) {
+        events.push({
+            at: trx.updatedAt,
+            label: `Status: ${trx.status}`,
+            detail: trx.message || undefined,
+            tone: 'ui-text-muted',
+        });
+    }
+    return events.sort((a, b) => new Date(a.at).getTime() - new Date(b.at).getTime());
+};
 
 const getStatusBadge = (status: TransactionStatus, size: 'sm' | 'md' = 'sm') => {
     const baseClass = size === 'md'
@@ -232,6 +356,16 @@ export default function AdminTransactions() {
     const [successMessage, setSuccessMessage] = useState('');
     const latestRequestId = useRef(0);
     const [exporting, setExporting] = useState(false);
+    const [stuckOpen, setStuckOpen] = useState(false);
+    const [stuckLoading, setStuckLoading] = useState(false);
+    const [stuckThresholdMinutes, setStuckThresholdMinutes] = useState(30);
+    const [stuckTotal, setStuckTotal] = useState(0);
+    const [stuckItems, setStuckItems] = useState<StuckTransaction[]>([]);
+    const [selectedIds, setSelectedIds] = useState<string[]>([]);
+    const [bulkRechecking, setBulkRechecking] = useState(false);
+    const [taxonomyCategories, setTaxonomyCategories] = useState<TaxonomyOption[]>([]);
+    const [taxonomyBrands, setTaxonomyBrands] = useState<TaxonomyOption[]>([]);
+    const [taxonomyVendors, setTaxonomyVendors] = useState<VendorOption[]>([]);
     const [editForm, setEditForm] = useState({
         status: 'pending' as TransactionStatus,
         vendorTrxId: '',
@@ -288,6 +422,7 @@ export default function AdminTransactions() {
             setTransactions(response.data.items || []);
             setSummary(response.data.summary);
             setMeta(response.data.meta);
+            setSelectedIds([]);
         } catch (error: any) {
             if (requestId !== latestRequestId.current) return;
             const message = error.response?.data?.message || 'Gagal memuat transaksi admin';
@@ -299,6 +434,42 @@ export default function AdminTransactions() {
         }
     }, [appliedFilters, meta.limit, meta.page, mode]);
 
+    const fetchStuckTransactions = useCallback(async (thresholdMinutes = stuckThresholdMinutes) => {
+        setStuckLoading(true);
+        try {
+            const response = await apiV2.get<StuckResponse>('/transactions/admin/stuck', {
+                params: { thresholdMinutes, limit: 50 },
+            });
+            setStuckItems(response.data.items || []);
+            setStuckTotal(response.data.total || 0);
+            setStuckThresholdMinutes(response.data.thresholdMinutes || thresholdMinutes);
+        } catch (error: any) {
+            setErrorMessage(error.response?.data?.message || 'Gagal memuat antrian stuck');
+        } finally {
+            setStuckLoading(false);
+        }
+    }, [stuckThresholdMinutes]);
+
+    const openStuckQueue = useCallback(async () => {
+        setStuckOpen(true);
+        setSuccessMessage('');
+        await fetchStuckTransactions(30);
+    }, [fetchStuckTransactions]);
+
+    const applyPreset = useCallback((preset: DatePresetId) => {
+        if (preset === 'stuck') {
+            void openStuckQueue();
+            return;
+        }
+        const next = buildPresetFilters(preset);
+        setFilters(next);
+        setAppliedFilters(next);
+        setMeta((current) => ({ ...current, page: 1 }));
+        setErrorMessage('');
+        setSuccessMessage('');
+        syncUrlParams(mode, next);
+    }, [mode, openStuckQueue, syncUrlParams]);
+
     useEffect(() => {
         if (mode !== 'internal') {
             return;
@@ -308,10 +479,55 @@ export default function AdminTransactions() {
     }, [fetchTransactions, mode]);
 
     useEffect(() => {
-        const handleRefresh = () => fetchTransactions();
+        const handleRefresh = () => {
+            fetchTransactions();
+            if (stuckOpen) {
+                void fetchStuckTransactions();
+            }
+        };
         window.addEventListener('admin:refresh-current-page', handleRefresh);
         return () => window.removeEventListener('admin:refresh-current-page', handleRefresh);
-    }, [fetchTransactions]);
+    }, [fetchStuckTransactions, fetchTransactions, stuckOpen]);
+
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            try {
+                const [categoriesRes, operatorsRes, vendorsRes] = await Promise.all([
+                    apiV2.get('/categories/admin/all'),
+                    apiV2.get('/operators/admin/all'),
+                    apiV2.get('/vendors/admin/all'),
+                ]);
+                if (cancelled) return;
+                const categories = Array.isArray(categoriesRes.data) ? categoriesRes.data : [];
+                const operators = Array.isArray(operatorsRes.data) ? operatorsRes.data : [];
+                const vendors = Array.isArray(vendorsRes.data) ? vendorsRes.data : [];
+                setTaxonomyCategories(
+                    categories
+                        .map((item: any) => ({ _id: String(item._id || item.id || ''), name: String(item.name || '') }))
+                        .filter((item: TaxonomyOption) => item._id && item.name)
+                        .sort((a: TaxonomyOption, b: TaxonomyOption) => a.name.localeCompare(b.name)),
+                );
+                setTaxonomyBrands(
+                    operators
+                        .map((item: any) => ({ _id: String(item._id || item.id || ''), name: String(item.name || '') }))
+                        .filter((item: TaxonomyOption) => item._id && item.name)
+                        .sort((a: TaxonomyOption, b: TaxonomyOption) => a.name.localeCompare(b.name)),
+                );
+                setTaxonomyVendors(
+                    vendors
+                        .map((item: any) => ({ _id: String(item._id || item.id || ''), name: String(item.name || item.code || '') }))
+                        .filter((item: VendorOption) => item._id && item.name)
+                        .sort((a: VendorOption, b: VendorOption) => a.name.localeCompare(b.name)),
+                );
+            } catch {
+                // Taxonomy dropdowns are progressive enhancement; free-text still works if empty.
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, []);
 
     const inputClass = 'w-full rounded-lg ui-field border px-3 py-2 text-sm';
     const selectClass = 'w-full rounded-lg ui-field border px-3 py-2 text-sm';
@@ -436,7 +652,17 @@ export default function AdminTransactions() {
             closeEditModal();
             setSelectedTrx(null);
             await fetchTransactions();
+            if (stuckOpen) {
+                await fetchStuckTransactions();
+            }
         } catch (error: any) {
+            if (isAmbiguousMutationFailure(error)) {
+                setErrorMessage(
+                    `${CRITICAL_MUTATION_AMBIGUOUS_MESSAGE}. Muat ulang daftar transaksi sebelum mencoba lagi.`,
+                );
+                await fetchTransactions();
+                return;
+            }
             const text = stepUpActionErrorMessage(error, 'Gagal memperbarui status transaksi');
             if (text) setErrorMessage(text);
         } finally {
@@ -504,12 +730,94 @@ export default function AdminTransactions() {
             refreshSidebarBadges();
             setSelectedTrx(null);
             await fetchTransactions();
+            if (stuckOpen) {
+                await fetchStuckTransactions();
+            }
         } catch (error: any) {
+            if (isAmbiguousMutationFailure(error)) {
+                setErrorMessage(
+                    `${CRITICAL_MUTATION_AMBIGUOUS_MESSAGE}. Muat ulang daftar transaksi sebelum mencoba lagi.`,
+                );
+                await fetchTransactions();
+                return;
+            }
             setErrorMessage(error.response?.data?.message || 'Gagal cek status ke vendor');
         } finally {
             setRecheckingId(null);
         }
     };
+
+    const toggleSelected = (id: string) => {
+        setSelectedIds((current) => (
+            current.includes(id)
+                ? current.filter((value) => value !== id)
+                : [...current, id]
+        ));
+    };
+
+    const toggleSelectAllVisible = () => {
+        const visibleIds = transactions.map((trx) => trx._id);
+        const allSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.includes(id));
+        setSelectedIds(allSelected ? [] : visibleIds);
+    };
+
+    const handleBulkRecheck = async () => {
+        const targets = transactions.filter(
+            (trx) => selectedIds.includes(trx._id) && canRecheckVendor(toPresentationInput(trx)),
+        );
+        if (targets.length === 0) {
+            setErrorMessage('Tidak ada transaksi terpilih yang bisa di-recheck vendor.');
+            return;
+        }
+
+        setBulkRechecking(true);
+        setErrorMessage('');
+        setSuccessMessage('');
+        let ok = 0;
+        let failed = 0;
+        let ambiguous = 0;
+
+        for (const trx of targets) {
+            try {
+                await apiV2.post(`/transactions/${trx._id}/recheck`);
+                ok += 1;
+            } catch (error: any) {
+                if (isAmbiguousMutationFailure(error)) {
+                    ambiguous += 1;
+                } else {
+                    failed += 1;
+                }
+            }
+        }
+
+        refreshSidebarBadges();
+        await fetchTransactions();
+        if (stuckOpen) {
+            await fetchStuckTransactions();
+        }
+
+        const parts = [
+            ok > 0 ? `${ok} berhasil` : null,
+            failed > 0 ? `${failed} gagal` : null,
+            ambiguous > 0 ? `${ambiguous} status belum pasti` : null,
+        ].filter(Boolean);
+        if (failed > 0 || ambiguous > 0) {
+            setErrorMessage(`Bulk recheck selesai: ${parts.join(', ')}.`);
+        } else {
+            setSuccessMessage(`Bulk recheck selesai: ${parts.join(', ') || 'tidak ada perubahan'}.`);
+        }
+        setBulkRechecking(false);
+    };
+
+    const selectedRecheckableCount = useMemo(
+        () => transactions.filter(
+            (trx) => selectedIds.includes(trx._id) && canRecheckVendor(toPresentationInput(trx)),
+        ).length,
+        [selectedIds, transactions],
+    );
+
+    const allVisibleSelected = transactions.length > 0
+        && transactions.every((trx) => selectedIds.includes(trx._id));
 
     const handleExport = async () => {
         try {
@@ -594,104 +902,123 @@ export default function AdminTransactions() {
     return (
         <div className="space-y-6">
             <div className="ui-panel rounded-2xl border ui-border p-4 sm:p-5">
-                <div className="relative space-y-4">
+                <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                    <div className="min-w-0">
+                        <p className="text-xs uppercase tracking-[0.18em] ui-text-muted">Meja Transaksi</p>
+                        <h1 className="mt-1 text-xl font-black ui-text sm:text-2xl">
+                            {mode === 'internal'
+                                ? (hasActiveFilters ? 'Audit terfilter' : 'Transaksi internal')
+                                : 'Digiflazz Seller'}
+                        </h1>
+                        <p className="mt-1 text-sm ui-text-muted">
+                            {mode === 'internal'
+                                ? rangeLabel
+                                : (canManageSellerCallbacks
+                                    ? 'Filter, export, detail raw, dan retry callback seller.'
+                                    : 'Mode lihat-saja untuk transaksi seller.')}
+                        </p>
+                    </div>
                     <div className="flex flex-wrap gap-2">
-                            <button
-                                onClick={() => {
-                                    setMode('internal');
-                                    syncUrlParams('internal', appliedFilters);
-                                }}
-                                className={`px-4 py-2.5 rounded-xl text-sm font-semibold transition-colors ${
-                                    mode === 'internal'
-                                        ? 'ui-accent-solid shadow-[0_12px_40px_var(--ui-accent-soft)]'
-                                        : 'ui-muted-action border hover:border-[var(--ui-accent)]'
-                                }`}
-                            >
-                                Transaksi Internal
-                            </button>
-                            <button
-                                onClick={() => {
-                                    setMode('digiflazzSeller');
-                                    syncUrlParams('digiflazzSeller', appliedFilters);
-                                }}
-                                className={`px-4 py-2.5 rounded-xl text-sm font-semibold transition-colors ${
-                                    mode === 'digiflazzSeller'
-                                        ? 'ui-accent-solid shadow-[0_12px_40px_var(--ui-accent-soft)]'
-                                        : 'ui-muted-action border hover:border-[var(--ui-accent)]'
-                                }`}
-                            >
-                                Digiflazz Seller
-                            </button>
+                        <button
+                            type="button"
+                            onClick={() => {
+                                setMode('internal');
+                                syncUrlParams('internal', appliedFilters);
+                            }}
+                            className={`px-4 py-2.5 rounded-xl text-sm font-semibold transition-colors ${
+                                mode === 'internal'
+                                    ? 'ui-accent-solid shadow-[0_12px_40px_var(--ui-accent-soft)]'
+                                    : 'ui-muted-action border hover:border-[var(--ui-accent)]'
+                            }`}
+                        >
+                            Transaksi Internal
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => {
+                                setMode('digiflazzSeller');
+                                setStuckOpen(false);
+                                syncUrlParams('digiflazzSeller', appliedFilters);
+                            }}
+                            className={`px-4 py-2.5 rounded-xl text-sm font-semibold transition-colors ${
+                                mode === 'digiflazzSeller'
+                                    ? 'ui-accent-solid shadow-[0_12px_40px_var(--ui-accent-soft)]'
+                                    : 'ui-muted-action border hover:border-[var(--ui-accent)]'
+                            }`}
+                        >
+                            Digiflazz Seller
+                        </button>
+                    </div>
+                </div>
+
+                {mode === 'internal' && (
+                    <div className="mt-4 space-y-3">
+                        <div className="flex flex-wrap gap-2">
+                            {PRESET_CHIPS.map((chip) => (
+                                <button
+                                    key={chip.id}
+                                    type="button"
+                                    onClick={() => applyPreset(chip.id)}
+                                    className="ui-muted-action rounded-full border px-3 py-1.5 text-xs font-semibold transition hover:border-[var(--ui-accent)]"
+                                >
+                                    {chip.id === 'stuck' ? (
+                                        <span className="inline-flex items-center gap-1">
+                                            <Timer className="h-3.5 w-3.5" /> {chip.label}
+                                            {stuckTotal > 0 ? ` (${stuckTotal})` : ''}
+                                        </span>
+                                    ) : chip.label}
+                                </button>
+                            ))}
                         </div>
-                    <div className="rounded-3xl border ui-border bg-[var(--ui-card-bg)]/75 p-5 backdrop-blur">
-                        {mode === 'internal' ? (
-                            <>
-                                <div className="flex items-start justify-between gap-3">
-                                    <div>
-                                        <p className="text-xs uppercase tracking-[0.18em] ui-text-muted">Sinyal Ledger</p>
-                                        <h2 className="mt-1 text-lg font-bold ui-text">{hasActiveFilters ? 'Ruang audit terfilter' : 'Semua transaksi internal'}</h2>
-                                        <p className="mt-1 text-xs ui-text-muted">{rangeLabel}</p>
-                                    </div>
-                                    <div className="flex gap-2">
-                                        <button
-                                            onClick={() => fetchTransactions()}
-                                            className="ui-muted-action inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-sm font-semibold transition-colors"
-                                        >
-                                            <RefreshCw className="h-4 w-4" />
-                                            Segarkan
-                                        </button>
-                                        <button
-                                            onClick={handleExport}
-                                            disabled={exporting || meta.total === 0}
-                                            className="ui-accent-solid inline-flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-semibold transition-colors disabled:opacity-60"
-                                        >
-                                            <Download className="h-4 w-4" />
-                                            CSV
-                                        </button>
-                                    </div>
-                                </div>
-                                <div className="mt-5 space-y-3">
-                                    {(priorityTransactions.length > 0 ? priorityTransactions : transactions.slice(0, 4)).map((trx) => (
+
+                        <div className="flex flex-col gap-3 rounded-2xl border ui-border bg-[var(--ui-card-muted)]/70 p-3 sm:flex-row sm:items-center sm:justify-between">
+                            <div className="min-w-0">
+                                <p className="text-[11px] font-semibold uppercase tracking-[0.16em] ui-text-muted">Prioritas cepat</p>
+                                <div className="mt-2 flex flex-wrap gap-2">
+                                    {(priorityTransactions.length > 0 ? priorityTransactions : transactions.slice(0, 3)).map((trx) => (
                                         <button
                                             key={trx._id}
                                             type="button"
                                             onClick={() => setSelectedTrx(trx)}
-                                            className="w-full rounded-2xl border ui-border bg-[var(--ui-card-muted)]/80 p-3 text-left transition hover:border-[var(--ui-accent)]"
+                                            className="max-w-full rounded-xl border ui-border bg-[var(--ui-card-bg)]/80 px-3 py-2 text-left transition hover:border-[var(--ui-accent)]"
                                         >
-                                            <div className="flex items-start justify-between gap-3">
-                                                <div className="min-w-0">
-                                                    <p className="truncate text-sm font-semibold ui-text">{trx.product?.name || '-'}</p>
-                                                    <p className="mt-1 truncate text-xs ui-text-muted">{trx.target} • {formatCurrency(trx.amount)}</p>
-                                                </div>
+                                            <div className="flex items-center gap-2">
                                                 {getStatusBadge(trx.status)}
+                                                <span className="truncate text-xs font-semibold ui-text">{trx.product?.name || trx.target}</span>
                                             </div>
+                                            <p className="mt-1 truncate text-[11px] ui-text-muted">{trx.target} · {formatCurrency(trx.amount)}</p>
                                         </button>
                                     ))}
                                     {!loading && transactions.length === 0 && (
-                                        <div className="rounded-2xl border ui-border bg-[var(--ui-card-muted)]/80 p-4 text-sm ui-text-muted">
-                                            Tidak ada transaksi internal pada filter aktif.
-                                        </div>
+                                        <span className="text-xs ui-text-muted">Tidak ada transaksi pada filter aktif.</span>
                                     )}
                                 </div>
-                            </>
-                        ) : (
-                            <div className="flex h-full flex-col justify-between gap-5">
-                                <div>
-                                    <p className="text-xs uppercase tracking-[0.18em] ui-text-muted">Meja Seller Aktif</p>
-                                    <h2 className="mt-1 text-lg font-bold ui-text">Operasi callback Digiflazz</h2>
-                                    <p className="mt-2 text-sm ui-text-muted">
-                                        Mode ini memuat panel seller terpisah dengan filter, export, detail raw request, dan retry callback.
-                                    </p>
-                                </div>
-                                <div className="rounded-2xl border ui-border bg-[var(--ui-card-muted)]/80 p-4 text-sm ui-text-muted">
-                                    {canManageSellerCallbacks
-                                        ? 'Akun ini bisa mengirim ulang callback seller.'
-                                        : 'Akun ini hanya bisa melihat transaksi seller.'}
-                                </div>
                             </div>
-                        )}
+                            <div className="flex shrink-0 flex-wrap gap-2">
+                                <button
+                                    type="button"
+                                    onClick={() => fetchTransactions()}
+                                    className="ui-muted-action inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-sm font-semibold"
+                                >
+                                    <RefreshCw className="h-4 w-4" />
+                                    Segarkan
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={handleExport}
+                                    disabled={exporting || meta.total === 0}
+                                    className="ui-accent-solid inline-flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-semibold disabled:opacity-60"
+                                >
+                                    <Download className="h-4 w-4" />
+                                    {exporting ? 'CSV…' : 'CSV'}
+                                </button>
+                            </div>
+                        </div>
+                        <p className="text-[11px] leading-5 ui-text-muted">
+                            CSV memakai filter yang sudah diterapkan (bukan draft filter yang belum di-Cari).
+                        </p>
                     </div>
-                </div>
+                )}
             </div>
 
             {mode === 'internal' ? (
@@ -703,6 +1030,114 @@ export default function AdminTransactions() {
                                 : 'ui-success-chip'
                         }`}>
                             {errorMessage || successMessage}
+                        </div>
+                    )}
+
+                    {stuckOpen && (
+                        <div className="ui-panel rounded-2xl border ui-border p-4 sm:p-5">
+                            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                                <div>
+                                    <p className="text-xs font-semibold uppercase tracking-[0.18em] ui-warning-text">Stuck queue</p>
+                                    <h2 className="mt-1 text-lg font-bold ui-text">Pending/proses &gt; {stuckThresholdMinutes} menit</h2>
+                                    <p className="mt-1 text-sm ui-text-muted">
+                                        {stuckLoading ? 'Memuat…' : `${stuckTotal} transaksi melewati ambang (tampil max 50).`}
+                                    </p>
+                                </div>
+                                <div className="flex flex-wrap gap-2">
+                                    <button
+                                        type="button"
+                                        onClick={() => void fetchStuckTransactions()}
+                                        className="ui-muted-action rounded-xl border px-3 py-2 text-sm font-semibold"
+                                    >
+                                        Segarkan stuck
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => setStuckOpen(false)}
+                                        className="ui-muted-action rounded-xl border px-3 py-2 text-sm font-semibold"
+                                    >
+                                        Tutup
+                                    </button>
+                                </div>
+                            </div>
+                            <div className="mt-4 space-y-2">
+                                {stuckItems.map((item) => (
+                                    <div
+                                        key={item._id}
+                                        className="flex flex-col gap-2 rounded-xl border ui-border bg-[var(--ui-card-muted)]/70 p-3 sm:flex-row sm:items-center sm:justify-between"
+                                    >
+                                        <div className="min-w-0">
+                                            <div className="flex flex-wrap items-center gap-2">
+                                                {getStatusBadge(item.status as TransactionStatus)}
+                                                <span className="text-xs font-semibold ui-warning-text">{item.ageMinutes} mnt</span>
+                                                <span className="truncate text-sm font-semibold ui-text">{item.product?.name || item.target}</span>
+                                            </div>
+                                            <p className="mt-1 truncate text-xs ui-text-muted">
+                                                {item.target} · {formatCurrency(item.amount)} · {item.user?.email || '-'}
+                                            </p>
+                                            <p className="font-mono text-[11px] ui-text-muted break-all">{item._id}</p>
+                                        </div>
+                                        <div className="flex shrink-0 flex-wrap gap-2">
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    const match = transactions.find((trx) => trx._id === item._id);
+                                                    if (match) setSelectedTrx(match);
+                                                    else {
+                                                        setFilters((current) => ({ ...current, search: item._id }));
+                                                        setAppliedFilters((current) => ({ ...current, search: item._id }));
+                                                        setMeta((current) => ({ ...current, page: 1 }));
+                                                        syncUrlParams(mode, { ...appliedFilters, search: item._id });
+                                                    }
+                                                }}
+                                                className="ui-muted-action rounded-lg border px-3 py-1.5 text-xs font-semibold"
+                                            >
+                                                Buka
+                                            </button>
+                                            {canEditStatus && (item.status === 'pending' || item.status === 'processing') && (
+                                                <button
+                                                    type="button"
+                                                    onClick={() => {
+                                                        const asAdmin: AdminTransaction = {
+                                                            _id: item._id,
+                                                            target: item.target,
+                                                            amount: item.amount,
+                                                            status: item.status as TransactionStatus,
+                                                            vendorTrxId: item.vendorTrxId,
+                                                            customerRefId: item.customerRefId,
+                                                            refunded: false,
+                                                            source: (item.source === 'api' ? 'api' : 'web'),
+                                                            createdAt: item.createdAt,
+                                                            updatedAt: item.updatedAt,
+                                                            user: item.user,
+                                                            product: item.product
+                                                                ? {
+                                                                    _id: item.product._id,
+                                                                    name: item.product.name,
+                                                                    code: item.product.code,
+                                                                    category: item.product.category,
+                                                                    brand: item.product.brand,
+                                                                    vendorName: item.product.vendor,
+                                                                }
+                                                                : undefined,
+                                                        };
+                                                        void handleRecheckVendor(asAdmin);
+                                                    }}
+                                                    disabled={recheckingId === item._id}
+                                                    className="ui-info-action inline-flex items-center gap-1 rounded-lg px-3 py-1.5 text-xs font-semibold disabled:opacity-60"
+                                                    title="Cek status ke vendor"
+                                                >
+                                                    {recheckingId === item._id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                                                    Recheck
+                                                </button>
+                                            )}
+                                        </div>
+                                    </div>
+                                ))}
+                                {!stuckLoading && stuckItems.length === 0 && (
+                                    <p className="rounded-xl border ui-border p-4 text-sm ui-text-muted">Tidak ada transaksi stuck di atas ambang ini.</p>
+                                )}
+                            </div>
                         </div>
                     )}
 
@@ -756,24 +1191,36 @@ export default function AdminTransactions() {
                                 <option value="web">Web</option>
                                 <option value="api">API</option>
                             </select>
-                            <input
-                                placeholder="Kategori"
+                            <select
                                 value={filters.category}
                                 onChange={(event) => setFilters((current) => ({ ...current, category: event.target.value }))}
-                                className={inputClass}
-                            />
-                            <input
-                                placeholder="Brand / operator"
+                                className={selectClass}
+                            >
+                                <option value="">Semua kategori</option>
+                                {taxonomyCategories.map((item) => (
+                                    <option key={item._id} value={item.name}>{item.name}</option>
+                                ))}
+                            </select>
+                            <select
                                 value={filters.brand}
                                 onChange={(event) => setFilters((current) => ({ ...current, brand: event.target.value }))}
-                                className={inputClass}
-                            />
-                            <input
-                                placeholder="Vendor"
+                                className={selectClass}
+                            >
+                                <option value="">Semua brand/operator</option>
+                                {taxonomyBrands.map((item) => (
+                                    <option key={item._id} value={item.name}>{item.name}</option>
+                                ))}
+                            </select>
+                            <select
                                 value={filters.vendor}
                                 onChange={(event) => setFilters((current) => ({ ...current, vendor: event.target.value }))}
-                                className={inputClass}
-                            />
+                                className={selectClass}
+                            >
+                                <option value="">Semua vendor</option>
+                                {taxonomyVendors.map((item) => (
+                                    <option key={item._id} value={item.name}>{item.name}</option>
+                                ))}
+                            </select>
                             <input
                                 type="date"
                                 value={filters.startDate}
@@ -839,12 +1286,34 @@ export default function AdminTransactions() {
                                 <p className="text-xs font-semibold uppercase tracking-[0.22em] ui-accent-text">Internal Ledger</p>
                                 <h2 className="mt-1 text-lg font-bold ui-text">Daftar transaksi member</h2>
                             </div>
-                            <div className="text-xs ui-text-muted">{rangeLabel}</div>
+                            <div className="flex flex-wrap items-center gap-2">
+                                <div className="text-xs ui-text-muted">{rangeLabel}</div>
+                                {selectedIds.length > 0 && (
+                                    <button
+                                        type="button"
+                                        onClick={() => void handleBulkRecheck()}
+                                        disabled={bulkRechecking || selectedRecheckableCount === 0}
+                                        className="ui-info-action inline-flex items-center gap-2 rounded-xl px-3 py-2 text-xs font-semibold disabled:opacity-60"
+                                        title="Hanya transaksi pending/proses yang eligible recheck"
+                                    >
+                                        {bulkRechecking ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                                        Bulk recheck ({selectedRecheckableCount}/{selectedIds.length})
+                                    </button>
+                                )}
+                            </div>
                         </div>
                         <div className="overflow-x-auto">
                             <table className="min-w-full">
                                 <thead>
                                     <tr className="ui-panel ui-text-muted text-xs uppercase">
+                                        <th className="px-3 py-3 text-left font-semibold">
+                                            <input
+                                                type="checkbox"
+                                                checked={allVisibleSelected}
+                                                onChange={toggleSelectAllVisible}
+                                                aria-label="Pilih semua di halaman ini"
+                                            />
+                                        </th>
                                         <th className="px-4 py-3 text-left font-semibold">Referensi</th>
                                         <th className="px-4 py-3 text-left font-semibold">Member</th>
                                         <th className="px-4 py-3 text-left font-semibold">Produk</th>
@@ -858,7 +1327,7 @@ export default function AdminTransactions() {
                                 <tbody className="divide-y divide-[var(--ui-border)]">
                                     {loading ? (
                                         <tr>
-                                            <td colSpan={8} className="px-4 py-8 text-center ui-text-muted">
+                                            <td colSpan={9} className="px-4 py-8 text-center ui-text-muted">
                                                 <span className="inline-flex items-center gap-2">
                                                     <Loader2 className="w-4 h-4 animate-spin" />
                                                     Memuat data transaksi...
@@ -867,13 +1336,21 @@ export default function AdminTransactions() {
                                         </tr>
                                     ) : transactions.length === 0 ? (
                                         <tr>
-                                            <td colSpan={8} className="px-4 py-8 text-center ui-text-muted">
+                                            <td colSpan={9} className="px-4 py-8 text-center ui-text-muted">
                                                 Tidak ada transaksi yang cocok dengan filter saat ini.
                                             </td>
                                         </tr>
                                     ) : (
                                         transactions.map((trx) => (
                                             <tr key={trx._id} className="hover:bg-[var(--ui-card-bg)]">
+                                                <td className="px-3 py-3 align-top">
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={selectedIds.includes(trx._id)}
+                                                        onChange={() => toggleSelected(trx._id)}
+                                                        aria-label={`Pilih ${trx._id}`}
+                                                    />
+                                                </td>
                                                 <td className="px-4 py-3 align-top text-sm ui-text">
                                                     <div className="font-semibold ui-info-text">{trx.vendorTrxId || '-'}</div>
                                                     <div className="text-xs ui-text-muted font-mono break-all">{trx._id}</div>
@@ -886,6 +1363,14 @@ export default function AdminTransactions() {
                                                 <td className="px-4 py-3 align-top text-sm ui-text">
                                                     <div className="font-semibold">{trx.user?.name || '-'}</div>
                                                     <div className="text-xs ui-info-text break-all">{trx.user?.email || '-'}</div>
+                                                    {trx.user?._id && (
+                                                        <Link
+                                                            to={`/admin/users?q=${encodeURIComponent(trx.user.email || trx.user._id)}`}
+                                                            className="mt-1 inline-flex items-center gap-1 text-[11px] font-semibold ui-accent-text hover:underline"
+                                                        >
+                                                            Buka user <ExternalLink className="h-3 w-3" />
+                                                        </Link>
+                                                    )}
                                                 </td>
                                                 <td className="px-4 py-3 align-top text-sm ui-text">
                                                     <div className="font-semibold">{trx.product?.name || '-'}</div>
@@ -895,6 +1380,14 @@ export default function AdminTransactions() {
                                                     <div className="text-[11px] ui-text-muted">
                                                         {trx.product?.brand || '-'} / {trx.product?.vendorName || '-'}
                                                     </div>
+                                                    {trx.product?._id && (
+                                                        <Link
+                                                            to={`/admin/products?q=${encodeURIComponent(trx.product.code || trx.product.name || trx.product._id)}`}
+                                                            className="mt-1 inline-flex items-center gap-1 text-[11px] font-semibold ui-accent-text hover:underline"
+                                                        >
+                                                            Buka produk <ExternalLink className="h-3 w-3" />
+                                                        </Link>
+                                                    )}
                                                 </td>
                                                 <td className="px-4 py-3 align-top text-sm ui-text">
                                                     <div className="font-semibold">{formatCurrency(trx.amount)}</div>
@@ -937,18 +1430,20 @@ export default function AdminTransactions() {
                                                             <>
                                                                 <button
                                                                     onClick={() => openEditModal(trx)}
-                                                                    className="ui-info-action px-2 py-1 rounded"
-                                                                    title="Edit status"
+                                                                    className="ui-info-action relative px-2 py-1 rounded"
+                                                                    title="Edit status (step-up)"
                                                                 >
                                                                     <Edit className="w-4 h-4" />
+                                                                    <ShieldAlert className="absolute -right-1 -top-1 h-3 w-3 ui-warning-text" />
                                                                 </button>
                                                                 {!trx.refunded && trx.status !== 'success' && (
                                                                     <button
                                                                         onClick={() => openRefundModal(trx)}
-                                                                        className="ui-warning-action px-2 py-1 rounded"
-                                                                        title="Refund saldo"
+                                                                        className="ui-warning-action relative px-2 py-1 rounded"
+                                                                        title="Refund saldo (step-up)"
                                                                     >
                                                                         <RotateCcw className="w-4 h-4" />
+                                                                        <ShieldAlert className="absolute -right-1 -top-1 h-3 w-3 ui-warning-text" />
                                                                     </button>
                                                                 )}
                                                                 {canRecheckVendor(toPresentationInput(trx)) && (
@@ -1109,6 +1604,14 @@ export default function AdminTransactions() {
                                             <p className="text-xs ui-text-muted">
                                                 {selectedTrx.product?.code || '-'} • {selectedTrx.product?.category || '-'} • {selectedTrx.product?.brand || '-'}
                                             </p>
+                                            {selectedTrx.product?._id && (
+                                                <Link
+                                                    to={`/admin/products?q=${encodeURIComponent(selectedTrx.product.code || selectedTrx.product.name || selectedTrx.product._id)}`}
+                                                    className="mt-2 inline-flex items-center gap-1 text-xs font-semibold ui-accent-text hover:underline"
+                                                >
+                                                    Buka produk <ExternalLink className="h-3.5 w-3.5" />
+                                                </Link>
+                                            )}
                                         </div>
 
                                         <div className="ui-panel-muted border ui-border rounded-xl p-3 flex items-start justify-between gap-3">
@@ -1128,11 +1631,33 @@ export default function AdminTransactions() {
                                             <p className="text-xs ui-text-muted">Member</p>
                                             <p className="text-sm ui-text font-semibold">{selectedTrx.user?.name || '-'}</p>
                                             <p className="text-xs ui-info-text break-all">{selectedTrx.user?.email || '-'}</p>
+                                            {selectedTrx.user?._id && (
+                                                <Link
+                                                    to={`/admin/users?q=${encodeURIComponent(selectedTrx.user.email || selectedTrx.user._id)}`}
+                                                    className="mt-2 inline-flex items-center gap-1 text-xs font-semibold ui-accent-text hover:underline"
+                                                >
+                                                    Buka user <ExternalLink className="h-3.5 w-3.5" />
+                                                </Link>
+                                            )}
                                         </div>
 
                                         <div className="ui-panel-muted border ui-border rounded-xl p-3">
                                             <p className="text-xs ui-text-muted">Nominal</p>
                                             <p className="text-lg ui-accent-text font-bold">{formatCurrency(selectedTrx.amount)}</p>
+                                            {selectedTrx.baseAmount && selectedTrx.baseAmount > selectedTrx.amount ? (
+                                                <p className="text-xs ui-text-muted mt-1">
+                                                    Sebelum promo {formatCurrency(selectedTrx.baseAmount)}
+                                                </p>
+                                            ) : null}
+                                            {selectedTrx.discountAmount ? (
+                                                <p className="text-xs ui-success-text mt-1">
+                                                    Diskon {formatCurrency(selectedTrx.discountAmount)}
+                                                    {selectedTrx.discountVoucherCode ? ` · ${selectedTrx.discountVoucherCode}` : ''}
+                                                </p>
+                                            ) : null}
+                                            {selectedTrx.flashSale ? (
+                                                <p className="text-xs ui-warning-text mt-1">Flash sale aktif</p>
+                                            ) : null}
                                             <p className={`text-xs mt-1 ${selectedTrx.refunded ? 'ui-success-text' : 'ui-text-muted'}`}>
                                                 {transactionBalanceCopy(toPresentationInput(selectedTrx))}
                                             </p>
@@ -1180,16 +1705,50 @@ export default function AdminTransactions() {
                                             <p className="text-sm ui-text">{selectedTrx.statusUpdatedBy?.name || '-'}</p>
                                             <p className="text-xs ui-text-muted">{selectedTrx.statusUpdatedBy?.email || selectedTrx.statusUpdatedBy?.role || '-'}</p>
                                         </div>
+
+                                        <div className="ui-panel-muted border ui-border rounded-xl p-3 md:col-span-2">
+                                            <p className="text-xs ui-text-muted">Timeline status (dari field transaksi)</p>
+                                            <div className="mt-3 space-y-2">
+                                                {buildTimeline(selectedTrx).map((event) => (
+                                                    <div key={`${event.label}-${event.at}`} className="flex gap-3">
+                                                        <div className={`mt-1 h-2 w-2 shrink-0 rounded-full ${event.tone.includes('success') ? 'bg-emerald-400' : event.tone.includes('warning') ? 'bg-amber-400' : 'bg-sky-400'}`} />
+                                                        <div className="min-w-0">
+                                                            <p className={`text-sm font-semibold ${event.tone}`}>{event.label}</p>
+                                                            <p className="text-xs ui-text-muted">{formatDateTime(event.at)}</p>
+                                                            {event.detail && <p className="mt-0.5 text-xs ui-text-muted whitespace-pre-wrap">{event.detail}</p>}
+                                                        </div>
+                                                    </div>
+                                                ))}
+                                                {buildTimeline(selectedTrx).length === 0 && (
+                                                    <p className="text-sm ui-text-muted">Belum ada jejak status.</p>
+                                                )}
+                                            </div>
+                                            <p className="mt-3 text-[11px] ui-text-muted">
+                                                Riwayat penuh audit log belum digabung di sini — ini ringkasan dari field transaksi.
+                                            </p>
+                                        </div>
                                     </div>
                                 </div>
 
                                 <div className="px-6 py-4 border-t ui-border flex flex-wrap justify-end gap-3">
+                                    {canEditStatus && (
+                                        <button
+                                            onClick={() => openEditModal(selectedTrx)}
+                                            className="ui-info-action inline-flex items-center gap-2 rounded-lg px-4 py-2 font-semibold"
+                                            title="Memerlukan step-up"
+                                        >
+                                            <Edit className="w-4 h-4" /> Edit status
+                                            <span className="rounded-full border px-2 py-0.5 text-[10px] font-bold ui-warning-chip">step-up</span>
+                                        </button>
+                                    )}
                                     {canEditStatus && !selectedTrx.refunded && selectedTrx.status !== 'success' && (
                                         <button
                                             onClick={() => openRefundModal(selectedTrx)}
                                             className="ui-warning-action inline-flex items-center gap-2 rounded-lg px-4 py-2 font-semibold transition-colors"
+                                            title="Memerlukan step-up"
                                         >
                                             <RotateCcw className="w-4 h-4" /> Refund Saldo
+                                            <span className="rounded-full border px-2 py-0.5 text-[10px] font-bold ui-warning-chip">step-up</span>
                                         </button>
                                     )}
                                     {canEditStatus && canRecheckVendor(toPresentationInput(selectedTrx)) && (

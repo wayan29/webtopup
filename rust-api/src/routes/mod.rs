@@ -227,6 +227,11 @@ pub fn app(state: Arc<AppState>) -> Router {
             "/v2/vouchers",
             get(vouchers::admin_list).post(vouchers::create),
         )
+        .route("/v2/vouchers/export", get(vouchers::admin_export))
+        .route("/v2/vouchers/giveaways", get(vouchers::giveaway_list).post(vouchers::giveaway_execute))
+        .route("/v2/vouchers/giveaways/preview", post(vouchers::giveaway_preview))
+        .route("/v2/vouchers/giveaways/{id}", get(vouchers::giveaway_detail))
+        .route("/v2/vouchers/discount/validate", post(vouchers::validate_discount))
         .route("/v2/vouchers/redeem", post(vouchers::redeem))
         .route("/v2/vouchers/{id}", delete(vouchers::archive))
         .route(
@@ -401,6 +406,8 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/v2/reports/dashboard", get(reports::dashboard_overview))
         .route("/v2/reports/sales", get(reports::sales_summary))
         .route("/v2/reports/sales/summary", get(reports::sales_summary))
+        .route("/v2/reports/promo", get(reports::promo_summary))
+        .route("/v2/reports/promo/export", get(reports::promo_export))
         .route(
             "/v2/reports/sales/export",
             get(reports::export_sales_report),

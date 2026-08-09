@@ -30,6 +30,7 @@ import {
   AdminUsers,
   AdminVouchers,
   AdminSalesReport,
+  AdminPromoReport,
   AdminVendors,
   AdminVendorHealth,
   AdminRewards,
@@ -438,6 +439,11 @@ function App() {
           <Route path="sales-report" element={
             <AdminGuarded path="/admin/sales-report">
               <AdminSalesReport />
+            </AdminGuarded>
+          } />
+          <Route path="promo-report" element={
+            <AdminGuarded path="/admin/promo-report">
+              <AdminPromoReport />
             </AdminGuarded>
           } />
           <Route path="notifications" element={

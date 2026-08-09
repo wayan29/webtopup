@@ -259,7 +259,6 @@ export default function Home() {
     const hasApiSliders = sliders.length > 0;
     const slidesCount = hasApiSliders ? sliders.length : defaultSlides.length;
     const activeFlashSales = flashSales.filter((flashSale) => flashSale.products.length > 0);
-    const primaryFlashSale = activeFlashSales[0] || null;
     const hasMultipleFlashSales = activeFlashSales.length > 1;
     const flashSaleEntries = activeFlashSales.flatMap((sale) => (
         sale.products.map((item) => ({ sale, item }))
@@ -810,13 +809,25 @@ export default function Home() {
                                         : 'Harga terbatas dengan stok yang terus bergerak.'}
                                 </p>
                             </div>
-                            {hasMultipleFlashSales ? (
-                                <div className="rounded-full border border-[var(--ui-accent)]/30 bg-[var(--ui-accent-soft)] px-4 py-2 text-sm font-semibold ui-accent-text ui-neon-pulse">
-                                    {activeFlashSales.length} promo aktif
-                                </div>
-                            ) : (
-                                primaryFlashSale && <HomeCountdown endDate={primaryFlashSale.endDate} />
-                            )}
+                            <div className="flex flex-col items-end gap-1.5">
+                                {hasMultipleFlashSales ? (
+                                    <div className="rounded-full border border-[var(--ui-accent)]/30 bg-[var(--ui-accent-soft)] px-4 py-2 text-sm font-semibold ui-accent-text ui-neon-pulse">
+                                        {activeFlashSales.length} promo aktif
+                                    </div>
+                                ) : null}
+                                {(() => {
+                                    const nearestEnd = activeFlashSales
+                                        .map((sale) => sale.endDate)
+                                        .filter(Boolean)
+                                        .sort()[0];
+                                    return nearestEnd ? (
+                                        <div className="flex items-center gap-2">
+                                            <span className="text-[11px] ui-text-muted">Berakhir dalam</span>
+                                            <HomeCountdown endDate={nearestEnd} />
+                                        </div>
+                                    ) : null;
+                                })()}
+                            </div>
                         </div>
 
                         <div className="overflow-x-auto pb-4 scrollbar-hide">

@@ -118,8 +118,13 @@ export default function ImagePicker({
 
     if (!isOpen) return null;
 
-    const tabs = [
-        { id: type, label: title }
+    // Show all gallery folders so images uploaded elsewhere (e.g. product icons)
+    // stay selectable here; the context folder stays the default tab.
+    const tabs: Array<{ id: 'icons' | 'covers' | 'popups' | 'instructions'; label: string }> = [
+        { id: 'icons', label: 'Ikon' },
+        { id: 'covers', label: 'Cover / Banner' },
+        { id: 'popups', label: 'Popup' },
+        { id: 'instructions', label: 'Instruksi' },
     ];
 
     return (

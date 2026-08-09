@@ -158,16 +158,18 @@ const getRoutePattern = (request: FastifyRequest) => {
     return routeOptions?.url || request.url.split('?')[0] || 'unknown';
 };
 
-const CRITICAL_IDEMPOTENT_ROUTE_PATTERNS = new Set([
+export const CRITICAL_IDEMPOTENT_ROUTE_PATTERNS = new Set([
     '/users/:id/balance',
     '/api/v2/users/:id/balance',
     '/transactions/:id/refund',
     '/api/v2/transactions/:id/refund',
     '/guest-transactions',
     '/api/v2/guest-transactions',
+    '/vouchers/giveaways',
+    '/api/v2/vouchers/giveaways',
 ]);
 
-const isCriticalIdempotentMutation = (request: FastifyRequest) => {
+export const isCriticalIdempotentMutation = (request: FastifyRequest) => {
     if ((request.method || '').toUpperCase() !== 'POST') {
         return false;
     }
@@ -182,7 +184,7 @@ const criticalIdempotencyEnforced = () => {
     return !(raw === '0' || raw === 'false' || raw === 'no' || raw === 'off');
 };
 
-const normalizeGatewayIdempotencyKey = (raw: unknown): string | null => {
+export const normalizeGatewayIdempotencyKey = (raw: unknown): string | null => {
     if (typeof raw !== 'string') {
         return null;
     }
@@ -207,7 +209,7 @@ const readIdempotencyKeyHeader = (request: FastifyRequest): string | undefined =
 };
 
 /** Fail closed at the gateway for critical financial mutations missing a bounded key. */
-const requireCriticalIdempotencyKey = async (request: FastifyRequest, reply: FastifyReply) => {
+export const requireCriticalIdempotencyKey = async (request: FastifyRequest, reply: FastifyReply) => {
     if (!isCriticalIdempotentMutation(request) || !criticalIdempotencyEnforced()) {
         return;
     }
@@ -1490,6 +1492,19 @@ const proxyUnlock = async (request: AuthRequest, reply: FastifyReply) => {
     app.all('/vendors/:id', { preHandler: [authenticate, hasPermission('manageVendors')] }, proxyRequest);
     app.all('/vendors/*', { preHandler: [authenticate, hasPermission('viewVendors')] }, proxyRequest);
     app.post('/vouchers/redeem', { preHandler: [voucherRedeemRateLimit, authenticate] }, proxyRequest);
+    // Giveaway execution credits member balances, so it needs both a bounded idempotency key
+    // and the same server-selected finance step-up as direct balance adjustments. Keep this
+    // route before the generic voucher catch-all so the trusted group is stamped upstream.
+    app.post('/vouchers/giveaways', {
+        preHandler: [
+            authenticate,
+            hasPermission('manageVouchers'),
+            requireStepUp('finance.adjust_balance'),
+            requireCriticalIdempotencyKey,
+        ],
+    }, proxyRequest);
+    // Checkout discount validation is public (guest checkout) with rate limit; optional auth enriches one-per-user checks.
+    app.post('/vouchers/discount/validate', { preHandler: [guestTransactionRateLimit] }, proxyRequest);
     app.all('/vouchers*', { preHandler: [authenticate, hasPermission('manageVouchers')] }, proxyRequest);
     app.post('/webhook/digiflazz', { preHandler: [webhookRateLimit] }, handleDigiflazzWebhook);
     app.post('/webhook/tokovoucher', { preHandler: [webhookRateLimit] }, handleTokovoucherWebhook);

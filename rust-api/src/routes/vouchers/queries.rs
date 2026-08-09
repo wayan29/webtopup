@@ -10,6 +10,24 @@ pub(super) async fn build_match(
     query: &VoucherQuery,
 ) -> Result<Document, &'static str> {
     let mut match_doc = Document::new();
+    let mut and_clauses: Vec<Document> = Vec::new();
+    let kind = query.kind.as_deref().map(str::trim).unwrap_or("balance");
+    match kind {
+        "" | "balance" => {
+            // Legacy docs without kind are balance vouchers.
+            and_clauses.push(doc! {
+                "$or": [
+                    { "kind": "balance" },
+                    { "kind": { "$exists": false } },
+                ]
+            });
+        }
+        "discount" => {
+            match_doc.insert("kind", "discount");
+        }
+        "all" => {}
+        _ => return Err("Jenis voucher tidak valid"),
+    }
     let status = query.status.as_deref().map(str::trim).unwrap_or_default();
     if !status.is_empty() {
         match status {
@@ -45,19 +63,37 @@ pub(super) async fn build_match(
         match_doc.insert("createdAt", created_at);
     }
 
+    let mut amount_range = Document::new();
+    if let Some(min_amount) = query.min_amount.filter(|value| *value >= 0) {
+        amount_range.insert("$gte", min_amount);
+    }
+    if let Some(max_amount) = query.max_amount.filter(|value| *value >= 0) {
+        amount_range.insert("$lte", max_amount);
+    }
+    if let (Some(min_amount), Some(max_amount)) = (query.min_amount, query.max_amount) {
+        if min_amount > max_amount {
+            return Err("Rentang nominal voucher tidak valid");
+        }
+    }
+    if !amount_range.is_empty() {
+        match_doc.insert("amount", amount_range);
+    }
+
     let search = query.search.as_deref().map(str::trim).unwrap_or_default();
     if !search.is_empty() {
         let regex = doc! { "$regex": escape_regex(search), "$options": "i" };
         let user_ids = matched_user_ids(client, db_name, regex.clone()).await;
-        match_doc.insert(
-            "$or",
-            vec![
-                doc! { "code": regex },
-                doc! { "redeemedBy": { "$in": user_ids.clone() } },
-                doc! { "createdBy": { "$in": user_ids.clone() } },
-                doc! { "archivedBy": { "$in": user_ids } },
-            ],
-        );
+        and_clauses.push(doc! {
+            "$or": [
+                { "code": regex },
+                { "redeemedBy": { "$in": user_ids.clone() } },
+                { "createdBy": { "$in": user_ids.clone() } },
+                { "archivedBy": { "$in": user_ids } },
+            ]
+        });
+    }
+    if !and_clauses.is_empty() {
+        match_doc.insert("$and", and_clauses);
     }
 
     Ok(match_doc)

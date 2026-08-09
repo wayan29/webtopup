@@ -156,6 +156,12 @@ export default function AdminDeposits() {
     const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
     const latestRequestId = useRef(0);
 
+    // Bulk action state: selectable pending rows on the current page.
+    const [selectedIds, setSelectedIds] = useState<string[]>([]);
+    const [bulkAction, setBulkAction] = useState<{ type: 'approve' | 'reject' } | null>(null);
+    const [bulkNote, setBulkNote] = useState('');
+    const [bulkRunning, setBulkRunning] = useState(false);
+
     const hasUnappliedChanges = useMemo(() => (
         filterKeys.some((key) => draftFilters[key] !== filters[key])
     ), [draftFilters, filters]);
@@ -251,6 +257,47 @@ export default function AdminDeposits() {
     }, [meta]);
 
     const pendingDeposits = deposits.filter((deposit) => deposit.status === 'pending').slice(0, 4);
+
+    // Quick presets mirror common operator flows; preset writes into draft + applied filters at once.
+    const applyPreset = (preset: 'pending-today' | 'mine' | 'unassigned') => {
+        const next: Filters = { ...defaultFilters };
+        if (preset === 'pending-today') {
+            next.status = 'pending';
+        } else if (preset === 'mine') {
+            next.status = 'pending';
+            next.assignment = 'mine';
+        } else if (preset === 'unassigned') {
+            next.status = 'pending';
+            next.assignment = 'unassigned';
+        }
+        setDraftFilters(next);
+        setFilters(next);
+        setMeta((current) => ({ ...current, page: 1 }));
+        setMessage(null);
+        syncUrlParams(next);
+    };
+
+    const selectablePending = useMemo(
+        () => deposits.filter((deposit) => deposit.status === 'pending' && !isDepositLockedByOther(deposit)),
+        // isDepositLockedByOther reads isOwner/user from closure; stable enough per render.
+        [deposits, user?.id, isOwner]
+    );
+    const selectableIds = useMemo(() => selectablePending.map((deposit) => deposit._id), [selectablePending]);
+    const selectedCount = selectedIds.length;
+    const allSelectableChecked = selectableIds.length > 0 && selectableIds.every((id) => selectedIds.includes(id));
+
+    // Drop selections that disappear after refetch (approved/rejected/locked rows no longer selectable).
+    useEffect(() => {
+        setSelectedIds((current) => current.filter((id) => selectableIds.includes(id)));
+    }, [selectableIds]);
+
+    const toggleSelectAll = () => {
+        setSelectedIds(allSelectableChecked ? [] : [...selectableIds]);
+    };
+
+    const toggleSelectOne = (id: string) => {
+        setSelectedIds((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]));
+    };
 
     const resetFilters = () => {
         setDraftFilters(defaultFilters);
@@ -411,6 +458,73 @@ export default function AdminDeposits() {
         } finally {
             setExporting(false);
         }
+    };
+
+    // Bulk approve/reject: run sequentially so step-up challenge fires once and failures are reported per-item.
+    const handleBulkAction = async () => {
+        if (!bulkAction || selectedIds.length === 0) return;
+        const note = bulkNote.trim();
+        if (note.length < 5) {
+            setMessage({ type: 'error', text: 'Catatan bulk minimal 5 karakter wajib diisi' });
+            return;
+        }
+
+        setBulkRunning(true);
+        setMessage(null);
+        const type = bulkAction.type;
+        let succeeded = 0;
+        const failed: string[] = [];
+
+        try {
+            for (const id of selectedIds) {
+                try {
+                    // eslint-disable-next-line no-await-in-loop
+                    const response = await stepUp.run('finance.deposit_approval', (config) =>
+                        apiV2.put(`/deposits/${id}/${type}`, { note }, config as never)
+                    );
+                    const updatedDeposit = response.data?.deposit as Deposit | undefined;
+                    if (updatedDeposit) syncUpdatedDeposit(updatedDeposit);
+                    succeeded += 1;
+                } catch (error: any) {
+                    const deposit = deposits.find((item) => item._id === id);
+                    const label = deposit?.invoiceCode || id.slice(-6);
+                    const text = stepUpActionErrorMessage(error, '');
+                    failed.push(`${label}${text ? ` (${text})` : ''}`);
+                }
+            }
+
+            refreshSidebarBadges();
+            setMessage(
+                failed.length === 0
+                    ? {
+                        type: 'success',
+                        text: `${succeeded} deposit berhasil ${type === 'approve' ? 'disetujui' : 'ditolak'}.`,
+                    }
+                    : {
+                        type: 'error',
+                        text: `${succeeded} berhasil, ${failed.length} gagal: ${failed.slice(0, 3).join(', ')}${failed.length > 3 ? '…' : ''}`,
+                    }
+            );
+            setBulkAction(null);
+            setBulkNote('');
+            setSelectedIds([]);
+            await fetchDeposits();
+        } finally {
+            setBulkRunning(false);
+        }
+    };
+
+    const ageBadge = (createdAt: string) => {
+        const ageMs = Date.now() - new Date(createdAt).getTime();
+        const minutes = Math.floor(ageMs / 60000);
+        if (minutes < 30) return null;
+        const label = minutes >= 60 ? `${Math.floor(minutes / 60)}j ${minutes % 60}m` : `${minutes}m`;
+        return (
+            <span className="ui-warning-chip inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-bold" title={`Menunggu ${label}`}>
+                <Clock className="h-3 w-3" />
+                {label}
+            </span>
+        );
     };
 
     if (!canViewDeposits) {
@@ -621,6 +735,30 @@ export default function AdminDeposits() {
                         <Search className="w-4 h-4" />
                         Cari
                     </button>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="text-xs ui-text-muted">Preset:</span>
+                        <button
+                            type="button"
+                            onClick={() => applyPreset('pending-today')}
+                            className="ui-muted-action rounded-full border px-3 py-1 text-xs font-semibold hover:border-[var(--ui-accent)]"
+                        >
+                            Pending
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => applyPreset('unassigned')}
+                            className="ui-muted-action rounded-full border px-3 py-1 text-xs font-semibold hover:border-[var(--ui-accent)]"
+                        >
+                            Belum di-claim
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => applyPreset('mine')}
+                            className="ui-muted-action rounded-full border px-3 py-1 text-xs font-semibold hover:border-[var(--ui-accent)]"
+                        >
+                            Claim saya
+                        </button>
+                    </div>
                     <button
                         onClick={resetFilters}
                         className="ui-muted-action inline-flex items-center gap-2 px-4 py-2 rounded-lg border text-sm font-semibold transition-colors"
@@ -657,12 +795,56 @@ export default function AdminDeposits() {
                         <p className="text-xs font-semibold uppercase tracking-[0.22em] ui-accent-text">Antrean Deposit</p>
                         <h2 className="mt-1 text-lg font-bold ui-text">Daftar mutasi deposit user</h2>
                     </div>
-                    <div className="text-xs ui-text-muted">{pageRangeText}</div>
+                    <div className="flex flex-wrap items-center gap-2">
+                        {canApproveDeposits && selectedCount > 0 ? (
+                            <>
+                                <span className="rounded-full border ui-accent-chip px-3 py-1 text-xs font-bold">
+                                    {selectedCount} dipilih
+                                </span>
+                                <button
+                                    type="button"
+                                    onClick={() => { setBulkAction({ type: 'approve' }); setBulkNote(''); }}
+                                    className="ui-success-action inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-bold"
+                                >
+                                    <CheckCircle className="h-3.5 w-3.5" />
+                                    Setujui massal
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => { setBulkAction({ type: 'reject' }); setBulkNote(''); }}
+                                    className="ui-danger-action inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-bold"
+                                >
+                                    <XCircle className="h-3.5 w-3.5" />
+                                    Tolak massal
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => setSelectedIds([])}
+                                    className="ui-muted-action rounded-lg border px-3 py-1.5 text-xs font-semibold"
+                                >
+                                    Batal pilih
+                                </button>
+                            </>
+                        ) : null}
+                        <span className="text-xs ui-text-muted">{pageRangeText}</span>
+                    </div>
                 </div>
                 <div className="overflow-x-auto">
                     <table className="min-w-full">
                         <thead>
                             <tr className="ui-panel ui-text-muted text-xs uppercase">
+                                {canApproveDeposits ? (
+                                    <th className="px-4 py-3 text-left font-semibold w-10">
+                                        <input
+                                            type="checkbox"
+                                            aria-label="Pilih semua deposit pending di halaman ini"
+                                            checked={allSelectableChecked}
+                                            onChange={toggleSelectAll}
+                                            disabled={selectableIds.length === 0}
+                                            className="h-4 w-4 accent-[var(--ui-accent)] disabled:opacity-40"
+                                        />
+                                    </th>
+                                ) : null}
                                 <th className="px-4 py-3 text-left font-semibold">Invoice</th>
                                 <th className="px-4 py-3 text-left font-semibold">User</th>
                                 <th className="px-4 py-3 text-left font-semibold">Transfer</th>
@@ -675,13 +857,13 @@ export default function AdminDeposits() {
                         <tbody className="divide-y divide-[var(--ui-border)]">
                             {loading ? (
                                 <tr>
-                                    <td colSpan={7} className="px-4 py-10 text-center ui-text-muted">
+                                    <td colSpan={canApproveDeposits ? 8 : 7} className="px-4 py-10 text-center ui-text-muted">
                                         Memuat data deposit...
                                     </td>
                                 </tr>
                             ) : deposits.length === 0 ? (
                                 <tr>
-                                    <td colSpan={7} className="px-4 py-10 text-center ui-text-muted font-semibold">
+                                    <td colSpan={canApproveDeposits ? 8 : 7} className="px-4 py-10 text-center ui-text-muted font-semibold">
                                         Tidak ada deposit yang cocok dengan filter aktif.
                                     </td>
                                 </tr>
@@ -689,14 +871,31 @@ export default function AdminDeposits() {
                                 deposits.map((deposit) => {
                                     const lockedByOther = isDepositLockedByOther(deposit);
                                     const canReleaseClaim = Boolean(deposit.assignedTo?._id) && (isOwner || isDepositAssignedToMe(deposit));
+                                    const isSelectable = deposit.status === 'pending' && !lockedByOther;
+                                    const isSelected = selectedIds.includes(deposit._id);
 
                                     return (
-                                    <tr key={deposit._id} className="hover:bg-[var(--ui-card-bg)] align-top">
+                                    <tr key={deposit._id} className={`hover:bg-[var(--ui-card-bg)] align-top ${isSelected ? 'bg-[var(--ui-accent-soft)]/40' : ''}`}>
+                                        {canApproveDeposits ? (
+                                            <td className="px-4 py-3 text-sm">
+                                                <input
+                                                    type="checkbox"
+                                                    aria-label={`Pilih deposit ${deposit.invoiceCode || deposit._id}`}
+                                                    checked={isSelected}
+                                                    onChange={() => toggleSelectOne(deposit._id)}
+                                                    disabled={!isSelectable}
+                                                    className="h-4 w-4 accent-[var(--ui-accent)] disabled:opacity-40"
+                                                />
+                                            </td>
+                                        ) : null}
                                         <td className="px-4 py-3 text-sm">
                                             <div className="space-y-1">
                                                 <div className="font-semibold ui-info-text">{deposit.invoiceCode || `INV${deposit._id.slice(-8).toUpperCase()}`}</div>
                                                 <div className="text-xs ui-text-muted break-all">{deposit._id}</div>
-                                                <div className="text-xs ui-text-muted">{new Date(deposit.createdAt).toLocaleString('id-ID')}</div>
+                                                <div className="flex items-center gap-2 text-xs ui-text-muted">
+                                                    <span>{new Date(deposit.createdAt).toLocaleString('id-ID')}</span>
+                                                    {deposit.status === 'pending' ? ageBadge(deposit.createdAt) : null}
+                                                </div>
                                             </div>
                                         </td>
                                         <td className="px-4 py-3 text-sm ui-text">
@@ -1068,6 +1267,82 @@ export default function AdminDeposits() {
                 </div>
             ) : null}
         </div>
+            {bulkAction ? (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+                    <div className="w-full max-w-lg rounded-xl border ui-border ui-panel-muted shadow-xl">
+                        <div className="border-b ui-border p-4">
+                            <h2 className="text-lg font-semibold ui-text">
+                                {bulkAction.type === 'approve' ? 'Setujui Massal' : 'Tolak Massal'} — {selectedIds.length} deposit
+                            </h2>
+                            <p className="mt-1 text-sm ui-text-muted">
+                                Aksi ini memproses satu per satu; yang gagal dilewati dan dilaporkan.
+                            </p>
+                        </div>
+                        <div className="space-y-4 p-4">
+                            <div className="rounded-lg border ui-border ui-panel p-3 text-sm ui-text">
+                                {selectedIds.slice(0, 5).map((id) => {
+                                    const deposit = deposits.find((item) => item._id === id);
+                                    if (!deposit) return null;
+                                    return (
+                                        <div key={id} className="flex items-center justify-between gap-3 py-1">
+                                            <span className="truncate font-mono text-xs ui-info-text">
+                                                {deposit.invoiceCode || `INV${id.slice(-8).toUpperCase()}`}
+                                            </span>
+                                            <span className="shrink-0 text-xs font-semibold">
+                                                {formatCurrency(deposit.totalAmount || deposit.amount)}
+                                            </span>
+                                        </div>
+                                    );
+                                })}
+                                {selectedIds.length > 5 ? (
+                                    <p className="pt-1 text-xs ui-text-muted">+{selectedIds.length - 5} deposit lainnya</p>
+                                ) : null}
+                            </div>
+                            <div className="space-y-2">
+                                <label className="block text-sm font-medium ui-text-muted">
+                                    {bulkAction.type === 'approve' ? 'Catatan approval (dipakai untuk semua)' : 'Catatan penolakan (dipakai untuk semua)'}
+                                </label>
+                                <textarea
+                                    value={bulkNote}
+                                    onChange={(event) => setBulkNote(event.target.value)}
+                                    rows={3}
+                                    className="ui-field w-full rounded-lg border px-3 py-2 text-sm focus:outline-none"
+                                    placeholder={bulkAction.type === 'approve' ? 'Contoh: mutasi batch pagi terverifikasi.' : 'Jelaskan alasan penolakan.'}
+                                />
+                            </div>
+                            {bulkAction.type === 'approve' ? (
+                                <div className="rounded-lg border p-3 text-sm ui-warning-chip">
+                                    Saldo {selectedIds.length} user akan bertambah. Pastikan semua mutasi sudah diverifikasi.
+                                </div>
+                            ) : null}
+                            <div className="flex justify-end gap-3">
+                                <button
+                                    type="button"
+                                    onClick={() => { setBulkAction(null); setBulkNote(''); }}
+                                    disabled={bulkRunning}
+                                    className="rounded-lg border ui-border px-4 py-2 text-sm font-medium ui-text-muted hover:bg-[var(--ui-card-muted)] disabled:opacity-50"
+                                >
+                                    Batal
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={handleBulkAction}
+                                    disabled={bulkRunning || bulkNote.trim().length < 5}
+                                    className={`rounded-lg px-4 py-2 text-sm font-semibold ui-text disabled:opacity-50 ${
+                                        bulkAction.type === 'approve' ? 'ui-success-action' : 'ui-danger-action'
+                                    }`}
+                                >
+                                    {bulkRunning
+                                        ? 'Memproses...'
+                                        : bulkAction.type === 'approve'
+                                            ? `Setujui ${selectedIds.length}`
+                                            : `Tolak ${selectedIds.length}`}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            ) : null}
             {stepUp.dialog}
         </>
     );

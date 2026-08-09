@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { Link } from 'react-router-dom';
 import { bindIdleLockFocusTrap } from '../../auth/idleLockFocus.ts';
 import type { StepUpActionGroup } from '../../auth/stepUp.ts';
 
@@ -7,6 +8,12 @@ type Props = {
   actionGroup: StepUpActionGroup;
   error?: string | null;
   busy?: boolean;
+  /**
+   * When false, staff has not enrolled 2FA yet. Backend rejects step-up grants
+   * (AUTH_2FA_ENROLLMENT_REQUIRED), so show an enrollment CTA instead of an OTP form
+   * that can never succeed.
+   */
+  twoFactorEnabled?: boolean;
   onSubmit(password: string, otp: string): Promise<void>;
   onClose(): void;
 };
@@ -27,12 +34,16 @@ const GROUP_LABELS: Record<StepUpActionGroup, string> = {
 /**
  * Focus-trapped step-up dialog. Escape closes only before submission starts.
  * Password/OTP are ephemeral and cleared on close.
+ *
+ * Unenrolled staff (twoFactorEnabled === false) see a CTA to /admin/security instead of
+ * an OTP form that the backend will always reject.
  */
 export default function StepUpDialog({
   open,
   actionGroup,
   error,
   busy = false,
+  twoFactorEnabled = true,
   onSubmit,
   onClose,
 }: Props) {
@@ -41,6 +52,7 @@ export default function StepUpDialog({
   const [otp, setOtp] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const submittedRef = useRef(false);
+  const needsEnrollment = twoFactorEnabled === false;
 
   useEffect(() => {
     if (!open) {
@@ -76,6 +88,7 @@ export default function StepUpDialog({
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
+    if (needsEnrollment) return;
     if (!password || submitting || busy) return;
     setSubmitting(true);
     submittedRef.current = true;
@@ -105,55 +118,90 @@ export default function StepUpDialog({
         className="w-full max-w-md rounded-2xl bg-white p-6 text-slate-900 shadow-2xl"
       >
         <h2 id="step-up-title" className="text-xl font-bold">
-          Verifikasi ulang diperlukan
+          {needsEnrollment ? 'Aktifkan 2FA terlebih dahulu' : 'Verifikasi ulang diperlukan'}
         </h2>
-        <p className="mt-2 text-sm text-slate-600">
-          Masukkan password dan kode OTP untuk mengizinkan {GROUP_LABELS[actionGroup]} selama lima menit.
-        </p>
-        <form onSubmit={submit} className="mt-5 space-y-4">
-          <label className="block text-sm font-semibold">
-            Password
-            <input
-              autoComplete="current-password"
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              className="mt-1 w-full rounded-lg border px-3 py-2"
-            />
-          </label>
-          <label className="block text-sm font-semibold">
-            Kode OTP
-            <input
-              autoComplete="one-time-code"
-              inputMode="numeric"
-              value={otp}
-              onChange={(e) => setOtp(e.target.value)}
-              className="mt-1 w-full rounded-lg border px-3 py-2"
-            />
-          </label>
-          {error && (
-            <p role="alert" className="text-sm text-red-700">
-              {error}
+        {needsEnrollment ? (
+          <>
+            <p className="mt-2 text-sm text-slate-600">
+              Aksi <span className="font-semibold">{GROUP_LABELS[actionGroup]}</span> dilindungi
+              step-up. Staf (termasuk owner) wajib mengaktifkan 2FA sebelum perubahan email,
+              password, atau aksi sensitif lain bisa dilanjutkan.
             </p>
-          )}
-          <div className="flex gap-2">
-            <button
-              type="button"
-              onClick={close}
-              disabled={submitting || busy}
-              className="flex-1 rounded-lg border px-4 py-2 font-semibold disabled:opacity-50"
-            >
-              Batal
-            </button>
-            <button
-              type="submit"
-              disabled={submitting || busy || !password || !otp.trim()}
-              className="flex-1 rounded-lg bg-slate-900 px-4 py-2 font-semibold text-white disabled:opacity-50"
-            >
-              {submitting || busy ? 'Memverifikasi…' : 'Lanjutkan'}
-            </button>
-          </div>
-        </form>
+            {error && (
+              <p role="alert" className="mt-3 text-sm text-red-700">
+                {error}
+              </p>
+            )}
+            <div className="mt-5 flex gap-2">
+              <button
+                type="button"
+                onClick={close}
+                disabled={submitting || busy}
+                className="flex-1 rounded-lg border px-4 py-2 font-semibold disabled:opacity-50"
+              >
+                Batal
+              </button>
+              <Link
+                to="/admin/security"
+                onClick={close}
+                className="flex-1 rounded-lg bg-slate-900 px-4 py-2 text-center font-semibold text-white"
+              >
+                Buka Keamanan
+              </Link>
+            </div>
+          </>
+        ) : (
+          <>
+            <p className="mt-2 text-sm text-slate-600">
+              Masukkan password dan kode OTP untuk mengizinkan {GROUP_LABELS[actionGroup]} selama
+              lima menit.
+            </p>
+            <form onSubmit={submit} className="mt-5 space-y-4">
+              <label className="block text-sm font-semibold">
+                Password
+                <input
+                  autoComplete="current-password"
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  className="mt-1 w-full rounded-lg border px-3 py-2"
+                />
+              </label>
+              <label className="block text-sm font-semibold">
+                Kode OTP
+                <input
+                  autoComplete="one-time-code"
+                  inputMode="numeric"
+                  value={otp}
+                  onChange={(e) => setOtp(e.target.value)}
+                  className="mt-1 w-full rounded-lg border px-3 py-2"
+                />
+              </label>
+              {error && (
+                <p role="alert" className="text-sm text-red-700">
+                  {error}
+                </p>
+              )}
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={close}
+                  disabled={submitting || busy}
+                  className="flex-1 rounded-lg border px-4 py-2 font-semibold disabled:opacity-50"
+                >
+                  Batal
+                </button>
+                <button
+                  type="submit"
+                  disabled={submitting || busy || !password || !otp.trim()}
+                  className="flex-1 rounded-lg bg-slate-900 px-4 py-2 font-semibold text-white disabled:opacity-50"
+                >
+                  {submitting || busy ? 'Memverifikasi…' : 'Lanjutkan'}
+                </button>
+              </div>
+            </form>
+          </>
+        )}
       </div>
     </div>
   );

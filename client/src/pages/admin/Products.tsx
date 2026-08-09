@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Link, useSearchParams } from 'react-router-dom';
 import { apiV2 } from '../../api';
-import { Plus, Search, Package, FileSpreadsheet, X, AlertCircle, Download, Sparkles, LayoutGrid, List, Edit2, ArrowUpDown, ChevronLeft, ChevronRight, ChevronDown, ChevronUp, SlidersHorizontal, Power, Trash2 } from 'lucide-react';
+import { Plus, Search, Package, FileSpreadsheet, X, AlertCircle, Download, Sparkles, LayoutGrid, List, Edit2, ArrowUpDown, ChevronLeft, ChevronRight, ChevronDown, ChevronUp, SlidersHorizontal, Power, Trash2, ExternalLink, Settings2 } from 'lucide-react';
 import ProductModal from '../../components/admin/ProductModal';
 import ProductSorting from '../../components/admin/ProductSorting';
 import { useAuthStore } from '../../store/useAuthStore';
@@ -122,11 +123,15 @@ export default function AdminProducts() {
     const [marginConfig, setMarginConfig] = useState<MarginConfig>({ basic: 10, gold: 5, platinum: 0 });
     const [loading, setLoading] = useState(true);
     const [viewMode, setViewMode] = useState<'list' | 'grid'>('list');
-    const [searchTerm, setSearchTerm] = useState('');
+    const [searchParams] = useSearchParams();
+    const [searchTerm, setSearchTerm] = useState(() => searchParams.get('q') || searchParams.get('search') || '');
     const [categoryFilter, setCategoryFilter] = useState('');
     const [operatorFilter, setOperatorFilter] = useState('');
     const [productTypeFilter, setProductTypeFilter] = useState('');
     const [statusFilter, setStatusFilter] = useState('all');
+    // Advanced list filters: loss-making prices and products missing an icon.
+    const [lossOnly, setLossOnly] = useState(false);
+    const [noImageOnly, setNoImageOnly] = useState(false);
     const [currentPage, setCurrentPage] = useState(1);
     const [pageSize, setPageSize] = useState(20);
     const [showFilters, setShowFilters] = useState(false);
@@ -139,10 +144,19 @@ export default function AdminProducts() {
     const [isBulkModalOpen, setIsBulkModalOpen] = useState(false);
     const [isBulkPriceOpen, setIsBulkPriceOpen] = useState(false);
     const [isAddTypeModalOpen, setIsAddTypeModalOpen] = useState(false);
+    /** Vendor credentials readiness for import chooser (null = still checking). */
+    const [digiflazzConfigured, setDigiflazzConfigured] = useState<boolean | null>(null);
+    const [tokovoucherConfigured, setTokovoucherConfigured] = useState<boolean | null>(null);
+    const [checkingVendorConfig, setCheckingVendorConfig] = useState(false);
     const [isVendorImportOpen, setIsVendorImportOpen] = useState(false);
     const [isSortingOpen, setIsSortingOpen] = useState(false);
     const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
     const [selectedDeleteProduct, setSelectedDeleteProduct] = useState<Product | null>(null);
+    // Bulk actions on the current page: activate/deactivate/archive.
+    const [selectedProductIds, setSelectedProductIds] = useState<string[]>([]);
+    const [bulkProductRunning, setBulkProductRunning] = useState(false);
+    // Duplicate mode: modal is prefilled from an existing product but saves as a new one.
+    const [isDuplicating, setIsDuplicating] = useState(false);
     const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
     const [dataSource, setDataSource] = useState<'api-v2' | 'api-v1'>('api-v2');
     const [showDeleteModal, setShowDeleteModal] = useState(false);
@@ -271,6 +285,30 @@ export default function AdminProducts() {
         }
     }, [message]);
 
+    const refreshVendorConfigured = useCallback(async () => {
+        if (!canManageProducts || !canManageVendors) {
+            setDigiflazzConfigured(null);
+            setTokovoucherConfigured(null);
+            return;
+        }
+        setCheckingVendorConfig(true);
+        try {
+            const [dg, tv] = await Promise.all([
+                apiV2.get('/vendors/digiflazz/settings').catch(() => null),
+                apiV2.get('/vendors/tokovoucher/settings').catch(() => null),
+            ]);
+            setDigiflazzConfigured(Boolean(dg?.data?.configured));
+            setTokovoucherConfigured(Boolean(tv?.data?.configured));
+        } finally {
+            setCheckingVendorConfig(false);
+        }
+    }, [canManageProducts, canManageVendors]);
+
+    useEffect(() => {
+        if (!isAddTypeModalOpen) return;
+        void refreshVendorConfigured();
+    }, [isAddTypeModalOpen, refreshVendorConfigured]);
+
     const handleAddProduct = () => {
         if (!canManageProducts) {
             setMessage({ type: 'error', text: 'Akun ini hanya dapat melihat produk. Perlu izin kelola produk untuk menambah.' });
@@ -283,6 +321,7 @@ export default function AdminProducts() {
         if (!canManageProducts) return;
         setIsAddTypeModalOpen(false);
         setSelectedProduct(null);
+        setIsDuplicating(false);
         setIsModalOpen(true);
     };
 
@@ -296,27 +335,72 @@ export default function AdminProducts() {
         setIsBulkModalOpen(true);
     };
 
-    const handleVendorImportFromSelector = () => {
+    const ensureVendorConfigured = async (vendor: 'digiflazz' | 'tokovoucher'): Promise<boolean> => {
         if (!canManageProducts || !canManageVendors) {
-            setMessage({ type: 'error', text: 'Import vendor membutuhkan izin kelola produk dan kelola vendor' });
-            return;
+            setMessage({
+                type: 'error',
+                text: 'Import vendor membutuhkan izin kelola produk dan kelola vendor',
+            });
+            return false;
         }
-        setIsAddTypeModalOpen(false);
-        handleVendorImportOpen();
+        try {
+            const path =
+                vendor === 'digiflazz'
+                    ? '/vendors/digiflazz/settings'
+                    : '/vendors/tokovoucher/settings';
+            const res = await apiV2.get(path);
+            const configured = Boolean(res.data?.configured);
+            if (vendor === 'digiflazz') setDigiflazzConfigured(configured);
+            else setTokovoucherConfigured(configured);
+            if (!configured) {
+                const label = vendor === 'digiflazz' ? 'Digiflazz' : 'Tokovoucher';
+                setMessage({
+                    type: 'error',
+                    text: `${label} belum dikonfigurasi. Isi kredensial di menu Add-ons → ${label} dulu sebelum import.`,
+                });
+                // Keep chooser open so user still sees the setup CTA on the import cards.
+                return false;
+            }
+            return true;
+        } catch {
+            setMessage({
+                type: 'error',
+                text: 'Gagal memeriksa pengaturan vendor. Coba lagi atau buka menu Add-ons.',
+            });
+            return false;
+        }
     };
 
-    const handleDgImportFromSelector = () => {
+    const handleVendorImportFromSelector = async () => {
         if (!canManageProducts || !canManageVendors) {
             setMessage({ type: 'error', text: 'Import vendor membutuhkan izin kelola produk dan kelola vendor' });
             return;
         }
+        const ok = await ensureVendorConfigured('tokovoucher');
+        if (!ok) return;
         setIsAddTypeModalOpen(false);
-        handleDgImportOpen();
+        await handleVendorImportOpen();
+    };
+
+    const handleDgImportFromSelector = async () => {
+        if (!canManageProducts || !canManageVendors) {
+            setMessage({ type: 'error', text: 'Import vendor membutuhkan izin kelola produk dan kelola vendor' });
+            return;
+        }
+        const ok = await ensureVendorConfigured('digiflazz');
+        if (!ok) return;
+        setIsAddTypeModalOpen(false);
+        await handleDgImportOpen();
     };
 
     const handleDgImportOpen = async () => {
         if (!canManageProducts || !canManageVendors) {
             setMessage({ type: 'error', text: 'Import Digiflazz membutuhkan izin kelola produk dan kelola vendor' });
+            return;
+        }
+        const ok = await ensureVendorConfigured('digiflazz');
+        if (!ok) {
+            setIsDgImportOpen(false);
             return;
         }
         setIsDgImportOpen(true);
@@ -511,6 +595,11 @@ export default function AdminProducts() {
             setMessage({ type: 'error', text: 'Import Tokovoucher membutuhkan izin kelola produk dan kelola vendor' });
             return;
         }
+        const ok = await ensureVendorConfigured('tokovoucher');
+        if (!ok) {
+            setIsVendorImportOpen(false);
+            return;
+        }
         setIsVendorImportOpen(true);
         setTvSelectedCategory('');
         setTvSelectedOperator('');
@@ -541,6 +630,22 @@ export default function AdminProducts() {
     const handleEdit = (product: Product) => {
         if (!canManageProducts) return;
         setSelectedProduct(product);
+        setIsDuplicating(false);
+        setIsModalOpen(true);
+    };
+
+    // Duplicate: prefill the modal with a copy (new code/name, no vendor SKU binding).
+    const handleDuplicate = (product: Product) => {
+        if (!canManageProducts) return;
+        setSelectedProduct({
+            ...product,
+            _id: '',
+            name: `${product.name} (Salinan)`,
+            code: '',
+            vendor: product.vendor ? { name: product.vendor.name, sku: '' } : { name: '', sku: '' },
+            status: false,
+        });
+        setIsDuplicating(true);
         setIsModalOpen(true);
     };
 
@@ -889,14 +994,17 @@ export default function AdminProducts() {
         }
 
         try {
-            if (selectedProduct) {
+            if (selectedProduct && !isDuplicating) {
                 await apiV2
                     .put(`/products/${selectedProduct._id}`, payload);
                 setMessage({ type: 'success', text: 'Produk berhasil diperbarui' });
             } else {
-                await apiV2.post('/products', payload);
-                setMessage({ type: 'success', text: 'Produk berhasil ditambahkan' });
+                // Create mode (new product or duplicate): never send a stale _id.
+                const { _id, ...createPayload } = payload;
+                await apiV2.post('/products', createPayload);
+                setMessage({ type: 'success', text: isDuplicating ? 'Produk duplikat berhasil dibuat' : 'Produk berhasil ditambahkan' });
             }
+            setIsDuplicating(false);
             await fetchData();
         } catch (error) {
             console.error('Failed to save product', error);
@@ -1160,9 +1268,14 @@ export default function AdminProducts() {
                 ? true
                 : statusFilter === 'active' ? p.status : !p.status;
 
-            return matchesSearch && matchesCategory && matchesOperator && matchesProductType && matchesStatus;
+            const cost = p.costPrice || 0;
+            const isLoss = hasLossPrice(cost, p.price);
+            const matchesLoss = !lossOnly || (cost > 0 && isLoss);
+            const matchesNoImage = !noImageOnly || !p.icon;
+
+            return matchesSearch && matchesCategory && matchesOperator && matchesProductType && matchesStatus && matchesLoss && matchesNoImage;
         });
-    }, [products, searchTerm, categoryFilter, operatorFilter, productTypeFilter, statusFilter, operatorsAll, productTypesAll, categories]);
+    }, [products, searchTerm, categoryFilter, operatorFilter, productTypeFilter, statusFilter, lossOnly, noImageOnly, operatorsAll, productTypesAll, categories]);
 
     const activeProductsCount = useMemo(
         () => products.filter((p) => p.status).length,
@@ -1182,7 +1295,7 @@ export default function AdminProducts() {
     );
 
     const hasActiveFilters = Boolean(
-        searchTerm || categoryFilter || operatorFilter || productTypeFilter || statusFilter !== 'all'
+        searchTerm || categoryFilter || operatorFilter || productTypeFilter || statusFilter !== 'all' || lossOnly || noImageOnly
     );
     const activeFilterCount = [
         Boolean(searchTerm),
@@ -1190,6 +1303,8 @@ export default function AdminProducts() {
         Boolean(operatorFilter),
         Boolean(productTypeFilter),
         statusFilter !== 'all',
+        lossOnly,
+        noImageOnly,
     ].filter(Boolean).length;
 
     const totalPages = Math.max(1, Math.ceil(filteredProducts.length / pageSize));
@@ -1202,6 +1317,60 @@ export default function AdminProducts() {
 
     const visibleStart = filteredProducts.length === 0 ? 0 : (resolvedCurrentPage - 1) * pageSize + 1;
     const visibleEnd = Math.min(resolvedCurrentPage * pageSize, filteredProducts.length);
+
+    const pageProductIds = useMemo(() => paginatedProducts.map((p) => p._id), [paginatedProducts]);
+    const allPageSelected = pageProductIds.length > 0 && pageProductIds.every((id) => selectedProductIds.includes(id));
+    const selectedPageProducts = useMemo(
+        () => paginatedProducts.filter((p) => selectedProductIds.includes(p._id)),
+        [paginatedProducts, selectedProductIds]
+    );
+
+    // Drop selections that are no longer on the current page data (e.g. after refetch).
+    useEffect(() => {
+        const visibleSet = new Set(products.map((p) => p._id));
+        setSelectedProductIds((current) => current.filter((id) => visibleSet.has(id)));
+    }, [products]);
+
+    const toggleSelectAllPage = () => {
+        setSelectedProductIds(allPageSelected ? [] : [...pageProductIds]);
+    };
+
+    const toggleSelectProduct = (id: string) => {
+        setSelectedProductIds((current) => (current.includes(id) ? current.filter((item) => item !== id) : [...current, id]));
+    };
+
+    const runBulkProductAction = async (action: 'activate' | 'deactivate' | 'archive') => {
+        if (!canManageProducts || selectedProductIds.length === 0 || bulkProductRunning) return;
+        setBulkProductRunning(true);
+        setMessage(null);
+        let succeeded = 0;
+        let failed = 0;
+        try {
+            for (const id of selectedProductIds) {
+                try {
+                    // eslint-disable-next-line no-await-in-loop
+                    if (action === 'archive') {
+                        await apiV2.delete(`/products/${id}`);
+                    } else {
+                        await apiV2.put(`/products/${id}`, { status: action === 'activate' });
+                    }
+                    succeeded += 1;
+                } catch {
+                    failed += 1;
+                }
+            }
+            const label = action === 'activate' ? 'diaktifkan' : action === 'deactivate' ? 'dinonaktifkan' : 'diarsipkan';
+            setMessage(
+                failed === 0
+                    ? { type: 'success', text: `${succeeded} produk berhasil ${label}.` }
+                    : { type: 'error', text: `${succeeded} produk ${label}, ${failed} gagal. Coba ulangi yang gagal.` }
+            );
+            setSelectedProductIds([]);
+            await fetchData();
+        } finally {
+            setBulkProductRunning(false);
+        }
+    };
 
     const filteredOperators = useMemo(() => {
         return operatorsAll.filter((o) => !categoryFilter || o.categoryId === categoryFilter);
@@ -1295,6 +1464,8 @@ export default function AdminProducts() {
         setOperatorFilter('');
         setProductTypeFilter('');
         setStatusFilter('all');
+        setLossOnly(false);
+        setNoImageOnly(false);
         setCurrentPage(1);
     };
 
@@ -1450,6 +1621,25 @@ export default function AdminProducts() {
                             <option value="active">Aktif</option>
                             <option value="inactive">Nonaktif</option>
                         </select>
+
+                        <label className="flex items-center gap-2 rounded-lg ui-panel border ui-border px-3 py-2 text-sm ui-text cursor-pointer">
+                            <input
+                                type="checkbox"
+                                checked={lossOnly}
+                                onChange={(e) => setLossOnly(e.target.checked)}
+                                className="h-4 w-4 accent-[var(--ui-accent)]"
+                            />
+                            Harga rugi
+                        </label>
+                        <label className="flex items-center gap-2 rounded-lg ui-panel border ui-border px-3 py-2 text-sm ui-text cursor-pointer">
+                            <input
+                                type="checkbox"
+                                checked={noImageOnly}
+                                onChange={(e) => setNoImageOnly(e.target.checked)}
+                                className="h-4 w-4 accent-[var(--ui-accent)]"
+                            />
+                            Tanpa gambar
+                        </label>
                     </div>
                 )}
             </div>
@@ -1526,10 +1716,61 @@ export default function AdminProducts() {
             {viewMode === 'list' ? (
                 // LIST VIEW
                 <div className="ui-panel-muted rounded-xl shadow-sm border ui-border overflow-hidden">
+                    {canManageProducts && selectedProductIds.length > 0 && (
+                        <div className="flex flex-wrap items-center gap-2 border-b ui-border px-4 py-3">
+                            <span className="rounded-full border ui-accent-chip px-3 py-1 text-xs font-bold">
+                                {selectedProductIds.length} dipilih
+                            </span>
+                            <button
+                                type="button"
+                                onClick={() => runBulkProductAction('activate')}
+                                disabled={bulkProductRunning || selectedPageProducts.every((p) => p.status)}
+                                className="ui-success-action inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-bold disabled:opacity-50"
+                            >
+                                <Power className="h-3.5 w-3.5" /> Aktifkan
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => runBulkProductAction('deactivate')}
+                                disabled={bulkProductRunning || selectedPageProducts.every((p) => !p.status)}
+                                className="ui-warning-chip inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-bold disabled:opacity-50"
+                            >
+                                <Power className="h-3.5 w-3.5" /> Nonaktifkan
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => runBulkProductAction('archive')}
+                                disabled={bulkProductRunning}
+                                className="ui-danger-action inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-bold disabled:opacity-50"
+                            >
+                                <Trash2 className="h-3.5 w-3.5" /> Arsipkan
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setSelectedProductIds([])}
+                                disabled={bulkProductRunning}
+                                className="ui-muted-action rounded-lg border px-3 py-1.5 text-xs font-semibold disabled:opacity-50"
+                            >
+                                Batal pilih
+                            </button>
+                        </div>
+                    )}
                     <div className="overflow-x-auto">
                         <table className="min-w-full">
                             <thead>
                                 <tr className="ui-panel ui-text-muted text-xs uppercase">
+                                    {canManageProducts && (
+                                        <th className="px-4 py-3 text-left font-semibold tracking-wider w-10">
+                                            <input
+                                                type="checkbox"
+                                                aria-label="Pilih semua produk di halaman ini"
+                                                checked={allPageSelected}
+                                                onChange={toggleSelectAllPage}
+                                                disabled={pageProductIds.length === 0}
+                                                className="h-4 w-4 accent-[var(--ui-accent)] disabled:opacity-40"
+                                            />
+                                        </th>
+                                    )}
                                     <th className="px-4 py-3 text-left font-semibold tracking-wider w-16">#ID</th>
                                     <th className="px-4 py-3 text-left font-semibold tracking-wider">Info Produk</th>
                                     <th className="hidden 2xl:table-cell px-4 py-3 text-left font-semibold tracking-wider">Tipe/Vendor</th>
@@ -1543,7 +1784,7 @@ export default function AdminProducts() {
                             <tbody className="divide-y divide-[var(--ui-border)]">
                                 {loading ? (
                                     <tr>
-                                        <td colSpan={8} className="px-4 py-8 text-center ui-text-muted">
+                                        <td colSpan={canManageProducts ? 9 : 8} className="px-4 py-8 text-center ui-text-muted">
                                             <div className="flex items-center justify-center gap-2">
                                                 <div className="h-5 w-5 border-2 border-[color-mix(in_srgb,var(--ui-accent)_34%,transparent)] border-t-[var(--ui-accent)] rounded-full animate-spin" />
                                                 Memuat data...
@@ -1552,7 +1793,7 @@ export default function AdminProducts() {
                                     </tr>
                                 ) : filteredProducts.length === 0 ? (
                                     <tr>
-                                        <td colSpan={8} className="px-4 py-12 text-center">
+                                        <td colSpan={canManageProducts ? 9 : 8} className="px-4 py-12 text-center">
                                             <Package className="w-12 h-12 ui-text-muted mx-auto mb-3" />
                                             <p className="ui-text-muted font-medium">
                                                 {products.length === 0 ? 'Belum ada produk' : 'Tidak ada produk yang sesuai'}
@@ -1565,9 +1806,21 @@ export default function AdminProducts() {
                                         const profitBasic = product.price.basic - cost;
                                         const productType = typeof product.productTypeId === 'object' ? (product.productTypeId as any)?.name : '';
                                         const categoryIcon = product.categoryId && typeof product.categoryId !== 'string' ? (product.categoryId as any).icon : null;
+                                        const isSelected = selectedProductIds.includes(product._id);
 
                                         return (
-                                            <tr key={product._id} className="hover:bg-[var(--ui-card-bg)] transition-colors group">
+                                            <tr key={product._id} className={`hover:bg-[var(--ui-card-bg)] transition-colors group ${isSelected ? 'bg-[var(--ui-accent-soft)]/40' : ''}`}>
+                                                {canManageProducts && (
+                                                    <td className="px-4 py-3.5 align-top">
+                                                        <input
+                                                            type="checkbox"
+                                                            aria-label={`Pilih produk ${product.name}`}
+                                                            checked={isSelected}
+                                                            onChange={() => toggleSelectProduct(product._id)}
+                                                            className="h-4 w-4 accent-[var(--ui-accent)]"
+                                                        />
+                                                    </td>
+                                                )}
                                                 <td className="px-4 py-3.5 align-top">
                                                     <span className="text-sm font-mono ui-accent-text">#{product.productId || '-'}</span>
                                                 </td>
@@ -1681,6 +1934,14 @@ export default function AdminProducts() {
                                                                     aria-label={`Edit produk ${product.name}`}
                                                                 >
                                                                     <Edit2 className="w-4 h-4" />
+                                                                </button>
+                                                                <button
+                                                                    onClick={() => handleDuplicate(product)}
+                                                                    className="p-2 ui-text-muted hover:text-[var(--ui-accent)] hover:bg-[var(--ui-accent-soft)] rounded-lg transition-all"
+                                                                    title="Duplikat Produk"
+                                                                    aria-label={`Duplikat produk ${product.name}`}
+                                                                >
+                                                                    <Plus className="w-4 h-4" />
                                                                 </button>
                                                                 <button
                                                                     onClick={() => handleToggleStatus(product)}
@@ -1912,31 +2173,97 @@ export default function AdminProducts() {
                                 </div>
                             </button>
 
-                            <button
-                                onClick={handleVendorImportFromSelector}
-                                className="w-full flex items-center gap-4 p-4 border ui-border rounded-xl ui-panel hover:border-[var(--ui-accent)] hover:bg-[var(--ui-accent-soft)] transition-colors text-left"
+                            <div
+                                className={`w-full flex items-center gap-4 p-4 border rounded-xl ${
+                                    tokovoucherConfigured === false
+                                        ? 'ui-border ui-panel-muted'
+                                        : 'ui-border ui-panel'
+                                }`}
                             >
-                                <div className="w-12 h-12 rounded-lg bg-[var(--ui-accent-soft)] flex items-center justify-center">
+                                <div className="w-12 h-12 shrink-0 rounded-lg bg-[var(--ui-accent-soft)] flex items-center justify-center">
                                     <Download className="w-6 h-6 ui-accent-text" />
                                 </div>
-                                <div>
+                                <div className="min-w-0 flex-1">
                                     <p className="font-semibold ui-text">Import Tokovoucher</p>
-                                    <p className="text-sm ui-text-muted">Ambil dari pricelist Tokovoucher</p>
+                                    {checkingVendorConfig ? (
+                                        <p className="text-sm ui-text-muted">Memeriksa pengaturan…</p>
+                                    ) : tokovoucherConfigured === false ? (
+                                        <p className="text-sm ui-warning-text mt-0.5">
+                                            Belum dikonfigurasi. Isi kredensial dulu, baru form import dibuka.
+                                        </p>
+                                    ) : (
+                                        <p className="text-sm ui-text-muted">Ambil dari pricelist Tokovoucher</p>
+                                    )}
+                                    <div className="mt-2 flex flex-wrap gap-2">
+                                        {tokovoucherConfigured === false ? (
+                                            <Link
+                                                to="/admin/addons/tokovoucher"
+                                                onClick={() => setIsAddTypeModalOpen(false)}
+                                                className="inline-flex items-center gap-1 rounded-lg border ui-border px-3 py-1.5 text-xs font-bold ui-accent-text hover:bg-[var(--ui-accent-soft)]"
+                                            >
+                                                <Settings2 className="h-3.5 w-3.5" />
+                                                Buka setting Tokovoucher
+                                                <ExternalLink className="h-3 w-3" />
+                                            </Link>
+                                        ) : (
+                                            <button
+                                                type="button"
+                                                onClick={() => { void handleVendorImportFromSelector(); }}
+                                                disabled={checkingVendorConfig}
+                                                className="inline-flex items-center gap-1 rounded-lg ui-accent-solid px-3 py-1.5 text-xs font-bold disabled:opacity-60"
+                                            >
+                                                Lanjut import
+                                            </button>
+                                        )}
+                                    </div>
                                 </div>
-                            </button>
+                            </div>
 
-                            <button
-                                onClick={handleDgImportFromSelector}
-                                className="w-full flex items-center gap-4 p-4 border ui-border rounded-xl ui-panel hover:border-[var(--ui-accent)] hover:bg-[var(--ui-accent-soft)] transition-colors text-left"
+                            <div
+                                className={`w-full flex items-center gap-4 p-4 border rounded-xl ${
+                                    digiflazzConfigured === false
+                                        ? 'ui-border ui-panel-muted'
+                                        : 'ui-border ui-panel'
+                                }`}
                             >
-                                <div className="w-12 h-12 rounded-lg bg-gradient-to-br from-blue-500/30 to-indigo-400/25 flex items-center justify-center">
+                                <div className="w-12 h-12 shrink-0 rounded-lg bg-gradient-to-br from-blue-500/30 to-indigo-400/25 flex items-center justify-center">
                                     <Download className="w-6 h-6 ui-info-text" />
                                 </div>
-                                <div>
+                                <div className="min-w-0 flex-1">
                                     <p className="font-semibold ui-text">Import Digiflazz</p>
-                                    <p className="text-sm ui-text-muted">Ambil dari pricelist Digiflazz</p>
+                                    {checkingVendorConfig ? (
+                                        <p className="text-sm ui-text-muted">Memeriksa pengaturan…</p>
+                                    ) : digiflazzConfigured === false ? (
+                                        <p className="text-sm ui-warning-text mt-0.5">
+                                            Belum dikonfigurasi. Isi kredensial dulu, baru form import dibuka.
+                                        </p>
+                                    ) : (
+                                        <p className="text-sm ui-text-muted">Ambil dari pricelist Digiflazz</p>
+                                    )}
+                                    <div className="mt-2 flex flex-wrap gap-2">
+                                        {digiflazzConfigured === false ? (
+                                            <Link
+                                                to="/admin/addons/digiflazz"
+                                                onClick={() => setIsAddTypeModalOpen(false)}
+                                                className="inline-flex items-center gap-1 rounded-lg border ui-border px-3 py-1.5 text-xs font-bold ui-accent-text hover:bg-[var(--ui-accent-soft)]"
+                                            >
+                                                <Settings2 className="h-3.5 w-3.5" />
+                                                Buka setting Digiflazz
+                                                <ExternalLink className="h-3 w-3" />
+                                            </Link>
+                                        ) : (
+                                            <button
+                                                type="button"
+                                                onClick={() => { void handleDgImportFromSelector(); }}
+                                                disabled={checkingVendorConfig}
+                                                className="inline-flex items-center gap-1 rounded-lg ui-accent-solid px-3 py-1.5 text-xs font-bold disabled:opacity-60"
+                                            >
+                                                Lanjut import
+                                            </button>
+                                        )}
+                                    </div>
                                 </div>
-                            </button>
+                            </div>
 
                             <button
                                 onClick={() => setIsAddTypeModalOpen(false)}
@@ -2743,7 +3070,7 @@ export default function AdminProducts() {
             {canManageProducts && (
                 <ProductModal
                     isOpen={isModalOpen}
-                    onClose={() => setIsModalOpen(false)}
+                    onClose={() => { setIsModalOpen(false); setIsDuplicating(false); }}
                     onSubmit={handleSubmit}
                     initialData={selectedProduct}
                 />

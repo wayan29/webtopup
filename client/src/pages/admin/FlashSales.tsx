@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
     AlertTriangle,
     Clock,
-    DollarSign,
     Edit,
     Eye,
     EyeOff,
@@ -160,6 +159,21 @@ const statusAppearance: Record<
 
 const formatCurrency = (value: number) => `Rp${Math.max(0, value || 0).toLocaleString('id-ID')}`;
 
+/** Human-readable remaining time until a live flash sale ends (null when not live). */
+const getRemainingLabel = (sale: Pick<FlashSale, 'endDate'>, statusKey: FlashSaleStatusKey): string | null => {
+    if (statusKey !== 'live') return null;
+    const end = new Date(sale.endDate).getTime();
+    const diffMs = end - Date.now();
+    if (!Number.isFinite(diffMs) || diffMs <= 0) return null;
+    const totalMinutes = Math.floor(diffMs / 60000);
+    const days = Math.floor(totalMinutes / 1440);
+    const hours = Math.floor((totalMinutes % 1440) / 60);
+    const minutes = totalMinutes % 60;
+    if (days > 0) return `${days}h ${hours}j tersisa`;
+    if (hours > 0) return `${hours}j ${minutes}m tersisa`;
+    return `${minutes}m tersisa`;
+};
+
 const calculateFlashPrice = (
     price: number,
     discountType: 'percentage' | 'fixed',
@@ -289,6 +303,8 @@ const validatePromoInput = (
 export default function FlashSales() {
     const [flashSales, setFlashSales] = useState<FlashSale[]>([]);
     const [products, setProducts] = useState<Product[]>([]);
+    const [productsLoading, setProductsLoading] = useState(false);
+    const [productsError, setProductsError] = useState('');
     const [loading, setLoading] = useState(true);
     const [showModal, setShowModal] = useState(false);
     const [showProductModal, setShowProductModal] = useState(false);
@@ -335,6 +351,8 @@ export default function FlashSales() {
     const fetchProducts = useCallback(async () => {
         const requestId = latestProductsRequestId.current + 1;
         latestProductsRequestId.current = requestId;
+        setProductsLoading(true);
+        setProductsError('');
         try {
             const response = await apiV2
                 .get('/products/admin/all');
@@ -343,7 +361,11 @@ export default function FlashSales() {
         } catch (error: any) {
             if (requestId !== latestProductsRequestId.current) return;
             console.error('Failed to load products', error);
-            setMessage({ type: 'error', text: error.response?.data?.message || 'Gagal memuat data produk' });
+            setProductsError(error.response?.data?.message || 'Gagal memuat data produk');
+        } finally {
+            if (requestId === latestProductsRequestId.current) {
+                setProductsLoading(false);
+            }
         }
     }, []);
 
@@ -563,6 +585,23 @@ export default function FlashSales() {
         } catch (error: any) {
             console.error('Failed to toggle status', error);
             setMessage({ type: 'error', text: error.response?.data?.message || 'Gagal mengubah status flash sale' });
+        } finally {
+            setActionLoadingId(null);
+        }
+    };
+
+    // End a live flash sale immediately by moving endDate to now (keeps history).
+    const handleEndNow = async (sale: FlashSale) => {
+        if (actionLoadingId) return;
+        setActionLoadingId(sale._id);
+        try {
+            await apiV2
+                .put(`/flash-sales/admin/${sale._id}`, { endDate: new Date().toISOString() });
+            setMessage({ type: 'success', text: `Flash sale "${sale.name}" diakhiri.` });
+            await fetchFlashSales();
+        } catch (error: any) {
+            console.error('Failed to end flash sale', error);
+            setMessage({ type: 'error', text: error.response?.data?.message || 'Gagal mengakhiri flash sale' });
         } finally {
             setActionLoadingId(null);
         }
@@ -888,6 +927,7 @@ export default function FlashSales() {
                         const statusMeta = statusAppearance[statusKey];
                         const summary = sale.summary ?? getFallbackSummary(sale);
                         const issues = getIssueList(sale);
+                        const remainingLabel = getRemainingLabel(sale, statusKey);
 
                         return (
                             <div
@@ -906,6 +946,12 @@ export default function FlashSales() {
                                                     <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-[11px] font-semibold ${statusMeta.badgeClass}`}>
                                                         {statusMeta.label}
                                                     </span>
+                                                    {remainingLabel ? (
+                                                        <span className="ui-accent-chip inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] font-semibold">
+                                                            <Clock className="w-3.5 h-3.5" />
+                                                            {remainingLabel}
+                                                        </span>
+                                                    ) : null}
                                                     {sale.hasIssues || issues.length > 0 ? (
                                                         <span className="ui-warning-chip inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] font-semibold">
                                                             <AlertTriangle className="w-3.5 h-3.5" />
@@ -948,6 +994,17 @@ export default function FlashSales() {
                                                 <Edit className="w-4 h-4" />
                                                 Edit
                                             </button>
+                                            {statusKey === 'live' ? (
+                                                <button
+                                                    onClick={() => handleEndNow(sale)}
+                                                    disabled={actionLoadingId === sale._id}
+                                                    className="ui-danger-chip inline-flex h-10 items-center gap-2 rounded-xl border px-3 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-60"
+                                                    title="Akhiri flash sale sekarang"
+                                                >
+                                                    <Clock className="w-4 h-4" />
+                                                    Akhiri
+                                                </button>
+                                            ) : null}
                                             <button
                                                 onClick={() => handleToggleStatus(sale)}
                                                 disabled={actionLoadingId === sale._id}
@@ -1129,11 +1186,14 @@ export default function FlashSales() {
                                                                         <span className="ui-text-muted line-through">
                                                                             {formatCurrency(originalPrice)}
                                                                         </span>
-                                                                        <span className="flex items-center gap-1 font-semibold ui-accent-text">
+                                                                        <span
+                                                                            className="flex items-center gap-1 font-semibold ui-accent-text"
+                                                                            title={item.discountType === 'percentage' ? 'Diskon persen dari harga normal' : 'Potongan harga tetap'}
+                                                                        >
                                                                             {item.discountType === 'percentage' ? (
                                                                                 <Percent className="w-3 h-3" />
                                                                             ) : (
-                                                                                <DollarSign className="w-3 h-3" />
+                                                                                <span className="text-[10px] font-black uppercase tracking-wide">Potong</span>
                                                                             )}
                                                                             {item.discountType === 'percentage'
                                                                                 ? `${item.discountValue}%`
@@ -1219,7 +1279,10 @@ export default function FlashSales() {
 
                             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                                 <div>
-                                    <label className={labelClass}>Tanggal Mulai</label>
+                                    <label className={labelClass}>
+                                        Tanggal Mulai
+                                        <span className="ui-accent-chip ml-2 inline-flex rounded-full border px-2 py-0.5 text-[10px] font-bold">WIB</span>
+                                    </label>
                                     <input
                                         type="datetime-local"
                                         value={form.startDate}
@@ -1229,7 +1292,10 @@ export default function FlashSales() {
                                     />
                                 </div>
                                 <div>
-                                    <label className={labelClass}>Tanggal Selesai</label>
+                                    <label className={labelClass}>
+                                        Tanggal Selesai
+                                        <span className="ui-accent-chip ml-2 inline-flex rounded-full border px-2 py-0.5 text-[10px] font-bold">WIB</span>
+                                    </label>
                                     <input
                                         type="datetime-local"
                                         value={form.endDate}
@@ -1239,6 +1305,9 @@ export default function FlashSales() {
                                     />
                                 </div>
                             </div>
+                            <p className="mt-1 text-xs ui-text-muted">
+                                Waktu diisi dalam zona WIB (UTC+7). Pelanggan di zona lain melihat hitung mundur yang sama.
+                            </p>
 
                             <div>
                                 <label className={labelClass}>Banner (opsional)</label>
@@ -1282,9 +1351,23 @@ export default function FlashSales() {
                                         />
                                     </div>
 
-                                    {newProductSearch ? (
-                                        <div className="mb-3 max-h-40 overflow-y-auto rounded-lg border ui-border ui-panel">
-                                            {filteredNewProducts.slice(0, 20).map((product) => (
+                                    {productsError ? (
+                                        <div className="mb-3 rounded-lg border ui-danger-chip px-3 py-2 text-xs">
+                                            {productsError} — coba tombol Segarkan di atas.
+                                        </div>
+                                    ) : null}
+
+                                    <div className="mb-3 max-h-52 overflow-y-auto rounded-lg border ui-border ui-panel">
+                                        {productsLoading ? (
+                                            <p className="px-3 py-3 text-sm ui-text-muted">Memuat produk…</p>
+                                        ) : filteredNewProducts.length === 0 ? (
+                                            <p className="px-3 py-3 text-sm ui-text-muted">
+                                                {products.length === 0
+                                                    ? 'Belum ada produk aktif. Buat produk dulu di menu Produk.'
+                                                    : 'Tidak ada produk yang cocok dengan pencarian.'}
+                                            </p>
+                                        ) : (
+                                            filteredNewProducts.slice(0, 20).map((product) => (
                                                 <button
                                                     key={product._id}
                                                     type="button"
@@ -1299,11 +1382,13 @@ export default function FlashSales() {
                                                     </div>
                                                     <Plus className="w-4 h-4 ui-success-text" />
                                                 </button>
-                                            ))}
-                                            {filteredNewProducts.length === 0 ? (
-                                                <p className="px-3 py-2 text-sm ui-text-muted">Tidak ada produk ditemukan</p>
-                                            ) : null}
-                                        </div>
+                                            ))
+                                        )}
+                                    </div>
+                                    {!newProductSearch && filteredNewProducts.length > 20 ? (
+                                        <p className="mb-3 text-[11px] ui-text-muted">
+                                            Menampilkan 20 produk pertama — ketik untuk mencari sisanya.
+                                        </p>
                                     ) : null}
 
                                     {selectedProducts.length > 0 ? (
@@ -1467,13 +1552,24 @@ export default function FlashSales() {
                                     className={inputClass}
                                     required
                                 >
-                                    <option value="">-- Pilih Produk --</option>
+                                    <option value="">
+                                        {productsLoading
+                                            ? 'Memuat produk…'
+                                            : productsError
+                                                ? 'Gagal memuat produk — coba segarkan'
+                                                : filteredProducts.length === 0
+                                                    ? 'Tidak ada produk aktif yang bisa dipilih'
+                                                    : '-- Pilih Produk --'}
+                                    </option>
                                     {filteredProducts.slice(0, 50).map((product) => (
                                         <option key={product._id} value={product._id}>
                                             {product.code} - {product.name} ({formatCurrency(product.price.basic)})
                                         </option>
                                     ))}
                                 </select>
+                                {productsError ? (
+                                    <p className="mt-1 text-xs ui-danger-text">{productsError}</p>
+                                ) : null}
                                 {filteredProducts.length > 50 ? (
                                     <p className="mt-1 text-xs ui-text-muted">
                                         Menampilkan 50 dari {filteredProducts.length} produk. Gunakan pencarian untuk mempersempit hasil.

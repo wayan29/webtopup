@@ -9,7 +9,7 @@ use mongodb::bson::{doc, DateTime, Document};
 
 use super::{internal_error, status_message, unavailable};
 use super::{mappers::object_id_from_bson, redeem_helpers::*, types::*, validation::*};
-use crate::{security::require_member_user, state::AppState, utils::bson::read_i64};
+use crate::{security::require_member_user, state::AppState, utils::bson::{read_i64, read_string}};
 
 pub async fn redeem(
     headers: axum::http::HeaderMap,
@@ -55,6 +55,18 @@ pub async fn redeem(
     let Ok(Some(voucher)) = claimed else {
         return voucher_redeem_error(&vouchers, &code).await;
     };
+
+    // Discount vouchers are applied at checkout, not via balance redeem.
+    let kind = read_string(&voucher, "kind");
+    if kind == "discount" {
+        if let Some(voucher_id) = object_id_from_bson(voucher.get("_id")) {
+            rollback_voucher_redeem(&vouchers, voucher_id).await;
+        }
+        return status_message(
+            axum::http::StatusCode::BAD_REQUEST,
+            "Kode ini adalah voucher diskon — pakai di halaman order, bukan redeem saldo",
+        );
+    }
 
     let voucher_id = object_id_from_bson(voucher.get("_id"));
     let amount = read_i64(&voucher, "amount");

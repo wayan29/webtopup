@@ -7,10 +7,16 @@ pub struct VoucherQuery {
     pub(super) limit: Option<i64>,
     pub(super) search: Option<String>,
     pub(super) status: Option<String>,
+    /// balance (default) | discount | all
+    pub(super) kind: Option<String>,
     #[serde(rename = "startDate")]
     pub(super) start_date: Option<String>,
     #[serde(rename = "endDate")]
     pub(super) end_date: Option<String>,
+    #[serde(rename = "minAmount")]
+    pub(super) min_amount: Option<i64>,
+    #[serde(rename = "maxAmount")]
+    pub(super) max_amount: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -18,6 +24,45 @@ pub struct VoucherCreatePayload {
     pub(super) amount: Option<Value>,
     pub(super) code: Option<Value>,
     pub(super) quantity: Option<Value>,
+    /// Optional campaign prefix for auto-generated codes (e.g. "PROMO-").
+    pub(super) prefix: Option<Value>,
+    /// "balance" (default) or "discount".
+    pub(super) kind: Option<Value>,
+    #[serde(rename = "discountType")]
+    pub(super) discount_type: Option<Value>,
+    #[serde(rename = "discountValue")]
+    pub(super) discount_value: Option<Value>,
+    #[serde(rename = "maxUses")]
+    pub(super) max_uses: Option<Value>,
+    #[serde(rename = "minPurchase")]
+    pub(super) min_purchase: Option<Value>,
+    #[serde(rename = "maxDiscount")]
+    pub(super) max_discount: Option<Value>,
+    #[serde(rename = "onePerUser")]
+    pub(super) one_per_user: Option<bool>,
+    #[serde(rename = "startsAt")]
+    pub(super) starts_at: Option<Value>,
+    #[serde(rename = "expiresAt")]
+    pub(super) expires_at: Option<Value>,
+    /// Optional product ObjectId list (discount scope).
+    #[serde(rename = "productIds")]
+    pub(super) product_ids: Option<Vec<String>>,
+    /// Optional category ObjectId list (discount scope).
+    #[serde(rename = "categoryIds")]
+    pub(super) category_ids: Option<Vec<String>>,
+    /// Optional operator ObjectId list (discount scope).
+    #[serde(rename = "operatorIds")]
+    pub(super) operator_ids: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscountValidatePayload {
+    pub code: Option<String>,
+    pub amount: Option<i64>,
+    pub product_id: Option<String>,
+    pub category_id: Option<String>,
+    pub operator_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -44,7 +89,33 @@ pub(super) struct VoucherItem {
     #[serde(rename = "_id")]
     pub(super) id: String,
     pub(super) code: String,
+    /// balance top-up amount, or 0 for discount vouchers.
     pub(super) amount: i64,
+    pub(super) kind: String,
+    #[serde(rename = "discountType", skip_serializing_if = "Option::is_none")]
+    pub(super) discount_type: Option<String>,
+    #[serde(rename = "discountValue", skip_serializing_if = "Option::is_none")]
+    pub(super) discount_value: Option<i64>,
+    #[serde(rename = "maxUses", skip_serializing_if = "Option::is_none")]
+    pub(super) max_uses: Option<i64>,
+    #[serde(rename = "usedCount", skip_serializing_if = "Option::is_none")]
+    pub(super) used_count: Option<i64>,
+    #[serde(rename = "minPurchase", skip_serializing_if = "Option::is_none")]
+    pub(super) min_purchase: Option<i64>,
+    #[serde(rename = "maxDiscount", skip_serializing_if = "Option::is_none")]
+    pub(super) max_discount: Option<i64>,
+    #[serde(rename = "onePerUser", skip_serializing_if = "Option::is_none")]
+    pub(super) one_per_user: Option<bool>,
+    #[serde(rename = "productIds", skip_serializing_if = "Option::is_none")]
+    pub(super) product_ids: Option<Vec<String>>,
+    #[serde(rename = "categoryIds", skip_serializing_if = "Option::is_none")]
+    pub(super) category_ids: Option<Vec<String>>,
+    #[serde(rename = "operatorIds", skip_serializing_if = "Option::is_none")]
+    pub(super) operator_ids: Option<Vec<String>>,
+    #[serde(rename = "startsAt", skip_serializing_if = "Option::is_none")]
+    pub(super) starts_at: Option<String>,
+    #[serde(rename = "expiresAt", skip_serializing_if = "Option::is_none")]
+    pub(super) expires_at: Option<String>,
     #[serde(rename = "isRedeemed")]
     pub(super) is_redeemed: bool,
     #[serde(rename = "isArchived")]

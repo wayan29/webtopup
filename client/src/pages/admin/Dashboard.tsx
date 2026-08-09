@@ -389,6 +389,34 @@ export default function AdminDashboard() {
             note: 'Alert prioritas',
             to: '/admin/notifications?severity=critical',
             tone: (notificationSummary?.critical || 0) > 0 ? 'ui-danger-chip' : 'ui-success-chip'
+        },
+        {
+            title: 'Voucher Idle >30h',
+            value: (opsSnapshot as any)?.promo?.idle_vouchers || 0,
+            note: 'Belum dibagikan',
+            to: '/admin/vouchers',
+            tone: ((opsSnapshot as any)?.promo?.idle_vouchers || 0) > 0 ? 'ui-warning-chip' : 'ui-success-chip'
+        },
+        {
+            title: 'Flash Sale Live',
+            value: (opsSnapshot as any)?.promo?.flash_sales_live || 0,
+            note: 'Sedang berjalan',
+            to: '/admin/flash-sales',
+            tone: ((opsSnapshot as any)?.promo?.flash_sales_live || 0) > 0 ? 'ui-accent-chip' : 'ui-success-chip'
+        },
+        {
+            title: 'Diskon Terbuka',
+            value: (opsSnapshot as any)?.promo?.discount_vouchers_open || 0,
+            note: 'Slot masih ada',
+            to: '/admin/vouchers',
+            tone: 'ui-info-chip'
+        },
+        {
+            title: 'Giveaway Total',
+            value: (opsSnapshot as any)?.promo?.giveaways_total || 0,
+            note: `Kredit ${(opsSnapshot as any)?.promo?.giveaways_amount_total ? `Rp${Number((opsSnapshot as any).promo.giveaways_amount_total).toLocaleString('id-ID')}` : 'Rp0'}`,
+            to: '/admin/vouchers',
+            tone: 'ui-success-chip'
         }
     ];
 

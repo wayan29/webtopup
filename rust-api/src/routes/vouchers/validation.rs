@@ -76,14 +76,39 @@ pub(super) fn normalize_archive_reason(value: Option<Value>) -> Result<String, R
     Ok(reason)
 }
 
+pub(super) fn normalize_voucher_prefix(value: Option<Value>) -> Result<String, Response> {
+    let prefix = text_value(value).unwrap_or_default().trim().to_uppercase();
+    if prefix.is_empty() {
+        return Ok(String::new());
+    }
+    // Leave room for a 10-char random suffix so total stays within code max (32).
+    if prefix.len() > 20 {
+        return Err(status_message(
+            axum::http::StatusCode::BAD_REQUEST,
+            "Prefix voucher maksimal 20 karakter",
+        ));
+    }
+    let valid_chars = prefix
+        .chars()
+        .all(|value| value.is_ascii_alphanumeric() || value == '_' || value == '-');
+    if !valid_chars {
+        return Err(status_message(
+            axum::http::StatusCode::BAD_REQUEST,
+            "Prefix voucher hanya boleh huruf, angka, garis bawah, atau strip",
+        ));
+    }
+    Ok(prefix)
+}
+
 pub(super) async fn generate_voucher_codes(
     vouchers: &mongodb::Collection<Document>,
     quantity: i64,
+    prefix: &str,
 ) -> Result<Vec<String>, Response> {
     let mut codes = Vec::new();
     let mut attempts = 0;
     while codes.len() < quantity as usize {
-        let code = random_voucher_code();
+        let code = random_voucher_code(prefix);
         attempts += 1;
         if attempts > quantity * 25 {
             return Err(status_message(
@@ -107,10 +132,15 @@ pub(super) async fn generate_voucher_codes(
     Ok(codes)
 }
 
-fn random_voucher_code() -> String {
+fn random_voucher_code(prefix: &str) -> String {
     let mut bytes = [0u8; 5];
     OsRng.fill_bytes(&mut bytes);
-    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
+    let suffix: String = bytes.iter().map(|byte| format!("{byte:02X}")).collect();
+    if prefix.is_empty() {
+        suffix
+    } else {
+        format!("{prefix}{suffix}")
+    }
 }
 
 fn number_value(value: Value) -> Option<i64> {

@@ -145,10 +145,18 @@ function SortableProductTypeRow({
             <td className="px-4 py-3 text-sm ui-text-muted">
                 <div className="inline-flex items-center gap-1 ui-info-text">
                     <Clock className="h-4 w-4" />
-                    <span>{productType.open24Hours ? '24 Jam' : `${productType.openTime} - ${productType.closeTime}`}</span>
+                    <span>
+                        {productType.open24Hours === true || (!productType.openTime && !productType.closeTime)
+                            ? '24 Jam'
+                            : `${productType.openTime || '00:00'} - ${productType.closeTime || '23:59'}`}
+                    </span>
                 </div>
                 <p className="mt-1 text-xs ui-text-muted">
                     Proses: {productType.processType === 'manual' ? 'Manual' : 'Otomatis'}
+                    <span className="ui-text-muted"> · </span>
+                    {productType.open24Hours === true || (!productType.openTime && !productType.closeTime)
+                        ? 'Buka 24 jam'
+                        : 'Jadwal terbatas'}
                 </p>
             </td>
             <td className="px-4 py-3">

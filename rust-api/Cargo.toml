@@ -3,6 +3,7 @@ name = "webtopup-rust-api"
 version = "0.1.0"
 edition = "2021"
 publish = false
+default-run = "webtopup-rust-api"
 
 [[bin]]
 name = "ensure_product_id_integrity"

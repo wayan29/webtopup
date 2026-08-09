@@ -19,6 +19,7 @@ export const AdminManualTransactions = lazy(() => import('./ManualTransactions')
 export const AdminUsers = lazy(() => import('./Users'));
 export const AdminVouchers = lazy(() => import('./Vouchers'));
 export const AdminSalesReport = lazy(() => import('./SalesReport'));
+export const AdminPromoReport = lazy(() => import('./PromoReport'));
 export const AdminVendors = lazy(() => import('./Vendors'));
 export const AdminVendorHealth = lazy(() => import('./VendorHealth'));
 export const AdminRewards = lazy(() => import('./Rewards'));

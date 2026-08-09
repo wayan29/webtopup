@@ -26,8 +26,12 @@ pub(super) fn is_valid_totp_code(code: &str, secret: &str) -> bool {
     if code.len() != 6 || !code.chars().all(|value| value.is_ascii_digit()) {
         return false;
     }
+    // Accept ±2 steps (30s each) so a code that just rolled on the phone still matches when
+    // the phone clock is a few dozen seconds ahead/behind the server. ±1 is the RFC minimum;
+    // ±2 is common for enrollment UX without meaningfully weakening brute-force resistance
+    // (still only ~5 codes valid at once, rate-limited by step-up / confirm handlers).
     let counter = (now_seconds() as i64) / 30;
-    (-1..=1).any(|offset| totp_code(&secret_bytes, counter + offset) == code)
+    (-2..=2).any(|offset| totp_code(&secret_bytes, counter + offset) == code)
 }
 
 pub(super) fn url_encode(value: &str) -> String {

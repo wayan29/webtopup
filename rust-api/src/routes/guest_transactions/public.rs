@@ -41,6 +41,7 @@ struct NormalizedGuestCreate {
     email: String,
     payment_method_id: String,
     use_flash_sale: bool,
+    voucher_code: String,
 }
 
 impl NormalizedGuestCreate {
@@ -53,6 +54,7 @@ impl NormalizedGuestCreate {
             email: normalize_payload_text(payload.email.as_deref()),
             payment_method_id: normalize_payload_text(payload.payment_method_id.as_deref()),
             use_flash_sale: payload.use_flash_sale.unwrap_or(false),
+            voucher_code: normalize_payload_text(payload.voucher_code.as_deref()).to_uppercase(),
         }
     }
 
@@ -113,6 +115,7 @@ pub async fn create_public(
             email: &normalized.email,
             payment_method_id: &normalized.payment_method_id,
             use_flash_sale: normalized.use_flash_sale,
+            voucher_code: &normalized.voucher_code,
             member_id: member.as_ref().map(|access| access.user_id),
         },
     );
@@ -406,7 +409,31 @@ async fn build_and_insert_guest_transaction(
     } else {
         None
     };
-    let price = preview_flash_price.unwrap_or(prepared.base_price);
+    let mut price = preview_flash_price.unwrap_or(prepared.base_price);
+    let mut applied_discount = None;
+    if !normalized.voucher_code.is_empty() {
+        let vouchers = db.collection::<Document>("vouchers");
+        let product_ctx = crate::routes::vouchers::DiscountProductContext {
+            product_id: prepared.product.get_object_id("_id").ok(),
+            category_id: prepared.product.get_object_id("categoryId").ok(),
+            operator_id: prepared.product.get_object_id("operatorId").ok(),
+        };
+        match crate::routes::vouchers::consume_discount_voucher(
+            &vouchers,
+            &normalized.voucher_code,
+            price,
+            member_id,
+            &product_ctx,
+        )
+        .await
+        {
+            Ok(applied) => {
+                price = applied.final_price;
+                applied_discount = Some(applied);
+            }
+            Err(response) => return Err(response),
+        }
+    }
     let admin_fee = read_i64(&prepared.payment_method, "adminFee")
         + ((price as f64 * read_f64(&prepared.payment_method, "adminPercent") / 100.0).ceil()
             as i64);
@@ -415,12 +442,20 @@ async fn build_and_insert_guest_transaction(
     let min_amount = read_i64_default(&prepared.payment_method, "minAmount", 10_000);
     let max_amount = read_i64_default(&prepared.payment_method, "maxAmount", 5_000_000);
     if total_amount < min_amount {
+        if let Some(applied) = applied_discount.as_ref() {
+            let vouchers = db.collection::<Document>("vouchers");
+            crate::routes::vouchers::release_discount_slot(&vouchers, applied, member_id).await;
+        }
         return Err(status_message_owned(
             StatusCode::BAD_REQUEST,
             format!("Minimum amount is Rp {}", format_rupiah(min_amount)),
         ));
     }
     if total_amount > max_amount {
+        if let Some(applied) = applied_discount.as_ref() {
+            let vouchers = db.collection::<Document>("vouchers");
+            crate::routes::vouchers::release_discount_slot(&vouchers, applied, member_id).await;
+        }
         return Err(status_message_owned(
             StatusCode::BAD_REQUEST,
             format!("Maximum amount is Rp {}", format_rupiah(max_amount)),
@@ -479,8 +514,14 @@ async fn build_and_insert_guest_transaction(
     } else {
         None
     };
+    // Flash sale reservation is for stock; price may be further reduced by discount voucher.
     if let Some(reservation) = flash_sale_reservation.as_ref() {
-        if reservation.price != price {
+        let expected_pre_discount = preview_flash_price.unwrap_or(prepared.base_price);
+        if reservation.price != expected_pre_discount {
+            if let Some(applied) = applied_discount.as_ref() {
+                let vouchers = db.collection::<Document>("vouchers");
+                crate::routes::vouchers::release_discount_slot(&vouchers, applied, member_id).await;
+            }
             return Err(internal_error());
         }
     }
@@ -519,6 +560,11 @@ async fn build_and_insert_guest_transaction(
     }
     if let Some(reservation) = flash_sale_reservation {
         document.insert("flashSale", reservation.flash_sale_id);
+    }
+    if let Some(applied) = applied_discount.as_ref() {
+        document.insert("discountVoucherCode", &applied.code);
+        document.insert("discountAmount", applied.discount_amount);
+        document.insert("baseAmount", prepared.base_price);
     }
     db.collection::<Document>("guesttransactions")
         .insert_one(document)

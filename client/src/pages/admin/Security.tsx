@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Eye, EyeOff, KeyRound, Loader2, LogOut, QrCode, RefreshCw, ShieldCheck, ShieldX } from 'lucide-react';
+import QRCode from 'qrcode';
 import { apiV2 } from '../../api';
 import { useStepUpOrchestration } from '../../auth/useStepUpOrchestration';
 import { stepUpActionErrorMessage } from '../../auth/withStepUp';
@@ -8,8 +9,37 @@ import { useAuthStore } from '../../store/useAuthStore';
 
 type TwoFactorSetup = {
     secret: string;
+    /** Data-URL for the otpauth QR. Generated client-side when API returns null. */
     qrCodeDataUrl: string;
 };
+
+async function resolveSetupPayload(data: {
+    secret?: string;
+    otpauthUrl?: string;
+    qrCodeDataUrl?: string | null;
+}): Promise<TwoFactorSetup> {
+    const secret = typeof data.secret === 'string' ? data.secret.trim() : '';
+    if (!secret) {
+        throw new Error('Setup 2FA tidak mengembalikan secret');
+    }
+    let qrCodeDataUrl =
+        typeof data.qrCodeDataUrl === 'string' && data.qrCodeDataUrl.startsWith('data:')
+            ? data.qrCodeDataUrl
+            : '';
+    if (!qrCodeDataUrl) {
+        const otpauthUrl =
+            typeof data.otpauthUrl === 'string' && data.otpauthUrl.startsWith('otpauth://')
+                ? data.otpauthUrl
+                : `otpauth://totp/PPOB%20Admin?secret=${encodeURIComponent(secret)}&issuer=PPOB%20Admin`;
+        qrCodeDataUrl = await QRCode.toDataURL(otpauthUrl, {
+            errorCorrectionLevel: 'M',
+            margin: 1,
+            width: 220,
+            color: { dark: '#0f172a', light: '#ffffff' },
+        });
+    }
+    return { secret, qrCodeDataUrl };
+}
 
 const normalizeOtpInput = (value: string) => value.replace(/\D/g, '').slice(0, 6);
 
@@ -45,7 +75,7 @@ export default function Security() {
             // user restart setup, which would invalidate the entry already in their authenticator.
             if (res.data.enabled !== true && res.data.setupPending === true) {
                 const resumed = await apiV2.post('/auth/2fa/setup');
-                setSetup({ secret: resumed.data.secret, qrCodeDataUrl: resumed.data.qrCodeDataUrl });
+                setSetup(await resolveSetupPayload(resumed.data));
             }
         } catch (err: any) {
             setError(err.response?.data?.message || 'Gagal memuat status 2FA');
@@ -71,7 +101,7 @@ export default function Security() {
         setShowManualSecret(false);
         try {
             const res = await apiV2.post('/auth/2fa/setup');
-            setSetup({ secret: res.data.secret, qrCodeDataUrl: res.data.qrCodeDataUrl });
+            setSetup(await resolveSetupPayload(res.data));
         } catch (err: any) {
             setError(err.response?.data?.message || 'Gagal memulai setup 2FA');
         } finally {
@@ -229,7 +259,12 @@ export default function Security() {
                             <div className="ui-accent-chip rounded-2xl p-3"><QrCode className="h-6 w-6" /></div>
                             <div>
                                 <h2 className="ui-text text-lg font-black">Scan QR code</h2>
-                                <p className="ui-text-muted mt-1 text-sm">Scan di Google Authenticator, Authy, 1Password, atau aplikasi TOTP lain. Setup kedaluwarsa dalam 10 menit.</p>
+                                <p className="ui-text-muted mt-1 text-sm">
+                                    Scan di Google Authenticator, Authy, 1Password, atau aplikasi TOTP lain.
+                                    Setup kedaluwarsa dalam <strong>10 menit</strong>. Kode di app berganti tiap 30 detik — itu normal.
+                                    Hapus dulu entri lama untuk akun ini di Authenticator sebelum scan ulang, lalu pakai kode yang tampil
+                                    <strong> saat ini</strong> (jangan kode yang sudah berganti).
+                                </p>
                             </div>
                         </div>
                         <div className="grid gap-6 lg:grid-cols-[220px_1fr]">

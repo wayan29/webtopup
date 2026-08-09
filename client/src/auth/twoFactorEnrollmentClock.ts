@@ -223,8 +223,8 @@ export function nextEnrollmentUiDelayMs(remainingMs: number | null, minuteCadenc
 
 export type EnrollmentDeadlineTimerDeps = {
   now(): number;
-  setTimeout(fn: () => void, ms: number): ReturnType<typeof setTimeout>;
-  clearTimeout(id: ReturnType<typeof setTimeout>): void;
+  setTimeout(fn: () => void, ms: number): number;
+  clearTimeout(id: number): void;
   onTick(): void;
 };
 
@@ -235,7 +235,7 @@ export type EnrollmentDeadlineTimerDeps = {
 export function createEnrollmentDeadlineTimer(deps: EnrollmentDeadlineTimerDeps) {
   let generation = 0;
   let stopped = true;
-  let timer: ReturnType<typeof setTimeout> | null = null;
+  let timer: number | null = null;
   let deadlineMs: number | null = null;
   let offsetMs: number | null = null;
 

@@ -42,6 +42,7 @@ pub struct GuestCreatePayload {
     pub(super) email: Option<String>,
     pub(super) payment_method_id: Option<String>,
     pub(super) use_flash_sale: Option<bool>,
+    pub(super) voucher_code: Option<String>,
 }
 
 #[derive(Deserialize)]

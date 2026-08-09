@@ -55,10 +55,72 @@ pub(super) fn voucher_from_doc(
     document: Document,
     users: &HashMap<String, UserBrief>,
 ) -> VoucherItem {
+    let kind = {
+        let raw = read_string(&document, "kind");
+        if raw.is_empty() {
+            "balance".to_string()
+        } else {
+            raw
+        }
+    };
+    let is_discount = kind == "discount";
     VoucherItem {
         id: id_from_doc(&document),
         code: read_string(&document, "code"),
         amount: read_i64(&document, "amount"),
+        kind,
+        discount_type: if is_discount {
+            Some(read_string(&document, "discountType"))
+        } else {
+            None
+        },
+        discount_value: if is_discount {
+            Some(read_i64(&document, "discountValue"))
+        } else {
+            None
+        },
+        max_uses: if is_discount {
+            Some(read_i64(&document, "maxUses"))
+        } else {
+            None
+        },
+        used_count: if is_discount {
+            Some(read_i64(&document, "usedCount"))
+        } else {
+            None
+        },
+        min_purchase: if is_discount {
+            Some(read_i64(&document, "minPurchase"))
+        } else {
+            None
+        },
+        max_discount: if is_discount {
+            Some(read_i64(&document, "maxDiscount"))
+        } else {
+            None
+        },
+        one_per_user: if is_discount {
+            Some(document.get_bool("onePerUser").unwrap_or(true))
+        } else {
+            None
+        },
+        product_ids: if is_discount {
+            Some(object_id_hex_list(&document, "productIds"))
+        } else {
+            None
+        },
+        category_ids: if is_discount {
+            Some(object_id_hex_list(&document, "categoryIds"))
+        } else {
+            None
+        },
+        operator_ids: if is_discount {
+            Some(object_id_hex_list(&document, "operatorIds"))
+        } else {
+            None
+        },
+        starts_at: optional_date_string(&document, "startsAt"),
+        expires_at: optional_date_string(&document, "expiresAt"),
         is_redeemed: document.get_bool("isRedeemed").unwrap_or(false),
         is_archived: document.get_bool("isArchived").unwrap_or(false),
         redeemed_at: optional_date_string(&document, "redeemedAt"),
@@ -93,6 +155,23 @@ pub(super) fn object_id_from_bson(value: Option<&Bson>) -> Option<ObjectId> {
         Some(Bson::String(id)) => ObjectId::parse_str(id).ok(),
         _ => None,
     }
+}
+
+fn object_id_hex_list(document: &Document, key: &str) -> Vec<String> {
+    document
+        .get_array(key)
+        .ok()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| match value {
+                    Bson::ObjectId(id) => Some(id.to_hex()),
+                    Bson::String(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
 pub(super) fn number_from_bson(value: Option<&Bson>) -> Option<i64> {

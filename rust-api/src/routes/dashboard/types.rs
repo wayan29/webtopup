@@ -14,6 +14,21 @@ pub struct OpsSnapshotResponse {
     pub deposits: DepositOpsSummary,
     pub vendors: VendorOpsSummary,
     pub stuck: StuckOpsSummary,
+    pub promo: PromoOpsSummary,
+}
+
+#[derive(Default, Serialize)]
+pub struct PromoOpsSummary {
+    /// Active balance vouchers idle >30 days (not redeemed, not archived).
+    pub idle_vouchers: i64,
+    /// Completed balance giveaways (all-time count).
+    pub giveaways_total: i64,
+    /// Total amount credited via balance giveaways.
+    pub giveaways_amount_total: i64,
+    /// Live flash sales currently in window.
+    pub flash_sales_live: i64,
+    /// Discount vouchers with remaining slots.
+    pub discount_vouchers_open: i64,
 }
 
 #[derive(Default, Serialize)]

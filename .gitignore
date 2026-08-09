@@ -59,6 +59,7 @@ playwright.config.ts
 !tools/dev-verification/playwright.config.ts
 server/src/**/*.test.ts
 server/src/**/*.spec.ts
+!server/src/routes/apiV2ProxyRoutes.test.ts
 client/src/**/*.test.tsx
 client/src/**/*.spec.tsx
 # # scripts/smoke/  # tracked harness  # tracked harness (mock/read smoke)
@@ -104,6 +105,9 @@ temp/
 
 # Playwright auth state
 playwright/.auth/
+
+# Graphify knowledge-graph outputs are local analysis artifacts (never publish)
+/graphify-out/
 
 # Local AI / coding-agent tooling and session artifacts (never publish)
 .agents/

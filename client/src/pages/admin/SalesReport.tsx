@@ -346,39 +346,40 @@ export default function SalesReport() {
 
     return (
         <div className="mx-auto w-full max-w-[1740px] min-w-0 space-y-5 pb-8 sm:space-y-6 sm:pb-10">
-            <section className="ui-panel rounded-[24px] border p-5">
-                <div className="flex flex-col justify-between gap-6 lg:flex-row lg:items-end">
-                    <div className="min-w-0">
-                        <div>
-                            <div>
-                                <p className="ui-text-muted text-xs font-bold uppercase tracking-[0.18em]">Pusat Export</p>
-                                <h2 className="ui-text mt-2 text-2xl font-black">CSV siap unduh</h2>
-                                <p className="ui-text-muted mt-2 text-sm leading-6">CSV memakai periode yang sudah diterapkan: <span className="font-bold ui-text">{activeRangeLabel}</span>.</p>
-                            </div>
+            <section className="ui-panel rounded-[24px] border p-4 sm:p-5">
+                <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between lg:gap-6">
+                    <div className="min-w-0 flex-1">
+                        <p className="ui-text-muted text-xs font-bold uppercase tracking-[0.18em]">Pusat Export</p>
+                        <h2 className="ui-text mt-1.5 text-xl font-black sm:text-2xl">CSV siap unduh</h2>
+                        <p className="ui-text-muted mt-1.5 text-sm leading-6">
+                            Periode aktif: <span className="font-bold ui-text">{activeRangeLabel}</span>
+                        </p>
+                    </div>
+                    <button
+                        type="button"
+                        onClick={handleExport}
+                        disabled={isExporting || loading || hasInvalidRange || hasUnappliedChanges || lastRefreshFailed}
+                        className="ui-accent-solid inline-flex w-full shrink-0 items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-black transition hover:brightness-105 disabled:cursor-not-allowed disabled:opacity-60 lg:w-auto lg:min-w-[11rem]"
+                    >
+                        <Download className="h-4 w-4" />
+                        {isExporting ? 'Mengexport...' : 'Export CSV'}
+                    </button>
+                </div>
 
-                            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-1">
-                                <div className="ui-panel-muted ui-border rounded-2xl border p-4">
-                                    <p className="ui-text-muted text-[10px] font-black uppercase tracking-[0.16em]">Total Omset</p>
-                                    <p className="ui-text mt-2 text-2xl font-black">{formatCurrency(data.summary.totalOmset)}</p>
-                                </div>
-                                <div className="ui-panel-muted ui-border rounded-2xl border p-4">
-                                    <p className="ui-text-muted text-[10px] font-black uppercase tracking-[0.16em]">Total Profit</p>
-                                    <p className="ui-text mt-2 text-2xl font-black">{formatCurrency(data.summary.totalProfit)}</p>
-                                </div>
-                            </div>
-
-                            <button
-                                onClick={handleExport}
-                                disabled={isExporting || loading || hasInvalidRange || hasUnappliedChanges || lastRefreshFailed}
-                                className="ui-accent-solid inline-flex w-full items-center justify-center gap-2 rounded-xl px-4 py-3 text-sm font-black transition hover:brightness-105 disabled:cursor-not-allowed disabled:opacity-60"
-                            >
-                                <Download className="h-4 w-4" />
-                                {isExporting ? 'Mengexport...' : 'Export CSV'}
-                            </button>
-                            <p className="ui-text-muted text-[11px] leading-5">Export mengikuti data yang tampil. Terapkan perubahan filter sebelum mengunduh CSV.</p>
-                        </div>
+                <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                    <div className="ui-panel-muted ui-border rounded-2xl border p-4">
+                        <p className="ui-text-muted text-[10px] font-black uppercase tracking-[0.16em]">Total Omset</p>
+                        <p className="ui-text mt-2 text-xl font-black sm:text-2xl">{formatCurrency(data.summary.totalOmset)}</p>
+                    </div>
+                    <div className="ui-panel-muted ui-border rounded-2xl border p-4">
+                        <p className="ui-text-muted text-[10px] font-black uppercase tracking-[0.16em]">Total Profit</p>
+                        <p className="ui-text mt-2 text-xl font-black sm:text-2xl">{formatCurrency(data.summary.totalProfit)}</p>
                     </div>
                 </div>
+
+                <p className="ui-text-muted mt-3 text-[11px] leading-5">
+                    Export mengikuti data yang tampil. Terapkan perubahan filter sebelum mengunduh CSV.
+                </p>
             </section>
 
             {(apiV2Error || filterError || exportError || hasUnappliedChanges || loading) && (

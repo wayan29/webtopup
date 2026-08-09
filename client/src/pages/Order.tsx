@@ -32,6 +32,7 @@ import {
 } from '../api/guestCheckoutSubmission';
 import { useAuthStore } from '../store/useAuthStore';
 import OperatorIcon from '../components/OperatorIcon';
+import HomeCountdown from '../components/HomeCountdown';
 
 interface ServerOption {
     label: string;
@@ -229,6 +230,14 @@ export default function Order() {
     const [selectedFlashSale, setSelectedFlashSale] = useState(false);
     const [selectedPayment, setSelectedPayment] = useState<PaymentMethod | null>(null);
     const [voucher, setVoucher] = useState('');
+    const [voucherChecking, setVoucherChecking] = useState(false);
+    const [voucherError, setVoucherError] = useState('');
+    const [voucherPreview, setVoucherPreview] = useState<{
+        valid: boolean;
+        discountAmount: number;
+        finalAmount: number;
+        remainingUses?: number;
+    } | null>(null);
     const [whatsapp, setWhatsapp] = useState('');
     const [showFullDescription, setShowFullDescription] = useState(false);
     const [flashSaleMap, setFlashSaleMap] = useState<Record<string, FlashSaleInfo>>({});
@@ -405,13 +414,41 @@ export default function Order() {
     };
 
     const basePrice = selectedProduct ? getUserPrice(selectedProduct, selectedFlashSale) : 0;
+    const discountedBase = voucherPreview?.valid ? voucherPreview.finalAmount : basePrice;
     const estimatedAdminFee = selectedPayment && selectedPayment._id !== 'saldo'
-        ? (selectedPayment.adminFee || 0) + Math.ceil(basePrice * ((selectedPayment.adminPercent || 0) / 100))
+        ? (selectedPayment.adminFee || 0) + Math.ceil(discountedBase * ((selectedPayment.adminPercent || 0) / 100))
         : 0;
-    const estimatedTransferTotal = basePrice + estimatedAdminFee;
-    const displayPrice = paymentInfo?.amount ?? basePrice;
+    const estimatedTransferTotal = discountedBase + estimatedAdminFee;
+    const displayPrice = paymentInfo?.amount ?? discountedBase;
     const originalPrice = selectedProduct ? getOriginalPrice(selectedProduct) : displayPrice;
-    const savings = selectedFlashSale ? Math.max(0, originalPrice - displayPrice) : 0;
+    const savings = Math.max(0, originalPrice - displayPrice);
+
+    const applyVoucherPreview = async () => {
+        if (!selectedProduct || !voucher.trim()) return;
+        setVoucherChecking(true);
+        setVoucherError('');
+        setVoucherPreview(null);
+        try {
+            const amount = getUserPrice(selectedProduct, selectedFlashSale);
+            const res = await apiV2.post('/vouchers/discount/validate', {
+                code: voucher.trim().toUpperCase(),
+                amount,
+                productId: selectedProduct._id,
+                categoryId: getEntityId((selectedProduct as { categoryId?: unknown }).categoryId) || undefined,
+                operatorId: getEntityId((selectedProduct as { operatorId?: unknown }).operatorId) || operator?._id || undefined,
+            });
+            setVoucherPreview({
+                valid: Boolean(res.data?.valid),
+                discountAmount: Number(res.data?.discountAmount || 0),
+                finalAmount: Number(res.data?.finalAmount ?? amount),
+                remainingUses: res.data?.remainingUses,
+            });
+        } catch (error: any) {
+            setVoucherError(error.response?.data?.message || 'Voucher tidak valid');
+        } finally {
+            setVoucherChecking(false);
+        }
+    };
     const rewardPoints = getRewardPoints(selectedProduct?.rewardPoints);
     const selectedValidation = selectedProduct?.validation?.enabled ? selectedProduct.validation : null;
     const targetLabel = selectedValidation?.targetLabel || operator?.userIdLabel || 'Nomor Tujuan';
@@ -548,7 +585,8 @@ export default function Order() {
                     serverId: normalizedServerId || undefined,
                     whatsapp: normalizedWhatsapp,
                     paymentMethodId: selectedPayment._id,
-                    useFlashSale: selectedFlashSale
+                    useFlashSale: selectedFlashSale,
+                    voucherCode: voucher.trim() || undefined,
                 };
                 const fingerprint = JSON.stringify([
                     selectedProduct.code,
@@ -558,6 +596,7 @@ export default function Order() {
                     '',
                     selectedPayment._id,
                     selectedFlashSale,
+                    voucher.trim(),
                     user?.id ?? '',
                 ]);
                 const current = guestCheckoutStateRef.current;
@@ -588,7 +627,8 @@ export default function Order() {
                     productCode: selectedProduct.code,
                     target: normalizedTarget,
                     serverId: normalizedServerId || undefined,
-                    useFlashSale: selectedFlashSale
+                    useFlashSale: selectedFlashSale,
+                    voucherCode: voucher.trim() || undefined,
                 };
                 await apiV2.post('/transactions', payload);
                 alert('Transaksi berhasil dibuat!');
@@ -903,10 +943,22 @@ export default function Order() {
 
                                     return (
                                         <div className="space-y-3">
-                                            <div className="flex items-center gap-2">
+                                            <div className="flex flex-wrap items-center gap-2">
                                                 <Zap className="h-5 w-5 text-orange-500" />
                                                 <h4 className="font-bold ui-text">Flash Sale</h4>
                                                 <span className="text-xs ui-text-muted">Harga spesial, stok terbatas!</span>
+                                                {(() => {
+                                                    const nearestEnd = flashSaleProducts
+                                                        .map((p) => flashSaleMap[p._id]?.endDate)
+                                                        .filter(Boolean)
+                                                        .sort()[0];
+                                                    return nearestEnd ? (
+                                                        <span className="inline-flex items-center gap-1.5">
+                                                            <span className="text-[11px] ui-text-muted">Berakhir dalam</span>
+                                                            <HomeCountdown endDate={nearestEnd} />
+                                                        </span>
+                                                    ) : null;
+                                                })()}
                                             </div>
                                             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
                                                 {flashSaleProducts.map((product) => {
@@ -1172,29 +1224,45 @@ export default function Order() {
                     </div>
                 </div>
 
-                {/* Step 4: Voucher */}
+                {/* Step 4: Voucher diskon checkout */}
                 <div className={panelClass}>
                     <div className={panelHeaderClass}>
                         <span className={stepBadgeClass}>4</span>
-                        <span className="font-semibold ui-text">Voucher</span>
+                        <span className="font-semibold ui-text">Voucher Diskon</span>
                     </div>
                     <div className="p-4">
                         <div className="flex gap-2">
                             <input
                                 type="text"
                                 value={voucher}
-                                onChange={(e) => setVoucher(e.target.value)}
-                                placeholder="Voucher checkout belum tersedia"
-                                disabled
-                                className="flex-1 cursor-not-allowed rounded-[20px] border ui-border ui-panel px-4 py-3 ui-text-muted placeholder-[var(--ui-text-muted)] outline-none"
+                                onChange={(e) => {
+                                    setVoucher(e.target.value.toUpperCase());
+                                    setVoucherPreview(null);
+                                    setVoucherError('');
+                                }}
+                                placeholder="Kode diskon (opsional)"
+                                className="flex-1 rounded-[20px] border ui-border ui-panel px-4 py-3 ui-text placeholder-[var(--ui-text-muted)] outline-none"
                             />
-                            <button disabled className="cursor-not-allowed rounded-[20px] border ui-border bg-[var(--ui-card-muted)] px-4 py-3 font-medium ui-text-muted">
-                                Belum Aktif
+                            <button
+                                type="button"
+                                onClick={applyVoucherPreview}
+                                disabled={voucherChecking || !voucher.trim() || !selectedProduct}
+                                className="rounded-[20px] border ui-border ui-accent-solid px-4 py-3 font-medium disabled:opacity-50"
+                            >
+                                {voucherChecking ? 'Cek…' : 'Pakai'}
                             </button>
                         </div>
-                        <p className="mt-2 text-xs ui-text-muted">
-                            Voucher diskon checkout belum terhubung. Gunakan halaman redeem voucher untuk top up saldo.
-                        </p>
+                        {voucherError ? <p className="mt-2 text-xs ui-danger-text">{voucherError}</p> : null}
+                        {voucherPreview?.valid ? (
+                            <p className="mt-2 text-xs ui-success-text">
+                                Diskon {formatPrice(voucherPreview.discountAmount)} · bayar Rp {formatPrice(voucherPreview.finalAmount)}
+                                {voucherPreview.remainingUses != null ? ` · sisa slot ${voucherPreview.remainingUses}` : ''}
+                            </p>
+                        ) : (
+                            <p className="mt-2 text-xs ui-text-muted">
+                                Voucher diskon multi-slot. Untuk top-up saldo pakai menu Redeem Voucher.
+                            </p>
+                        )}
                     </div>
                 </div>
 
@@ -1233,7 +1301,7 @@ export default function Order() {
                             <p className="text-xs ui-text-muted">Total</p>
                             <div className="flex flex-wrap items-center gap-2">
                                 <p className="text-2xl font-bold ui-text">
-                                    Rp {selectedProduct ? formatPrice(selectedPayment?._id === 'saldo' ? basePrice : estimatedTransferTotal) : '0'}
+                                    Rp {selectedProduct ? formatPrice(selectedPayment?._id === 'saldo' ? discountedBase : estimatedTransferTotal) : '0'}
                                 </p>
                                 {rewardPoints > 0 && (
                                     <span className="inline-flex items-center gap-1 rounded-full border border-[var(--ui-accent)]/25 bg-[var(--ui-accent-soft)] px-2.5 py-1 text-xs font-bold ui-accent-text">
@@ -1242,6 +1310,22 @@ export default function Order() {
                                     </span>
                                 )}
                             </div>
+                            {selectedProduct && (selectedFlashSale || voucherPreview?.valid) ? (
+                                <div className="mt-1 space-y-0.5 text-xs">
+                                    <p className="ui-text-muted">
+                                        Harga produk <span className="line-through">Rp {formatPrice(getOriginalPrice(selectedProduct))}</span>
+                                        {' → '}
+                                        <span className="font-semibold ui-text">Rp {formatPrice(basePrice)}</span>
+                                        {selectedFlashSale ? ' (flash sale)' : ''}
+                                    </p>
+                                    {voucherPreview?.valid ? (
+                                        <p className="ui-success-text font-semibold">
+                                            Voucher −Rp {formatPrice(voucherPreview.discountAmount)}
+                                            {' → bayar Rp '}{formatPrice(discountedBase)}
+                                        </p>
+                                    ) : null}
+                                </div>
+                            ) : null}
                             {selectedPayment?._id !== 'saldo' && estimatedAdminFee > 0 && (
                                 <p className="text-xs ui-text-muted">
                                     Estimasi fee Rp {formatPrice(estimatedAdminFee)}

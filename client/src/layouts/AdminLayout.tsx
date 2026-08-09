@@ -17,6 +17,7 @@ import {
     LogOut,
     Menu,
     Moon,
+    MoreHorizontal,
     Pin,
     RefreshCw,
     Search,
@@ -345,8 +346,10 @@ function SortableMenuItem({
                             onClick={() => onTogglePin(item.name)}
                             aria-label={isPinned ? `Lepas pin ${item.name}` : `Pin ${item.name}`}
                             title={isPinned ? 'Lepas dari favorit' : 'Tambah ke favorit'}
-                            className={`shrink-0 rounded-lg border px-1.5 py-1 transition-colors ${isCompact ? 'md:hidden' : ''} ${
-                                isPinned ? 'ui-accent-chip' : 'ui-muted-action opacity-70 hover:opacity-100'
+                            className={`shrink-0 rounded-lg border px-1.5 py-1 transition-all ${isCompact ? 'md:hidden' : ''} ${
+                                isPinned
+                                    ? 'ui-accent-chip'
+                                    : 'ui-muted-action opacity-0 group-hover:opacity-100 focus-visible:opacity-100'
                             }`}
                         >
                             <Pin className={`h-3.5 w-3.5 ${isPinned ? 'fill-current' : ''}`} />
@@ -452,8 +455,10 @@ function SortableMenuItem({
                     onClick={() => onTogglePin(item.name)}
                     aria-label={isPinned ? `Lepas pin ${item.name}` : `Pin ${item.name}`}
                     title={isPinned ? 'Lepas dari favorit' : 'Tambah ke favorit'}
-                    className={`shrink-0 rounded-lg border px-1.5 py-1 transition-colors ${isCompact ? 'md:hidden' : ''} ${
-                        isPinned ? 'ui-accent-chip' : 'ui-muted-action opacity-70 hover:opacity-100'
+                    className={`shrink-0 rounded-lg border px-1.5 py-1 transition-all ${isCompact ? 'md:hidden' : ''} ${
+                        isPinned
+                            ? 'ui-accent-chip'
+                            : 'ui-muted-action opacity-0 group-hover:opacity-100 focus-visible:opacity-100'
                     }`}
                 >
                     <Pin className={`h-3.5 w-3.5 ${isPinned ? 'fill-current' : ''}`} />
@@ -478,6 +483,10 @@ export default function AdminLayout() {
     const [isThemePickerOpen, setIsThemePickerOpen] = useState(false);
     const themeDialogRef = useRef<HTMLDivElement>(null);
     const themeTriggerRef = useRef<HTMLButtonElement>(null);
+    /** "⋯ Sidebar" dropdown keeps compact/reorder/theme controls out of the header. */
+    const [isSidebarOptionsOpen, setIsSidebarOptionsOpen] = useState(false);
+    const sidebarOptionsRef = useRef<HTMLDivElement | null>(null);
+    const [isFavoritesCollapsed, setIsFavoritesCollapsed] = useState(() => localStorage.getItem('adminFavoritesCollapsed') === '1');
     const [menuSearch, setMenuSearch] = useState('');
     const [accessDenied, setAccessDenied] = useState(false);
     const [themeSaving, setThemeSaving] = useState(false);
@@ -994,6 +1003,46 @@ export default function AdminLayout() {
         setAccountMenuOpen(false);
     }, [location.pathname]);
 
+    // Close the sidebar options dropdown on outside click / Escape, mirroring the account menu.
+    useEffect(() => {
+        if (!isSidebarOptionsOpen) return;
+        const onPointerDown = (event: MouseEvent | TouchEvent) => {
+            if (!sidebarOptionsRef.current?.contains(event.target as Node)) {
+                setIsSidebarOptionsOpen(false);
+            }
+        };
+        const onKeyDown = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') setIsSidebarOptionsOpen(false);
+        };
+        document.addEventListener('mousedown', onPointerDown);
+        document.addEventListener('touchstart', onPointerDown);
+        document.addEventListener('keydown', onKeyDown);
+        return () => {
+            document.removeEventListener('mousedown', onPointerDown);
+            document.removeEventListener('touchstart', onPointerDown);
+            document.removeEventListener('keydown', onKeyDown);
+        };
+    }, [isSidebarOptionsOpen]);
+
+    useEffect(() => {
+        setIsSidebarOptionsOpen(false);
+    }, [location.pathname]);
+
+    useEffect(() => {
+        // Options menu holds the reorder toggle; closing options should not leave customize mode on.
+        if (isCompactSidebar && isCustomizingMenu) {
+            setIsCustomizingMenu(false);
+        }
+    }, [isCompactSidebar, isCustomizingMenu]);
+
+    const toggleFavoritesCollapsed = () => {
+        setIsFavoritesCollapsed((prev) => {
+            const next = !prev;
+            localStorage.setItem('adminFavoritesCollapsed', next ? '1' : '0');
+            return next;
+        });
+    };
+
     const handleAdminThemeChange = async (themeId: UIThemeId) => {
         if (themeId === user?.preferences?.uiTheme || themeSaving) {
             return;
@@ -1339,34 +1388,67 @@ export default function AdminLayout() {
                                 <div className="text-[10px] font-black uppercase tracking-[0.28em] ui-text-muted">Navigasi</div>
                                 <div className="mt-0.5 text-[11px] ui-text-muted">Cari dan atur urutan menu</div>
                             </div>
-                            <div className={`flex items-center gap-2 ${isCompactSidebar ? 'md:flex-col' : ''}`}>
+                            <div className={`relative flex items-center gap-2 ${isCompactSidebar ? 'md:flex-col' : ''}`} ref={sidebarOptionsRef}>
                                 <button
                                     type="button"
-                                    onClick={toggleCompactSidebar}
-                                    className={`hidden md:inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-1.5 text-[11px] font-semibold transition-colors ${
-                                        isCompactSidebar
-                                            ? 'ui-accent-chip md:w-full md:justify-center'
-                                            : 'ui-muted-action hover:border-[var(--ui-accent)] hover:text-[var(--ui-accent)]'
-                                    }`}
-                                    title={isCompactSidebar ? 'Kembali normal' : 'Aktifkan mode ringkas'}
-                                    aria-label={isCompactSidebar ? 'Kembali ke sidebar normal' : 'Aktifkan mode ringkas'}
+                                    onClick={() => setIsSidebarOptionsOpen((open) => !open)}
+                                    aria-label="Opsi sidebar"
+                                    aria-haspopup="menu"
+                                    aria-expanded={isSidebarOptionsOpen}
+                                    title="Opsi sidebar"
+                                    className={`ui-muted-action inline-flex h-9 w-9 items-center justify-center rounded-xl border transition-colors hover:border-[var(--ui-accent)] hover:text-[var(--ui-accent)] ${
+                                        isSidebarOptionsOpen ? 'ui-accent-chip' : ''
+                                    } ${isCompactSidebar ? 'md:w-full' : ''}`}
                                 >
-                                    {isCompactSidebar ? <ChevronRight className="h-3.5 w-3.5" /> : <ChevronLeft className="h-3.5 w-3.5" />}
-                                    <span className={isCompactSidebar ? 'md:hidden' : ''}>{isCompactSidebar ? 'Normal' : 'Ringkas'}</span>
+                                    <MoreHorizontal className="h-4 w-4" />
                                 </button>
-                                <button
-                                    type="button"
-                                    onClick={() => setIsCustomizingMenu((prev) => !prev)}
-                                    disabled={isSearchMode || isCompactSidebar}
-                                    className={`inline-flex items-center gap-2 rounded-xl border px-3 py-1.5 text-[11px] font-semibold transition-colors ${
-                                        isCustomizingMenu
-                                            ? 'ui-accent-chip'
-                                            : 'ui-muted-action hover:border-[var(--ui-accent)] hover:text-[var(--ui-accent)]'
-                                    } disabled:cursor-not-allowed disabled:opacity-50 ${isCompactSidebar ? 'md:hidden' : ''}`}
-                                >
-                                    <GripVertical className="h-3.5 w-3.5" />
-                                    {isCustomizingMenu ? 'Selesai' : 'Atur Menu'}
-                                </button>
+                                {isSidebarOptionsOpen ? (
+                                    <div
+                                        role="menu"
+                                        aria-label="Opsi sidebar"
+                                        className="ui-panel ui-border absolute right-0 top-full z-50 mt-2 w-56 overflow-hidden rounded-2xl border shadow-2xl"
+                                    >
+                                        <button
+                                            type="button"
+                                            role="menuitem"
+                                            onClick={() => {
+                                                toggleCompactSidebar();
+                                                setIsSidebarOptionsOpen(false);
+                                            }}
+                                            className="ui-text flex w-full items-center gap-3 px-4 py-3 text-sm font-medium transition-colors hover:bg-[var(--ui-card-muted)]"
+                                        >
+                                            {isCompactSidebar ? <ChevronRight className="h-4 w-4" /> : <ChevronLeft className="h-4 w-4" />}
+                                            {isCompactSidebar ? 'Sidebar normal' : 'Mode ringkas'}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            role="menuitem"
+                                            onClick={() => {
+                                                setIsCustomizingMenu((prev) => !prev);
+                                                setIsSidebarOptionsOpen(false);
+                                            }}
+                                            disabled={isSearchMode || isCompactSidebar}
+                                            className="ui-text ui-border flex w-full items-center gap-3 border-t px-4 py-3 text-sm font-medium transition-colors hover:bg-[var(--ui-card-muted)] disabled:cursor-not-allowed disabled:opacity-50"
+                                            title={isCompactSidebar ? 'Atur urutan tersedia di sidebar normal' : undefined}
+                                        >
+                                            <GripVertical className="h-4 w-4" />
+                                            {isCustomizingMenu ? 'Selesai atur menu' : 'Atur urutan menu'}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            role="menuitem"
+                                            onClick={() => {
+                                                setIsThemePickerOpen(true);
+                                                setIsSidebarOptionsOpen(false);
+                                            }}
+                                            className="ui-text ui-border flex w-full items-center gap-3 border-t px-4 py-3 text-sm font-medium transition-colors hover:bg-[var(--ui-card-muted)]"
+                                        >
+                                            <Settings2 className="h-4 w-4" />
+                                            <span className="min-w-0 flex-1 truncate text-left">Tema UI</span>
+                                            <span className="truncate text-xs ui-text-muted">{activeTheme.label}</span>
+                                        </button>
+                                    </div>
+                                ) : null}
                             </div>
                         </div>
 
@@ -1447,12 +1529,23 @@ export default function AdminLayout() {
                         {displayPinnedNavItems.length > 0 ? (
                             <div className="space-y-2">
                                 <div className={`flex items-center justify-between gap-2 px-2 ${isCompactSidebar ? 'md:hidden' : ''}`}>
-                                    <div>
-                                        <p className="text-[10px] uppercase tracking-[0.22em] ui-text-muted">Favorit</p>
-                                        {!isCompactSidebar ? (
-                                            <p className="mt-0.5 text-[10px] ui-text-muted">Seret handle untuk ubah urutan favorit</p>
-                                        ) : null}
-                                    </div>
+                                    <button
+                                        type="button"
+                                        onClick={toggleFavoritesCollapsed}
+                                        aria-expanded={!isFavoritesCollapsed}
+                                        className="flex min-w-0 flex-1 items-center gap-1.5 text-left ui-text-muted hover:text-[var(--ui-text)] transition-colors"
+                                    >
+                                        <ChevronRight
+                                            className={`h-3.5 w-3.5 shrink-0 transition-transform ${isFavoritesCollapsed ? '' : 'rotate-90'}`}
+                                            aria-hidden="true"
+                                        />
+                                        <span className="min-w-0">
+                                            <span className="block text-[10px] uppercase tracking-[0.22em]">Favorit</span>
+                                            {!isCompactSidebar && !isFavoritesCollapsed ? (
+                                                <span className="mt-0.5 block text-[10px]">Seret handle untuk ubah urutan</span>
+                                            ) : null}
+                                        </span>
+                                    </button>
                                     <button
                                         type="button"
                                         onClick={clearPinnedMenus}
@@ -1461,6 +1554,7 @@ export default function AdminLayout() {
                                         Kosongkan
                                     </button>
                                 </div>
+                                {!isFavoritesCollapsed ? (
                                 <DndContext
                                     sensors={sensors}
                                     collisionDetection={closestCenter}
@@ -1500,6 +1594,7 @@ export default function AdminLayout() {
                                         </div>
                                     </SortableContext>
                                 </DndContext>
+                                ) : null}
                             </div>
                         ) : null}
 
@@ -1573,20 +1668,6 @@ export default function AdminLayout() {
                                 </div>
                             </div>
                         </div>
-                        <button
-                            ref={themeTriggerRef}
-                            type="button"
-                            onClick={() => setIsThemePickerOpen(true)}
-                            title="Tema UI"
-                            aria-label="Buka pengaturan tema UI"
-                            className={`ui-muted-action mb-2 flex w-full items-center gap-3 rounded-xl border px-3 py-2.5 text-left transition-colors hover:border-[var(--ui-accent)] hover:text-[var(--ui-accent)] ${isCompactSidebar ? 'md:justify-center md:px-2' : 'justify-between'}`}
-                        >
-                            <span className={`min-w-0 ${isCompactSidebar ? 'md:hidden' : ''}`}>
-                                <span className="block text-[10px] uppercase tracking-[0.18em] ui-text-muted">Tema UI</span>
-                                <span className="block truncate text-xs font-semibold ui-text" title={activeTheme.label}>{activeTheme.label}</span>
-                            </span>
-                            <Settings2 className="h-4 w-4 shrink-0 ui-accent-text" />
-                        </button>
                         <button
                             type="button"
                             onClick={handleLogout}

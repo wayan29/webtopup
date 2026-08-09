@@ -90,6 +90,26 @@ export const ADMIN_NAV_BLUEPRINT: AdminNavBlueprintItem[] = [
         subtitle: 'Analitik omset dan performa'
     },
     {
+        name: 'Laporan Promo',
+        path: '/admin/promo-report',
+        icon: Gift,
+        permission: 'viewReports',
+        section: 'Overview',
+        subtitle: 'Biaya voucher, giveaway, flash sale'
+    },
+    {
+        name: 'Kampanye',
+        icon: Ticket,
+        id: 'kampanye',
+        section: 'Overview',
+        subtitle: 'Flash sale, voucher, giveaway',
+        submenu: [
+            { name: 'Flash Sale', path: '/admin/flash-sales', permission: 'manageProducts', subtitle: 'Promo berbatas waktu' },
+            { name: 'Voucher & Giveaway', path: '/admin/vouchers', permission: 'manageVouchers', subtitle: 'Kode saldo, diskon, undian' },
+            { name: 'Laporan Promo', path: '/admin/promo-report', permission: 'viewReports', subtitle: 'Biaya kampanye' },
+        ],
+    },
+    {
         name: 'Transaksi',
         icon: History,
         permission: 'viewTransactions',
@@ -129,24 +149,25 @@ export const ADMIN_NAV_BLUEPRINT: AdminNavBlueprintItem[] = [
         subtitle: 'Kategori, metode, dan verifikasi',
         badgeKey: 'payment',
         submenu: [
+            // Setup order: kategori dulu (induk metode), lalu metode, baru deposit operasional.
             {
-                name: 'Deposit',
-                path: '/admin/deposits',
-                permission: 'viewDeposits',
-                subtitle: 'Verifikasi deposit member',
-                badgeKey: 'deposits'
-            },
-            {
-                name: 'Metode',
-                path: '/admin/payment-methods',
-                permission: 'managePayment',
-                subtitle: 'Kelola metode pembayaran'
-            },
-            {
-                name: 'Kategori',
+                name: '1. Kategori',
                 path: '/admin/payment-categories',
                 permission: 'managePayment',
-                subtitle: 'Kelola kategori pembayaran'
+                subtitle: 'Buat dulu — induk metode'
+            },
+            {
+                name: '2. Metode',
+                path: '/admin/payment-methods',
+                permission: 'managePayment',
+                subtitle: 'Setelah kategori — kanal bayar'
+            },
+            {
+                name: '3. Deposit',
+                path: '/admin/deposits',
+                permission: 'viewDeposits',
+                subtitle: 'Operasional — verifikasi deposit member',
+                badgeKey: 'deposits'
             }
         ]
     },
@@ -158,12 +179,13 @@ export const ADMIN_NAV_BLUEPRINT: AdminNavBlueprintItem[] = [
         section: 'Catalog',
         subtitle: 'Struktur kategori, operator, dan item',
         submenu: [
-            { name: 'List Produk', path: '/admin/products', permission: 'viewProducts', subtitle: 'Kelola daftar produk' },
-            { name: 'Flash Sale', path: '/admin/flash-sales', permission: 'manageProducts', subtitle: 'Kelola promo cepat' },
-            { name: 'Kategori Produk', path: '/admin/product-categories', permission: 'manageProducts', subtitle: 'Kelola kategori produk' },
-            { name: 'Operator Produk', path: '/admin/product-operators', permission: 'manageProducts', subtitle: 'Kelola operator produk' },
-            { name: 'Jenis Produk', path: '/admin/product-types', permission: 'manageProducts', subtitle: 'Kelola jenis produk' },
-            { name: 'Audit Katalog', path: '/admin/catalog-audit', permission: 'manageProducts', subtitle: 'Cek relasi katalog publik' }
+            // Setup order: master data first, then sellable items, promo, then integrity check.
+            { name: '1. Kategori Produk', path: '/admin/product-categories', permission: 'manageProducts', subtitle: 'Buat dulu — induk katalog' },
+            { name: '2. Operator Produk', path: '/admin/product-operators', permission: 'manageProducts', subtitle: 'Setelah kategori — brand/operator' },
+            { name: '3. Jenis Produk', path: '/admin/product-types', permission: 'manageProducts', subtitle: 'Setelah operator — tipe item' },
+            { name: '4. List Produk', path: '/admin/products', permission: 'viewProducts', subtitle: 'Setelah master lengkap — SKU jual' },
+            { name: '5. Flash Sale', path: '/admin/flash-sales', permission: 'manageProducts', subtitle: 'Opsional — promo di atas produk' },
+            { name: '6. Audit Katalog', path: '/admin/catalog-audit', permission: 'manageProducts', subtitle: 'Cek relasi & master kosong' },
         ]
     },
     {
@@ -301,7 +323,8 @@ export const ADMIN_DEFAULT_EXPANDED_MENUS: Record<string, boolean> = {
     produk: true,
     payment: true,
     transactions: true,
-    addons: true
+    addons: true,
+    kampanye: true,
 };
 
 /**
@@ -369,6 +392,7 @@ export const getAdminNotificationLabel = (count: number) => (
 export const ADMIN_ROUTE_PERMISSIONS: AdminRoutePermissionRule[] = [
     { id: 'dashboard', match: (pathname) => pathname === '/admin' || isExactOrDescendant(pathname, '/admin/dashboard'), permission: 'viewDashboard' },
     { id: 'sales-report', match: (pathname) => isExactOrDescendant(pathname, '/admin/sales-report'), permission: 'viewReports' },
+    { id: 'promo-report', match: (pathname) => isExactOrDescendant(pathname, '/admin/promo-report'), permission: 'viewReports' },
     { id: 'notifications', match: (pathname) => isExactOrDescendant(pathname, '/admin/notifications'), permission: 'viewDashboard' },
     { id: 'transactions-manual', match: (pathname) => isExactOrDescendant(pathname, '/admin/transactions/manual'), permission: 'processManualTransaction' },
     { id: 'transactions-guest', match: (pathname) => isExactOrDescendant(pathname, '/admin/transactions/guest'), permission: 'viewTransactions' },

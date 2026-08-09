@@ -580,7 +580,7 @@ export default function ProductOperators() {
                             <th className="px-4 py-3 text-left font-semibold w-16">#</th>
                             <th className="px-4 py-3 text-left font-semibold">Nama Operator</th>
                             <th className="px-4 py-3 text-left font-semibold">Dependensi</th>
-                            <th className="px-4 py-3 text-left font-semibold">Cek Username</th>
+                            <th className="px-4 py-3 text-left font-semibold">Validasi ID</th>
                             <th className="px-4 py-3 text-left font-semibold">Status</th>
                             <th className="px-4 py-3 text-left font-semibold">Dibuat</th>
                             <th className="px-4 py-3 text-left font-semibold">Diubah</th>

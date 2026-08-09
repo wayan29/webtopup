@@ -3,7 +3,9 @@ use mongodb::bson::{doc, DateTime, Document};
 
 use crate::utils::{bson::read_i64, dates::start_of_today_utc};
 
-use super::types::{DepositOpsSummary, StuckOpsSummary, TransactionTodaySummary, VendorOpsSummary};
+use super::types::{
+    DepositOpsSummary, PromoOpsSummary, StuckOpsSummary, TransactionTodaySummary, VendorOpsSummary,
+};
 
 pub async fn transaction_today_summary(db: &mongodb::Database) -> TransactionTodaySummary {
     let pipeline = vec![
@@ -113,6 +115,64 @@ pub async fn stuck_ops_summary(db: &mongodb::Database, threshold_minutes: i64) -
     StuckOpsSummary {
         threshold_minutes,
         total,
+    }
+}
+
+pub async fn promo_ops_summary(db: &mongodb::Database) -> PromoOpsSummary {
+    let idle_cutoff =
+        DateTime::from_millis(DateTime::now().timestamp_millis() - 30 * 24 * 60 * 60 * 1000);
+    let vouchers = db.collection::<Document>("vouchers");
+    let idle_vouchers = vouchers
+        .count_documents(doc! {
+            "isRedeemed": false,
+            "isArchived": false,
+            "$or": [
+                { "kind": "balance" },
+                { "kind": { "$exists": false } },
+            ],
+            "createdAt": { "$lte": idle_cutoff },
+        })
+        .await
+        .unwrap_or(0) as i64;
+    let discount_vouchers_open = vouchers
+        .count_documents(doc! {
+            "kind": "discount",
+            "isArchived": false,
+            "$expr": { "$lt": ["$usedCount", "$maxUses"] },
+        })
+        .await
+        .unwrap_or(0) as i64;
+    let giveaways = db.collection::<Document>("balancegiveaways");
+    let giveaways_total = giveaways.count_documents(doc! {}).await.unwrap_or(0) as i64;
+    let giveaways_amount_total = first_document(
+        giveaways
+            .aggregate(vec![doc! {
+                "$group": {
+                    "_id": null,
+                    "total": { "$sum": "$allocatedTotal" },
+                }
+            }])
+            .await,
+    )
+    .await
+    .map(|doc| read_i64(&doc, "total"))
+    .unwrap_or(0);
+    let now = DateTime::now();
+    let flash_sales_live = db
+        .collection::<Document>("flashsales")
+        .count_documents(doc! {
+            "isActive": true,
+            "startDate": { "$lte": now },
+            "endDate": { "$gte": now },
+        })
+        .await
+        .unwrap_or(0) as i64;
+    PromoOpsSummary {
+        idle_vouchers,
+        giveaways_total,
+        giveaways_amount_total,
+        flash_sales_live,
+        discount_vouchers_open,
     }
 }
 

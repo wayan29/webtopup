@@ -77,6 +77,14 @@ pub(super) struct ManualTransactionItem {
     pub(crate) product: ProductBrief,
     #[serde(rename = "statusUpdatedBy")]
     pub(crate) status_updated_by: UserBrief,
+    #[serde(rename = "discountVoucherCode", skip_serializing_if = "Option::is_none")]
+    pub(crate) discount_voucher_code: Option<String>,
+    #[serde(rename = "discountAmount", skip_serializing_if = "Option::is_none")]
+    pub(crate) discount_amount: Option<i64>,
+    #[serde(rename = "baseAmount", skip_serializing_if = "Option::is_none")]
+    pub(crate) base_amount: Option<i64>,
+    #[serde(rename = "flashSale", skip_serializing_if = "Option::is_none")]
+    pub(crate) flash_sale: Option<String>,
 }
 
 #[derive(Default, Serialize)]
@@ -124,6 +132,8 @@ pub struct CreateTransactionPayload {
     pub(super) target: Option<String>,
     pub(super) server_id: Option<String>,
     pub(super) use_flash_sale: Option<bool>,
+    /// Optional checkout discount voucher code (kind=discount).
+    pub(super) voucher_code: Option<String>,
 }
 
 #[derive(Serialize)]

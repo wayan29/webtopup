@@ -12,7 +12,7 @@
     "catalog:audit": "ts-node src/scripts/audit-catalog.ts",
     "catalog:remediate": "ts-node src/scripts/remediate-catalog.ts",
     "indexes:rewards-points": "ts-node src/scripts/ensure-reward-point-indexes.ts",
-    "test:security": "node --test dist/securityHardening.test.js"
+    "test:security": "cd ../rust-api && cargo test --bin webtopup-rust-api security_hardening_checks"
   },
   "keywords": [],
   "author": "",
@@ -47,5 +47,9 @@
     "nodemon": "^3.1.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.3.3"
+  },
+  "allowScripts": {
+    "bcrypt@6.0.0": true,
+    "protobufjs@7.6.1": true
   }
 }

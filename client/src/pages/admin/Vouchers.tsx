@@ -1,11 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { apiV2 } from '../../api';
+import BalanceGiveawayPanel from './BalanceGiveawayPanel';
 import {
     AlertTriangle,
     Archive,
     Check,
     CheckCircle,
     Copy,
+    Download,
+    Gift,
     Loader2,
     Plus,
     RotateCcw,
@@ -20,6 +23,14 @@ interface VoucherRecord {
     _id: string;
     code: string;
     amount: number;
+    kind?: string;
+    discountType?: string;
+    discountValue?: number;
+    maxUses?: number;
+    usedCount?: number;
+    minPurchase?: number;
+    maxDiscount?: number;
+    onePerUser?: boolean;
     isRedeemed: boolean;
     isArchived: boolean;
     redeemedAt?: string;
@@ -68,13 +79,17 @@ type FilterState = {
     status: VoucherStatusFilter;
     startDate: string;
     endDate: string;
+    minAmount: string;
+    maxAmount: string;
 };
 
 const defaultFilters: FilterState = {
     search: '',
     status: '',
     startDate: '',
-    endDate: ''
+    endDate: '',
+    minAmount: '',
+    maxAmount: ''
 };
 
 const formatCurrency = (value: number) => `Rp${value.toLocaleString('id-ID')}`;
@@ -90,7 +105,50 @@ const formatDateTime = (value?: string) => (
         : '-'
 );
 
+const getAgeLabel = (createdAt?: string) => {
+    if (!createdAt) return '';
+    const ageMs = Date.now() - new Date(createdAt).getTime();
+    if (!Number.isFinite(ageMs) || ageMs < 0) return '';
+    const minutes = Math.floor(ageMs / 60000);
+    if (minutes < 60) return `${Math.max(1, minutes)} mnt lalu`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 48) return `${hours} jam lalu`;
+    const days = Math.floor(hours / 24);
+    return `${days} hari lalu`;
+};
+
+const isIdleActive = (voucher: VoucherRecord) => {
+    if (voucher.isArchived || voucher.isRedeemed) return false;
+    const ageMs = Date.now() - new Date(voucher.createdAt).getTime();
+    return Number.isFinite(ageMs) && ageMs >= 30 * 86400000;
+};
+
+const isDiscountVoucher = (voucher: VoucherRecord) =>
+    (voucher.kind || 'balance') === 'discount';
+
 const getVoucherBadge = (voucher: VoucherRecord) => {
+    const badges: ReactNode[] = [];
+    if (isDiscountVoucher(voucher)) {
+        badges.push(
+            <span key="kind" className="ui-info-chip rounded-full border px-2 py-1 text-xs font-semibold">Diskon</span>
+        );
+        const maxUses = voucher.maxUses ?? 0;
+        const used = voucher.usedCount ?? 0;
+        const remaining = Math.max(0, maxUses - used);
+        if (voucher.isArchived) {
+            badges.push(<span key="st" className="rounded-full ui-panel px-2 py-1 text-xs font-semibold ui-text-muted">Arsip</span>);
+        } else if (remaining <= 0 || voucher.isRedeemed) {
+            badges.push(<span key="st" className="ui-danger-chip rounded-full border px-2 py-1 text-xs font-semibold">Slot habis</span>);
+        } else {
+            badges.push(
+                <span key="st" className="ui-accent-chip rounded-full px-2 py-1 text-xs font-semibold">
+                    {used}/{maxUses} slot
+                </span>
+            );
+        }
+        return <>{badges}</>;
+    }
+
     if (voucher.isArchived) {
         return <span className="rounded-full ui-panel px-2 py-1 text-xs font-semibold ui-text-muted">Arsip</span>;
     }
@@ -99,7 +157,11 @@ const getVoucherBadge = (voucher: VoucherRecord) => {
         return <span className="ui-success-chip rounded-full border px-2 py-1 text-xs font-semibold">Redeemed</span>;
     }
 
-    return <span className="ui-accent-chip rounded-full px-2 py-1 text-xs font-semibold">Aktif</span>;
+    if (isIdleActive(voucher)) {
+        return <span className="ui-warning-chip rounded-full border px-2 py-1 text-xs font-semibold" title="Aktif tapi belum ditukar >30 hari">Perlu dibagikan</span>;
+    }
+
+    return <span className="ui-accent-chip rounded-full px-2 py-1 text-xs font-semibold">Siap pakai</span>;
 };
 
 export default function AdminVouchers() {
@@ -125,8 +187,24 @@ export default function AdminVouchers() {
     const [amount, setAmount] = useState('');
     const [quantity, setQuantity] = useState('1');
     const [customCode, setCustomCode] = useState('');
+    const [codePrefix, setCodePrefix] = useState('');
+    const [voucherKind, setVoucherKind] = useState<'balance' | 'discount'>('balance');
+    const [discountType, setDiscountType] = useState<'fixed' | 'percentage'>('fixed');
+    const [discountValue, setDiscountValue] = useState('5000');
+    const [maxUses, setMaxUses] = useState('10');
+    const [minPurchase, setMinPurchase] = useState('0');
+    const [maxDiscount, setMaxDiscount] = useState('0');
+    const [onePerUser, setOnePerUser] = useState(true);
+    const [listKind, setListKind] = useState<'balance' | 'discount' | 'all'>('balance');
+    const [categoryOptions, setCategoryOptions] = useState<Array<{ _id: string; name: string }>>([]);
+    const [operatorOptions, setOperatorOptions] = useState<Array<{ _id: string; name: string }>>([]);
+    const [scopeCategoryIds, setScopeCategoryIds] = useState<string[]>([]);
+    const [scopeOperatorIds, setScopeOperatorIds] = useState<string[]>([]);
     const [copiedId, setCopiedId] = useState<string | null>(null);
     const [createdCodes, setCreatedCodes] = useState<string[]>([]);
+    const [createdCount, setCreatedCount] = useState(0);
+    const [exporting, setExporting] = useState(false);
+    const [activeTab, setActiveTab] = useState<'codes' | 'giveaway'>('codes');
     const [confirmation, setConfirmation] = useState<{
         type: 'archive' | 'restore';
         voucher: VoucherRecord;
@@ -152,6 +230,7 @@ export default function AdminVouchers() {
             const params = {
                 page: requestPage,
                 limit: requestLimit,
+                kind: listKind,
                 ...Object.fromEntries(
                     Object.entries(requestFilters).filter(([, value]) => value)
                 )
@@ -176,11 +255,22 @@ export default function AdminVouchers() {
                 setLoading(false);
             }
         }
-    }, [appliedFilters, meta.limit, meta.page]);
+    }, [appliedFilters, meta.limit, meta.page, listKind]);
 
     useEffect(() => {
         fetchVouchers();
     }, [fetchVouchers]);
+
+    useEffect(() => {
+        // Taxonomy for discount scope multi-selects.
+        void Promise.all([
+            apiV2.get('/categories/admin/all').catch(() => ({ data: [] })),
+            apiV2.get('/operators/admin/all').catch(() => ({ data: [] })),
+        ]).then(([cats, ops]) => {
+            setCategoryOptions((cats.data || []).map((c: any) => ({ _id: c._id, name: c.name })));
+            setOperatorOptions((ops.data || []).map((o: any) => ({ _id: o._id, name: o.name })));
+        });
+    }, []);
 
     useEffect(() => {
         const handler = () => fetchVouchers();
@@ -206,11 +296,28 @@ export default function AdminVouchers() {
         setCreatedCodes([]);
 
         try {
-            const payload = {
-                amount: Number(amount),
-                quantity: customCode ? 1 : Number(quantity),
-                code: customCode || undefined
-            };
+            const payload =
+                voucherKind === 'discount'
+                    ? {
+                        kind: 'discount',
+                        code: customCode || undefined,
+                        prefix: codePrefix.trim() || undefined,
+                        discountType,
+                        discountValue: Number(discountValue),
+                        maxUses: Number(maxUses),
+                        minPurchase: Number(minPurchase) || 0,
+                        maxDiscount: Number(maxDiscount) || 0,
+                        onePerUser,
+                        categoryIds: scopeCategoryIds,
+                        operatorIds: scopeOperatorIds,
+                    }
+                    : {
+                        kind: 'balance',
+                        amount: Number(amount),
+                        quantity: customCode ? 1 : Number(quantity),
+                        code: customCode || undefined,
+                        prefix: codePrefix.trim() || undefined,
+                    };
             const response = await apiV2
                 .post('/vouchers', payload);
 
@@ -218,7 +325,9 @@ export default function AdminVouchers() {
             setAmount('');
             setQuantity('1');
             setCustomCode('');
-            setCreatedCodes(items.map((item: VoucherRecord) => item.code).slice(0, 8));
+            setCodePrefix('');
+            setCreatedCodes(items.map((item: VoucherRecord) => item.code));
+            setCreatedCount(items.length);
             setSuccessMessage(response.data?.message || 'Voucher berhasil dibuat');
             setMeta((current) => ({ ...current, page: 1 }));
             setAppliedFilters(defaultFilters);
@@ -283,10 +392,66 @@ export default function AdminVouchers() {
             setSuccessMessage('');
             return;
         }
+        if (filters.minAmount && filters.maxAmount && Number(filters.minAmount) > Number(filters.maxAmount)) {
+            setErrorMessage('Nominal minimum tidak boleh lebih besar dari maksimum.');
+            setSuccessMessage('');
+            return;
+        }
         setErrorMessage('');
         setAppliedFilters({ ...filters });
         setMeta((current) => ({ ...current, page: 1 }));
         setSuccessMessage('');
+    };
+
+    const applyPreset = (preset: 'active-today' | 'new-7d') => {
+        const today = new Date();
+        const toInput = (d: Date) => d.toISOString().slice(0, 10);
+        let next: FilterState;
+        if (preset === 'active-today') {
+            next = { ...defaultFilters, status: 'available', startDate: toInput(today), endDate: toInput(today) };
+        } else {
+            const weekAgo = new Date(today.getTime() - 6 * 86400000);
+            next = { ...defaultFilters, startDate: toInput(weekAgo), endDate: toInput(today) };
+        }
+        setFilters(next);
+        setAppliedFilters(next);
+        setMeta((current) => ({ ...current, page: 1 }));
+        setErrorMessage('');
+    };
+
+    const copyAllCreated = async () => {
+        if (createdCodes.length === 0) return;
+        try {
+            await navigator.clipboard.writeText(createdCodes.join('\n'));
+            setCopiedId('all-created');
+            window.setTimeout(() => setCopiedId(null), 1800);
+        } catch {
+            setErrorMessage('Gagal menyalin semua kode');
+        }
+    };
+
+    const handleExport = async () => {
+        setExporting(true);
+        setErrorMessage('');
+        try {
+            const params = Object.fromEntries(
+                Object.entries(appliedFilters).filter(([, value]) => value)
+            );
+            const response = await apiV2.get('/vouchers/export', { params, responseType: 'blob' });
+            const blob = new Blob([response.data], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.setAttribute('download', `vouchers-${new Date().toISOString().split('T')[0]}.csv`);
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            URL.revokeObjectURL(url);
+        } catch (error: any) {
+            setErrorMessage(error.response?.data?.message || 'Gagal export CSV voucher');
+        } finally {
+            setExporting(false);
+        }
     };
 
     const resetFilters = () => {
@@ -298,7 +463,43 @@ export default function AdminVouchers() {
 
     return (
         <div className="space-y-6">
+            <div className="border-b ui-border">
+                <nav className="flex gap-4" role="tablist" aria-label="Voucher dan bagikan saldo">
+                    <button
+                        type="button"
+                        role="tab"
+                        aria-selected={activeTab === 'codes'}
+                        onClick={() => setActiveTab('codes')}
+                        className={`inline-flex items-center gap-2 border-b-2 px-1 pb-3 text-sm font-medium transition-colors ${
+                            activeTab === 'codes'
+                                ? 'border-[var(--ui-accent)] ui-accent-text'
+                                : 'border-transparent ui-text-muted hover:text-[var(--ui-text)]'
+                        }`}
+                    >
+                        <Ticket className="h-4 w-4" />
+                        Kode Voucher
+                    </button>
+                    <button
+                        type="button"
+                        role="tab"
+                        aria-selected={activeTab === 'giveaway'}
+                        onClick={() => setActiveTab('giveaway')}
+                        className={`inline-flex items-center gap-2 border-b-2 px-1 pb-3 text-sm font-medium transition-colors ${
+                            activeTab === 'giveaway'
+                                ? 'border-[var(--ui-accent)] ui-accent-text'
+                                : 'border-transparent ui-text-muted hover:text-[var(--ui-text)]'
+                        }`}
+                    >
+                        <Gift className="h-4 w-4" />
+                        Bagikan Saldo Random
+                    </button>
+                </nav>
+            </div>
 
+            {activeTab === 'giveaway' ? <BalanceGiveawayPanel /> : null}
+
+            {activeTab === 'codes' ? (
+            <>
             {(errorMessage || successMessage) && (
                 <div className="space-y-3">
                     {errorMessage && (
@@ -349,6 +550,13 @@ export default function AdminVouchers() {
                     </div>
 
                     <form onSubmit={handleCreate} className="space-y-4">
+                        <div className="flex flex-wrap gap-2">
+                            <button type="button" onClick={() => setVoucherKind('balance')} className={`rounded-full border px-3 py-1.5 text-xs font-semibold ${voucherKind === 'balance' ? 'ui-accent-chip' : 'ui-muted-action'}`}>Saldo</button>
+                            <button type="button" onClick={() => setVoucherKind('discount')} className={`rounded-full border px-3 py-1.5 text-xs font-semibold ${voucherKind === 'discount' ? 'ui-accent-chip' : 'ui-muted-action'}`}>Diskon checkout</button>
+                        </div>
+
+                        {voucherKind === 'balance' ? (
+                        <>
                         <label className="block space-y-2">
                             <span className="text-sm font-medium ui-text">Nominal Voucher</span>
                             <input
@@ -375,6 +583,82 @@ export default function AdminVouchers() {
                                 placeholder="Contoh: 10"
                             />
                         </label>
+                        </>
+                        ) : (
+                        <>
+                        <div className="grid grid-cols-2 gap-3">
+                            <label className="block space-y-2">
+                                <span className="text-sm font-medium ui-text">Tipe diskon</span>
+                                <select value={discountType} onChange={(e) => setDiscountType(e.target.value as 'fixed' | 'percentage')} className={selectClass}>
+                                    <option value="fixed">Potongan Rp</option>
+                                    <option value="percentage">Persen %</option>
+                                </select>
+                            </label>
+                            <label className="block space-y-2">
+                                <span className="text-sm font-medium ui-text">{discountType === 'percentage' ? 'Persen' : 'Nominal potong'}</span>
+                                <input type="number" min="1" value={discountValue} onChange={(e) => setDiscountValue(e.target.value)} className={inputClass} />
+                            </label>
+                            <label className="block space-y-2">
+                                <span className="text-sm font-medium ui-text">Slot (max uses)</span>
+                                <input type="number" min="1" max="10000" value={maxUses} onChange={(e) => setMaxUses(e.target.value)} className={inputClass} />
+                            </label>
+                            <label className="block space-y-2">
+                                <span className="text-sm font-medium ui-text">Min belanja</span>
+                                <input type="number" min="0" value={minPurchase} onChange={(e) => setMinPurchase(e.target.value)} className={inputClass} />
+                            </label>
+                            <label className="block space-y-2">
+                                <span className="text-sm font-medium ui-text">Max diskon (0=∞)</span>
+                                <input type="number" min="0" value={maxDiscount} onChange={(e) => setMaxDiscount(e.target.value)} className={inputClass} />
+                            </label>
+                            <label className="flex items-center gap-2 pt-6 text-sm ui-text">
+                                <input type="checkbox" checked={onePerUser} onChange={(e) => setOnePerUser(e.target.checked)} className="h-4 w-4" />
+                                1x per user
+                            </label>
+                        </div>
+                        <div className="space-y-2">
+                            <p className="text-sm font-medium ui-text">Scope kategori (opsional)</p>
+                            <select
+                                multiple
+                                value={scopeCategoryIds}
+                                onChange={(e) => setScopeCategoryIds(Array.from(e.target.selectedOptions).map((o) => o.value))}
+                                className={`${selectClass} min-h-[88px]`}
+                            >
+                                {categoryOptions.map((c) => (
+                                    <option key={c._id} value={c._id}>{c.name}</option>
+                                ))}
+                            </select>
+                            <p className="text-xs ui-text-muted">Kosong = semua kategori. Ctrl/Cmd+klik untuk multi.</p>
+                        </div>
+                        <div className="space-y-2">
+                            <p className="text-sm font-medium ui-text">Scope operator (opsional)</p>
+                            <select
+                                multiple
+                                value={scopeOperatorIds}
+                                onChange={(e) => setScopeOperatorIds(Array.from(e.target.selectedOptions).map((o) => o.value))}
+                                className={`${selectClass} min-h-[88px]`}
+                            >
+                                {operatorOptions.map((o) => (
+                                    <option key={o._id} value={o._id}>{o.name}</option>
+                                ))}
+                            </select>
+                        </div>
+                        </>
+                        )}
+
+                        <label className="block space-y-2">
+                            <span className="text-sm font-medium ui-text">Prefix Kode (opsional)</span>
+                            <input
+                                type="text"
+                                value={codePrefix}
+                                onChange={(event) => setCodePrefix(event.target.value.toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 20))}
+                                disabled={Boolean(customCode)}
+                                className={`${inputClass} disabled:cursor-not-allowed disabled:opacity-60`}
+                                placeholder="Contoh: PROMO-"
+                            />
+                            <p className="text-xs ui-text-muted">
+                                Hanya untuk generate batch. Contoh hasil: <span className="font-mono">{codePrefix || 'PROMO-'}A1B2C3D4E5</span>
+                            </p>
+                        </label>
 
                         <label className="block space-y-2">
                             <span className="text-sm font-medium ui-text">Custom Code</span>
@@ -386,13 +670,23 @@ export default function AdminVouchers() {
                                 placeholder="Contoh: PROMO2026"
                             />
                             <p className="text-xs ui-text-muted">
-                                Format: huruf besar, angka, `_` atau `-`, minimal 4 karakter.
+                                Format: huruf besar, angka, `_` atau `-`, minimal 4 karakter. Mengisi custom code menonaktifkan qty & prefix.
                             </p>
                         </label>
 
+                        {Number(amount) > 0 ? (
+                            <div className="rounded-xl border ui-border ui-panel px-3 py-2.5 text-sm">
+                                <p className="ui-text-muted">Total nilai batch</p>
+                                <p className="mt-0.5 font-bold ui-accent-text">
+                                    {formatCurrency(Number(amount))} × {customCode ? 1 : Math.max(1, Number(quantity) || 1)} ={' '}
+                                    {formatCurrency(Number(amount) * (customCode ? 1 : Math.max(1, Number(quantity) || 1)))}
+                                </p>
+                            </div>
+                        ) : null}
+
                         <button
                             type="submit"
-                            disabled={submitting || !amount}
+                            disabled={submitting || (voucherKind === 'balance' ? !amount : !discountValue)}
                             className="inline-flex w-full items-center justify-center gap-2 rounded-xl ui-accent-solid px-4 py-3 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-60"
                         >
                             {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
@@ -402,8 +696,20 @@ export default function AdminVouchers() {
 
                     {createdCodes.length > 0 && (
                         <div className="ui-success-chip mt-5 rounded-2xl border p-4">
-                            <p className="text-sm font-semibold">Kode terbaru</p>
-                            <div className="mt-3 flex flex-wrap gap-2">
+                            <div className="flex items-center justify-between gap-2">
+                                <p className="text-sm font-semibold">
+                                    Kode terbaru ({createdCount || createdCodes.length})
+                                </p>
+                                <button
+                                    type="button"
+                                    onClick={copyAllCreated}
+                                    className="inline-flex items-center gap-1.5 rounded-full ui-panel px-3 py-1 text-xs font-semibold ui-text transition hover:bg-[var(--ui-card-muted)]"
+                                >
+                                    {copiedId === 'all-created' ? <Check className="h-3.5 w-3.5 ui-success-text" /> : <Copy className="h-3.5 w-3.5" />}
+                                    Salin semua
+                                </button>
+                            </div>
+                            <div className="mt-3 flex max-h-40 flex-wrap gap-2 overflow-y-auto">
                                 {createdCodes.map((code) => (
                                     <button
                                         key={code}
@@ -433,7 +739,7 @@ export default function AdminVouchers() {
                         </div>
                     </div>
 
-                    <div className="grid gap-4 border-b ui-border px-5 py-5 md:grid-cols-2 xl:grid-cols-4">
+                    <div className="grid gap-4 border-b ui-border px-5 py-5 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6">
                         <label className="space-y-2">
                             <span className="text-xs font-semibold uppercase tracking-[0.16em] ui-text-muted">Cari</span>
                             <div className="relative">
@@ -448,6 +754,22 @@ export default function AdminVouchers() {
                         </label>
 
                         <label className="space-y-2">
+                            <span className="text-xs font-semibold uppercase tracking-[0.16em] ui-text-muted">Jenis</span>
+                            <select
+                                value={listKind}
+                                onChange={(event) => {
+                                    setListKind(event.target.value as 'balance' | 'discount' | 'all');
+                                    setMeta((current) => ({ ...current, page: 1 }));
+                                }}
+                                className={selectClass}
+                            >
+                                <option value="balance">Saldo</option>
+                                <option value="discount">Diskon</option>
+                                <option value="all">Semua</option>
+                            </select>
+                        </label>
+
+                        <label className="space-y-2">
                             <span className="text-xs font-semibold uppercase tracking-[0.16em] ui-text-muted">Status</span>
                             <select
                                 value={filters.status}
@@ -459,6 +781,30 @@ export default function AdminVouchers() {
                                 <option value="redeemed">Redeemed</option>
                                 <option value="archived">Arsip</option>
                             </select>
+                        </label>
+
+                        <label className="space-y-2">
+                            <span className="text-xs font-semibold uppercase tracking-[0.16em] ui-text-muted">Nominal Min</span>
+                            <input
+                                type="number"
+                                min="0"
+                                value={filters.minAmount}
+                                onChange={(event) => setFilters((current) => ({ ...current, minAmount: event.target.value }))}
+                                className={inputClass}
+                                placeholder="0"
+                            />
+                        </label>
+
+                        <label className="space-y-2">
+                            <span className="text-xs font-semibold uppercase tracking-[0.16em] ui-text-muted">Nominal Max</span>
+                            <input
+                                type="number"
+                                min="0"
+                                value={filters.maxAmount}
+                                onChange={(event) => setFilters((current) => ({ ...current, maxAmount: event.target.value }))}
+                                className={inputClass}
+                                placeholder="100000"
+                            />
                         </label>
 
                         <label className="space-y-2">
@@ -486,6 +832,20 @@ export default function AdminVouchers() {
                         <div className="flex flex-wrap items-center gap-2">
                             <button
                                 type="button"
+                                onClick={() => applyPreset('active-today')}
+                                className="inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-xs font-semibold ui-muted-action transition"
+                            >
+                                Aktif hari ini
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => applyPreset('new-7d')}
+                                className="inline-flex items-center gap-2 rounded-xl border px-3 py-2 text-xs font-semibold ui-muted-action transition"
+                            >
+                                Baru 7 hari
+                            </button>
+                            <button
+                                type="button"
                                 onClick={resetFilters}
                                 className="inline-flex items-center gap-2 rounded-xl border px-4 py-2 text-sm font-semibold ui-muted-action transition"
                             >
@@ -499,6 +859,15 @@ export default function AdminVouchers() {
                             >
                                 <Search className="h-4 w-4" />
                                 Terapkan
+                            </button>
+                            <button
+                                type="button"
+                                onClick={handleExport}
+                                disabled={exporting || summary.total === 0}
+                                className="inline-flex items-center gap-2 rounded-xl border px-4 py-2 text-sm font-semibold ui-muted-action transition disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                                {exporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                                Export CSV
                             </button>
                         </div>
                         <select
@@ -557,11 +926,34 @@ export default function AdminVouchers() {
                                                 <div className="mt-2 text-xs ui-text-muted">{formatDateTime(voucher.updatedAt)}</div>
                                             </td>
                                             <td className="px-4 py-4 align-top text-sm ui-text">
-                                                <div className="font-semibold ui-text">{formatCurrency(voucher.amount)}</div>
-                                                {voucher.redeemedBalanceAfter !== undefined && (
-                                                    <div className="mt-2 text-xs ui-success-text">
-                                                        Balance user: {formatCurrency(voucher.redeemedBalanceBefore || 0)} → {formatCurrency(voucher.redeemedBalanceAfter)}
+                                                {isDiscountVoucher(voucher) ? (
+                                                    <div className="space-y-1">
+                                                        <div className="font-semibold ui-accent-text">
+                                                            {voucher.discountType === 'percentage'
+                                                                ? `${voucher.discountValue ?? 0}%`
+                                                                : formatCurrency(voucher.discountValue || 0)}
+                                                            <span className="ml-1 text-xs font-medium ui-text-muted">
+                                                                {voucher.discountType === 'percentage' ? 'diskon' : 'potong'}
+                                                            </span>
+                                                        </div>
+                                                        <div className="text-xs ui-text-muted">
+                                                            Slot {(voucher.usedCount ?? 0)}/{voucher.maxUses ?? 0}
+                                                            {(voucher.minPurchase || 0) > 0 ? ` · min ${formatCurrency(voucher.minPurchase || 0)}` : ''}
+                                                            {(voucher.maxDiscount || 0) > 0 ? ` · max ${formatCurrency(voucher.maxDiscount || 0)}` : ''}
+                                                        </div>
+                                                        {voucher.onePerUser !== false ? (
+                                                            <div className="text-[11px] ui-text-muted">1× per user</div>
+                                                        ) : null}
                                                     </div>
+                                                ) : (
+                                                    <>
+                                                        <div className="font-semibold ui-text">{formatCurrency(voucher.amount)}</div>
+                                                        {voucher.redeemedBalanceAfter !== undefined && (
+                                                            <div className="mt-2 text-xs ui-success-text">
+                                                                Balance user: {formatCurrency(voucher.redeemedBalanceBefore || 0)} → {formatCurrency(voucher.redeemedBalanceAfter)}
+                                                            </div>
+                                                        )}
+                                                    </>
                                                 )}
                                             </td>
                                             <td className="px-4 py-4 align-top">
@@ -589,6 +981,9 @@ export default function AdminVouchers() {
                                                 <div className="space-y-1">
                                                     <div className="font-medium ui-text">{voucher.createdBy?.name || '-'}</div>
                                                     <div className="text-xs ui-text-muted">{formatDateTime(voucher.createdAt)}</div>
+                                                    {getAgeLabel(voucher.createdAt) ? (
+                                                        <div className="text-[11px] ui-text-muted">{getAgeLabel(voucher.createdAt)}</div>
+                                                    ) : null}
                                                 </div>
                                             </td>
                                             <td className="px-4 py-4 align-top">
@@ -650,7 +1045,7 @@ export default function AdminVouchers() {
                 </div>
             </div>
 
-            {confirmation && (
+            {activeTab === 'codes' && confirmation && (
                 <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4">
                     <div className="w-full max-w-md rounded-2xl border ui-border ui-panel p-6 shadow-2xl" role="dialog" aria-modal="true" aria-labelledby="voucher-confirm-title">
                         <div className="mb-4 flex items-start gap-3">
@@ -695,6 +1090,8 @@ export default function AdminVouchers() {
                     </div>
                 </div>
             )}
+            </>
+            ) : null}
         </div>
     );
 }

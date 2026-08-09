@@ -15,8 +15,14 @@ import {
     Save,
     Info,
     ChevronLeft,
-    ChevronRight
+    ChevronRight,
+    Copy,
+    Power,
+    TrendingUp,
+    TrendingDown
 } from 'lucide-react';
+import ImagePickerField from '../../components/admin/ImagePickerField';
+import { getAssetUrl } from '../../lib/assetUrl';
 
 interface Reward {
     _id: string;
@@ -92,6 +98,10 @@ export default function Rewards() {
         initialTab === 'rewards' || initialTab === 'history' ? initialTab : 'settings'
     );
     const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+    const [lowStockOnly, setLowStockOnly] = useState(false);
+    const [togglingId, setTogglingId] = useState<string | null>(null);
+    const [historyType, setHistoryType] = useState<'' | 'earn' | 'redeem' | 'admin_adjustment'>('redeem');
+    const [historyUserQuery, setHistoryUserQuery] = useState('');
 
     // Points Settings State
     const [pointsSetting, setPointsSetting] = useState<PointsSetting | null>(null);
@@ -171,16 +181,16 @@ export default function Rewards() {
         if (activeTab === 'history') {
             fetchHistory(historyPage);
         }
-    }, [activeTab, historyPage]);
+    }, [activeTab, historyPage, historyType]);
 
-    const fetchHistory = async (page = 1) => {
+    const fetchHistory = async (page = 1, type = historyType) => {
         const requestId = latestHistoryRequestId.current + 1;
         latestHistoryRequestId.current = requestId;
 
         try {
             setHistoryLoading(true);
             const params = {
-                type: 'redeem',
+                type: type || undefined,
                 page,
                 limit: HISTORY_PAGE_SIZE
             };
@@ -278,8 +288,8 @@ export default function Rewards() {
             setMessage({ type: 'error', text: 'Stok hadiah tidak boleh negatif' });
             return;
         }
-        if (!isValidHttpUrl(imageUrl)) {
-            setMessage({ type: 'error', text: 'URL gambar harus diawali http:// atau https://' });
+        if (imageUrl && !isValidHttpUrl(imageUrl) && !imageUrl.startsWith('/')) {
+            setMessage({ type: 'error', text: 'URL gambar harus diawali http://, https://, atau path /uploads dari galeri' });
             return;
         }
 
@@ -327,10 +337,62 @@ export default function Rewards() {
         }
     };
 
-    const filteredRewards = useMemo(() => rewards.filter(reward =>
-        reward.name.toLowerCase().includes(search.toLowerCase()) ||
-        reward.category.toLowerCase().includes(search.toLowerCase())
-    ), [rewards, search]);
+    const filteredRewards = useMemo(() => rewards.filter(reward => {
+        const matchesSearch = reward.name.toLowerCase().includes(search.toLowerCase()) ||
+            reward.category.toLowerCase().includes(search.toLowerCase());
+        const matchesStock = !lowStockOnly || reward.stock <= 5;
+        return matchesSearch && matchesStock;
+    }), [rewards, search, lowStockOnly]);
+
+    const filteredHistory = useMemo(() => {
+        const term = historyUserQuery.trim().toLowerCase();
+        if (!term) return transactions;
+        return transactions.filter((trx) =>
+            (trx.user?.name || '').toLowerCase().includes(term) ||
+            (trx.user?.email || '').toLowerCase().includes(term)
+        );
+    }, [transactions, historyUserQuery]);
+
+    const historyPointsSummary = useMemo(() => {
+        return transactions.reduce(
+            (acc, trx) => {
+                if (trx.points >= 0) acc.in += trx.points;
+                else acc.out += Math.abs(trx.points);
+                return acc;
+            },
+            { in: 0, out: 0 }
+        );
+    }, [transactions]);
+
+    const handleToggleStatus = async (reward: Reward) => {
+        if (togglingId) return;
+        setTogglingId(reward._id);
+        setMessage(null);
+        try {
+            await apiV2
+                .put(`/rewards/admin/${reward._id}`, { status: !reward.status });
+            setMessage({ type: 'success', text: `Hadiah ${!reward.status ? 'diaktifkan' : 'dinonaktifkan'}` });
+            await fetchData();
+        } catch (error: any) {
+            setMessage({ type: 'error', text: error.response?.data?.message || 'Gagal mengubah status hadiah' });
+        } finally {
+            setTogglingId(null);
+        }
+    };
+
+    const handleDuplicate = (reward: Reward) => {
+        setSelectedReward(null);
+        setFormData({
+            name: `${reward.name} (Salinan)`,
+            description: reward.description,
+            pointsRequired: reward.pointsRequired,
+            stock: reward.stock,
+            imageUrl: reward.imageUrl || '',
+            category: reward.category,
+            status: false
+        });
+        setShowModal(true);
+    };
 
     const formatNumber = (num: number) => num.toLocaleString('id-ID');
     const formatDate = (date: string) => {
@@ -346,8 +408,9 @@ export default function Rewards() {
     };
     const historyStart = historyMeta.total === 0 ? 0 : (historyMeta.page - 1) * historyMeta.limit + 1;
     const historyEnd = historyMeta.total === 0 ? 0 : Math.min(historyMeta.page * historyMeta.limit, historyMeta.total);
-    const sampleTransactionAmount = 50000;
-    const samplePointsEarned = Math.floor(sampleTransactionAmount / POINTS_UNIT_AMOUNT) * pointsValue;
+    const [simAmount, setSimAmount] = useState<number | string>(50000);
+    const simAmountNum = Math.max(0, Number(simAmount) || 0);
+    const simPoints = Math.floor(simAmountNum / POINTS_UNIT_AMOUNT) * pointsValue;
 
     if (loading) {
         return (
@@ -504,12 +567,30 @@ export default function Rewards() {
                             </div>
 
                             <div className="rounded-xl border border-[color-mix(in_srgb,var(--ui-accent)_28%,transparent)] bg-[var(--ui-accent-soft)] p-4 text-sm ui-text">
-                                <p className="font-medium ui-accent-text">Simulasi cepat</p>
-                                <p className="mt-1 ui-text-muted">
-                                    Transaksi Rp {formatNumber(sampleTransactionAmount)} akan menghasilkan <span className="font-semibold ui-text">{formatNumber(samplePointsEarned)} poin</span>.
+                                <p className="font-medium ui-accent-text">Simulasi kurs</p>
+                                <div className="mt-2 flex items-center gap-2">
+                                    <span className="ui-text-muted text-sm">Nominal transaksi</span>
+                                    <div className="relative max-w-[180px]">
+                                        <span className="absolute left-3 top-1/2 -translate-y-1/2 text-xs ui-text-muted">Rp</span>
+                                        <input
+                                            type="number"
+                                            min={0}
+                                            step={1000}
+                                            value={simAmount}
+                                            onChange={(e) => setSimAmount(e.target.value)}
+                                            className="w-full rounded-lg border ui-field pl-8 pr-2 py-1.5 text-sm font-mono"
+                                            aria-label="Nominal simulasi transaksi"
+                                        />
+                                    </div>
+                                </div>
+                                <p className="mt-2 ui-text-muted">
+                                    Transaksi Rp {formatNumber(simAmountNum)} menghasilkan <span className="font-semibold ui-text">{formatNumber(simPoints)} poin</span>.
                                 </p>
                                 <p className="mt-1 ui-text-muted">
-                                    Jika ditukar, nilai teoritisnya sekitar <span className="font-semibold ui-text">Rp {formatNumber(samplePointsEarned * pointValueRate)}</span>.
+                                    Nilai tukarnya sekitar <span className="font-semibold ui-text">Rp {formatNumber(simPoints * pointValueRate)}</span>
+                                    {simAmountNum > 0 && simPoints > 0 ? (
+                                        <span> ({((simPoints * pointValueRate) / simAmountNum * 100).toFixed(2)}% dari nominal)</span>
+                                    ) : null}.
                                 </p>
                             </div>
 
@@ -543,17 +624,28 @@ export default function Rewards() {
             {activeTab === 'rewards' && (
                 <>
                     {/* Search */}
-                    <div className="relative max-w-md">
-                        <label htmlFor="reward-search" className="sr-only">Cari hadiah</label>
-                        <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 ui-text-muted" />
-                        <input
-                            id="reward-search"
-                            type="text"
-                            placeholder="Cari hadiah..."
-                            value={search}
-                            onChange={(e) => setSearch(e.target.value)}
-                            className="w-full pl-10 pr-4 py-2 border rounded-lg ui-field"
-                        />
+                    <div className="flex flex-wrap items-center gap-3">
+                        <div className="relative max-w-md flex-1 min-w-[240px]">
+                            <label htmlFor="reward-search" className="sr-only">Cari hadiah</label>
+                            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 ui-text-muted" />
+                            <input
+                                id="reward-search"
+                                type="text"
+                                placeholder="Cari hadiah..."
+                                value={search}
+                                onChange={(e) => setSearch(e.target.value)}
+                                className="w-full pl-10 pr-4 py-2 border rounded-lg ui-field"
+                            />
+                        </div>
+                        <label className="flex items-center gap-2 rounded-lg ui-panel border ui-border px-3 py-2 text-sm ui-text cursor-pointer">
+                            <input
+                                type="checkbox"
+                                checked={lowStockOnly}
+                                onChange={(e) => setLowStockOnly(e.target.checked)}
+                                className="h-4 w-4 accent-[var(--ui-accent)]"
+                            />
+                            Stok menipis (≤5)
+                        </label>
                     </div>
 
                     {/* Rewards Grid */}
@@ -561,7 +653,7 @@ export default function Rewards() {
                         {filteredRewards.map((reward) => (
                             <div key={reward._id} className="ui-panel-muted rounded-xl border ui-border overflow-hidden">
                                 {reward.imageUrl ? (
-                                    <img src={reward.imageUrl} alt={reward.name} referrerPolicy="no-referrer" className="w-full h-40 object-cover" />
+                                    <img src={reward.imageUrl.startsWith('http') ? reward.imageUrl : getAssetUrl(reward.imageUrl)} alt={reward.name} referrerPolicy="no-referrer" className="w-full h-40 object-cover" />
                                 ) : (
                                     <div className="w-full h-40 bg-[var(--ui-accent-soft)] flex items-center justify-center">
                                         <Package className="w-16 h-16 ui-accent-text opacity-60" />
@@ -585,9 +677,38 @@ export default function Rewards() {
                                                 <span className="font-bold">{formatNumber(reward.pointsRequired)}</span>
                                                 <span className="text-sm">poin</span>
                                             </div>
-                                            <p className="text-xs ui-text-muted">Stok: {formatNumber(reward.stock)}</p>
+                                            <p className="text-xs ui-text-muted">
+                                                Stok: {formatNumber(reward.stock)}
+                                                {reward.stock === 0 ? (
+                                                    <span className="ui-danger-chip ml-2 inline-flex rounded-full border px-2 py-0.5 text-[10px] font-bold">Habis</span>
+                                                ) : reward.stock <= 5 ? (
+                                                    <span className="ui-warning-chip ml-2 inline-flex rounded-full border px-2 py-0.5 text-[10px] font-bold">Menipis</span>
+                                                ) : null}
+                                            </p>
                                         </div>
                                         <div className="flex gap-2">
+                                            <button
+                                                onClick={() => handleToggleStatus(reward)}
+                                                disabled={submitting || deleting || togglingId === reward._id}
+                                                className={`p-2 rounded-lg transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                                                    reward.status
+                                                        ? 'ui-warning-chip border'
+                                                        : 'ui-success-chip border'
+                                                }`}
+                                                aria-label={reward.status ? `Nonaktifkan hadiah ${reward.name}` : `Aktifkan hadiah ${reward.name}`}
+                                                title={reward.status ? 'Nonaktifkan' : 'Aktifkan'}
+                                            >
+                                                <Power className="w-4 h-4" />
+                                            </button>
+                                            <button
+                                                onClick={() => handleDuplicate(reward)}
+                                                disabled={submitting || deleting}
+                                                className="p-2 ui-text-muted hover:text-[var(--ui-accent)] hover:bg-[var(--ui-accent-soft)] rounded-lg transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                                                aria-label={`Duplikat hadiah ${reward.name}`}
+                                                title="Duplikat hadiah"
+                                            >
+                                                <Copy className="w-4 h-4" />
+                                            </button>
                                             <button
                                                 onClick={() => handleOpenModal(reward)}
                                                 disabled={submitting || deleting}
@@ -625,13 +746,56 @@ export default function Rewards() {
 
             {activeTab === 'history' && (
                 <div className="ui-panel-muted rounded-xl border ui-border overflow-hidden">
-                    <div className="flex flex-col gap-3 border-b ui-border px-4 py-4 sm:flex-row sm:items-center sm:justify-between">
-                        <div>
-                            <h3 className="text-sm font-semibold ui-text">Riwayat Penukaran Poin</h3>
-                            <p className="text-sm ui-text-muted">Hanya transaksi redeem yang ditampilkan di sini.</p>
+                    <div className="flex flex-col gap-3 border-b ui-border px-4 py-4">
+                        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                            <div>
+                                <h3 className="text-sm font-semibold ui-text">Riwayat Transaksi Poin</h3>
+                                <p className="text-sm ui-text-muted">Filter per tipe transaksi dan cari user.</p>
+                            </div>
+                            <div className="text-xs ui-text-muted">
+                                Menampilkan {historyStart}-{historyEnd} dari {formatNumber(historyMeta.total)} transaksi
+                            </div>
                         </div>
-                        <div className="text-xs ui-text-muted">
-                            Menampilkan {historyStart}-{historyEnd} dari {formatNumber(historyMeta.total)} penukaran
+                        <div className="flex flex-wrap items-center gap-2">
+                            {([
+                                { key: 'redeem', label: 'Redeem' },
+                                { key: 'earn', label: 'Earn' },
+                                { key: 'admin_adjustment', label: 'Penyesuaian Admin' },
+                                { key: '', label: 'Semua' },
+                            ] as const).map((item) => (
+                                <button
+                                    key={item.key || 'all'}
+                                    type="button"
+                                    onClick={() => { setHistoryType(item.key); setHistoryPage(1); }}
+                                    className={`rounded-full border px-3 py-1.5 text-xs font-semibold transition-colors ${
+                                        historyType === item.key
+                                            ? 'ui-accent-chip'
+                                            : 'ui-muted-action hover:border-[var(--ui-accent)]'
+                                    }`}
+                                >
+                                    {item.label}
+                                </button>
+                            ))}
+                            <div className="relative min-w-[200px] flex-1 sm:max-w-xs">
+                                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 ui-text-muted" />
+                                <input
+                                    type="text"
+                                    value={historyUserQuery}
+                                    onChange={(e) => setHistoryUserQuery(e.target.value)}
+                                    placeholder="Cari nama/email user (halaman ini)"
+                                    className="w-full pl-9 pr-3 py-2 border rounded-lg ui-field text-sm"
+                                />
+                            </div>
+                        </div>
+                        <div className="flex flex-wrap gap-4 text-xs">
+                            <span className="inline-flex items-center gap-1.5 ui-text-muted">
+                                <TrendingUp className="w-3.5 h-3.5 ui-success-text" />
+                                Poin masuk halaman ini: <span className="font-bold ui-success-text">+{formatNumber(historyPointsSummary.in)}</span>
+                            </span>
+                            <span className="inline-flex items-center gap-1.5 ui-text-muted">
+                                <TrendingDown className="w-3.5 h-3.5 ui-danger-text" />
+                                Poin keluar halaman ini: <span className="font-bold ui-danger-text">-{formatNumber(historyPointsSummary.out)}</span>
+                            </span>
                         </div>
                     </div>
 
@@ -654,7 +818,7 @@ export default function Rewards() {
                                         </tr>
                                     </thead>
                                     <tbody className="divide-y ui-border">
-                                        {transactions.map((trx) => (
+                                        {filteredHistory.map((trx) => (
                                             <tr key={trx._id} className="hover:bg-[var(--ui-card-bg)]">
                                                 <td className="px-4 py-3">
                                                     <p className="font-medium ui-text">{trx.user?.name || '-'}</p>
@@ -664,7 +828,10 @@ export default function Rewards() {
                                                     <p className="font-medium ui-text">{trx.relatedReward?.name || 'Hadiah lama / terhapus'}</p>
                                                 </td>
                                                 <td className="px-4 py-3">
-                                                    <span className="font-medium ui-danger-text">-{formatNumber(Math.abs(trx.points))}</span>
+                                                    <span className={`font-medium ${trx.points >= 0 ? 'ui-success-text' : 'ui-danger-text'}`}>
+                                                        {trx.points >= 0 ? '+' : '-'}{formatNumber(Math.abs(trx.points))}
+                                                    </span>
+                                                    <span className="ml-2 text-[10px] uppercase ui-text-muted">{trx.type === 'admin_adjustment' ? 'penyesuaian' : trx.type}</span>
                                                 </td>
                                                 <td className="px-4 py-3 text-sm ui-text-muted">{trx.description}</td>
                                                 <td className="px-4 py-3 text-sm ui-text-muted">{formatDate(trx.createdAt)}</td>
@@ -773,15 +940,13 @@ export default function Rewards() {
                                 </div>
                             </div>
                             <div>
-                                <label htmlFor="reward-image-url" className="block text-sm font-medium ui-text mb-1">URL Gambar (opsional)</label>
-                                <input
-                                    id="reward-image-url"
-                                    type="url"
+                                <label className="block text-sm font-medium ui-text mb-1">Gambar (opsional)</label>
+                                <ImagePickerField
                                     value={formData.imageUrl}
-                                    onChange={(e) => setFormData({ ...formData, imageUrl: e.target.value })}
-                                    className="w-full px-3 py-2 border rounded-lg ui-field"
-                                    placeholder="https://example.com/image.jpg"
+                                    onChange={(url: string) => setFormData({ ...formData, imageUrl: url })}
+                                    folder="covers"
                                 />
+                                <p className="mt-1 text-[11px] ui-text-muted">Pilih dari galeri atau upload baru. URL manual juga bisa disimpan lewat galeri.</p>
                             </div>
                             <div>
                                 <label htmlFor="reward-category" className="block text-sm font-medium ui-text mb-1">Kategori</label>

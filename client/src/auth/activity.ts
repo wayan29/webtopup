@@ -7,7 +7,7 @@ type EventSource = {
   addEventListener(type: string, listener: (event: { isTrusted?: boolean }) => void): void;
   removeEventListener(type: string, listener: (event: { isTrusted?: boolean }) => void): void;
 };
-type Timer = ReturnType<typeof setTimeout>;
+type Timer = number;
 
 export type StaffActivityDependencies = {
   now(): number;

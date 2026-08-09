@@ -1,0 +1,18 @@
+{
+	email admin@danayasa.biz.id
+	# Origin hanya HTTPS (:443). Cloudflare SSL = Full(strict) + "Always Use HTTPS"
+	# di edge sudah menangani http->https untuk pengunjung, jadi origin tidak perlu :80.
+	auto_https disable_redirects
+}
+
+danayasa.biz.id, www.danayasa.biz.id {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:9005 {
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+	}
+	tls {
+		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+	}
+}

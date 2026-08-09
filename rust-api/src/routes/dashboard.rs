@@ -12,7 +12,8 @@ use crate::{
 };
 
 use queries::{
-    deposit_ops_summary, stuck_ops_summary, transaction_today_summary, vendor_ops_summary,
+    deposit_ops_summary, promo_ops_summary, stuck_ops_summary, transaction_today_summary,
+    vendor_ops_summary,
 };
 use types::OpsSnapshotResponse;
 
@@ -40,6 +41,7 @@ pub async fn ops_snapshot(
     let deposits = deposit_ops_summary(&db).await;
     let vendors = vendor_ops_summary(&db).await;
     let stuck = stuck_ops_summary(&db, 15).await;
+    let promo = promo_ops_summary(&db).await;
 
     Json(OpsSnapshotResponse {
         ok: true,
@@ -52,6 +54,7 @@ pub async fn ops_snapshot(
         deposits,
         vendors,
         stuck,
+        promo,
     })
     .into_response()
 }

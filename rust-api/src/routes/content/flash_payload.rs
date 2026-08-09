@@ -105,13 +105,31 @@ fn parse_flash_sale_date(
 }
 
 fn parse_date_text(value: &str) -> Option<DateTime> {
-    if value.trim().is_empty() {
+    let value = value.trim();
+    if value.is_empty() {
         return None;
     }
-    DateTime::parse_rfc3339_str(value)
+    // 1) Full RFC3339 with explicit offset (e.g. "2026-08-08T21:03:00+07:00") is authoritative.
+    if let Ok(parsed) = DateTime::parse_rfc3339_str(value) {
+        return Some(parsed);
+    }
+    // 2) Bare "YYYY-MM-DDTHH:mm" from <input type="datetime-local"> carries no zone —
+    //    interpret it as Asia/Jakarta (the operator's timezone) instead of UTC so
+    //    a 21:00 WIB start doesn't get stored as 21:00 UTC (7 hours late).
+    if let Some(local) = parse_as_jakarta_local(value) {
+        return Some(local);
+    }
+    None
+}
+
+fn parse_as_jakarta_local(value: &str) -> Option<DateTime> {
+    use chrono::{FixedOffset, TimeZone};
+    let naive = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M")
         .ok()
-        .or_else(|| DateTime::parse_rfc3339_str(format!("{}:00Z", value)).ok())
-        .or_else(|| DateTime::parse_rfc3339_str(format!("{}Z", value)).ok())
+        .or_else(|| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S").ok())?;
+    let jakarta = FixedOffset::east_opt(7 * 3600)?;
+    let localized = jakarta.from_local_datetime(&naive).single()?;
+    Some(DateTime::from_millis(localized.timestamp_millis()))
 }
 
 fn flash_sale_products_from_value(value: Value) -> Result<Vec<FlashSaleProductPayload>, Response> {

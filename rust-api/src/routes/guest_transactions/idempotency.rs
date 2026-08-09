@@ -18,6 +18,7 @@ pub(super) struct GuestCheckoutFingerprint<'a> {
     pub(super) email: &'a str,
     pub(super) payment_method_id: &'a str,
     pub(super) use_flash_sale: bool,
+    pub(super) voucher_code: &'a str,
     pub(super) member_id: Option<ObjectId>,
 }
 
@@ -41,6 +42,7 @@ pub(super) fn guest_checkout_digest(
             fingerprint.email,
             fingerprint.payment_method_id,
             flash_sale,
+            fingerprint.voucher_code,
             &member_id,
         ],
     )
@@ -141,6 +143,7 @@ mod tests {
             email: "buyer@example.com",
             payment_method_id: "507f1f77bcf86cd799439011",
             use_flash_sale: true,
+            voucher_code: "",
             member_id: Some(ObjectId::from_bytes([7; 12])),
         }
     }

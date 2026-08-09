@@ -458,6 +458,9 @@ export function stepUpErrorMessage(error: unknown): string {
   if (code === 'REAUTH_PASSWORD_INVALID') return 'Password tidak valid';
   if (code === 'REAUTH_OTP_INVALID') return 'Kode OTP tidak valid';
   if (code === 'REAUTH_ATTEMPTS_EXHAUSTED') return 'Percobaan verifikasi terlalu banyak';
+  if (code === 'AUTH_2FA_ENROLLMENT_REQUIRED') {
+    return 'Aktifkan 2FA di menu Keamanan sebelum melanjutkan aksi sensitif';
+  }
   if (typeof message === 'string' && message.trim()) return message;
   return 'Verifikasi ulang gagal';
 }

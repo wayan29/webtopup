@@ -52,13 +52,14 @@ interface Product {
     productTypeId?: string | { _id: string; name: string } | null;
     paymentType?: 'prabayar' | 'pascabayar';
     icon?: string;
-    rewardPoints?: number;
+    rewardPoints?: number | '';
     brand: string;
-    costPrice: number;
+    /** Empty string while the user is clearing/retyping the amount field. */
+    costPrice: number | '';
     price: {
-        basic: number;
-        gold: number;
-        platinum: number;
+        basic: number | '';
+        gold: number | '';
+        platinum: number | '';
     };
     vendor?: {
         name: string;
@@ -107,9 +108,11 @@ export default function ProductModal({ isOpen, onClose, onSubmit, initialData }:
     const [showVendorResults, setShowVendorResults] = useState(false);
     const [vendorAvailability, setVendorAvailability] = useState({ digiflazz: false, tokovoucher: false });
 
-    // Margin state
+    // Margin state — empty string allowed while clearing/retyping a field
+    type MarginField = number | '';
+    type MarginDraft = { basic: MarginField; gold: MarginField; platinum: MarginField };
     const [showMarginModal, setShowMarginModal] = useState(false);
-    const [margins, setMargins] = useState({ basic: 10, gold: 5, platinum: 0 });
+    const [margins, setMargins] = useState<MarginDraft>({ basic: 10, gold: 5, platinum: 0 });
     const [globalMargins, setGlobalMargins] = useState({ basic: 10, gold: 5, platinum: 0 });
 
     const vendorOptions = useMemo(() => [
@@ -285,12 +288,32 @@ export default function ProductModal({ isOpen, onClose, onSubmit, initialData }:
     };
 
     // Select product from vendor search results
-    const sanitizeAmount = (value: unknown) => Math.max(0, Math.round(Number(value) || 0));
+    /** Coerce to a non-negative integer for save / vendor apply (empty → 0). */
+    const coerceAmount = (value: unknown) => Math.max(0, Math.round(Number(value) || 0));
+    /** While typing: allow empty string so the user can clear "0" before retyping. */
+    const parseAmountInput = (raw: string): number | '' => {
+        if (raw === '' || raw === null || raw === undefined) return '';
+        // Allow intermediate typing like "" after deleting 0; reject non-numeric junk.
+        const n = Number(raw);
+        if (!Number.isFinite(n)) return '';
+        return Math.max(0, Math.round(n));
+    };
+    const amountOrZero = (value: number | '' | undefined | null) =>
+        typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;
+    /** Margin % input: allow empty while typing; clamp 0–500 when numeric. */
+    const parseMarginInput = (raw: string): MarginField => {
+        if (raw === '' || raw === null || raw === undefined) return '';
+        const n = Number(raw);
+        if (!Number.isFinite(n)) return '';
+        return Math.min(Math.max(n, 0), 500);
+    };
+    const marginOrZero = (value: MarginField | undefined | null) =>
+        typeof value === 'number' && Number.isFinite(value) ? Math.min(Math.max(value, 0), 500) : 0;
 
     const handleSelectVendorProduct = (vp: VendorProduct) => {
         const vendorSku = vp.buyer_sku_code || vp.sku_code || vp.code || vp.kode || '';
         const name = vp.product_name || vp.nama || vp.nama_produk || '';
-        const vendorPrice = sanitizeAmount(vp.buyer_product_price || vp.price || vp.harga || 0);
+        const vendorPrice = coerceAmount(vp.buyer_product_price || vp.price || vp.harga || 0);
 
         if (!vendorSku) {
             setSubmitError('Produk vendor tanpa SKU tidak bisa dipilih.');
@@ -318,14 +341,23 @@ export default function ProductModal({ isOpen, onClose, onSubmit, initialData }:
 
     // Apply margin to prices
     const applyMargins = () => {
-        if (formData.costPrice <= 0) return;
+        const cost = amountOrZero(formData.costPrice);
+        if (cost <= 0) return;
 
-        const basic = Math.round(formData.costPrice * (1 + margins.basic / 100));
-        const gold = Math.round(formData.costPrice * (1 + margins.gold / 100));
-        const platinum = Math.round(formData.costPrice * (1 + margins.platinum / 100));
+        const basicPct = marginOrZero(margins.basic);
+        const goldPct = marginOrZero(margins.gold);
+        const platinumPct = marginOrZero(margins.platinum);
+
+        // Normalize empty draft fields back to numbers before applying.
+        setMargins({ basic: basicPct, gold: goldPct, platinum: platinumPct });
+
+        const basic = Math.round(cost * (1 + basicPct / 100));
+        const gold = Math.round(cost * (1 + goldPct / 100));
+        const platinum = Math.round(cost * (1 + platinumPct / 100));
 
         setFormData({
             ...formData,
+            costPrice: cost,
             price: { basic, gold, platinum }
         });
         setShowMarginModal(false);
@@ -352,10 +384,22 @@ export default function ProductModal({ isOpen, onClose, onSubmit, initialData }:
             return;
         }
 
+        // Normalize empty amount fields → 0 before save so API always gets numbers.
+        const payload: Product = {
+            ...formData,
+            costPrice: amountOrZero(formData.costPrice),
+            rewardPoints: amountOrZero(formData.rewardPoints),
+            price: {
+                basic: amountOrZero(formData.price.basic),
+                gold: amountOrZero(formData.price.gold),
+                platinum: amountOrZero(formData.price.platinum),
+            },
+        };
+
         setSubmitError(null);
         setLoading(true);
         try {
-            await onSubmit(formData);
+            await onSubmit(payload);
             onClose();
         } catch (error: any) {
             console.error(error);
@@ -713,7 +757,7 @@ export default function ProductModal({ isOpen, onClose, onSubmit, initialData }:
                                             <button
                                                 type="button"
                                                 onClick={() => setShowMarginModal(true)}
-                                                disabled={formData.costPrice <= 0}
+                                                disabled={amountOrZero(formData.costPrice) <= 0}
                                                 className="text-xs ui-accent-chip px-2 py-1 rounded hover:bg-[var(--ui-accent-soft)] disabled:opacity-50"
                                             >
                                                 Setup Margin Otomatis
@@ -726,17 +770,20 @@ export default function ProductModal({ isOpen, onClose, onSubmit, initialData }:
                                                 <button onClick={() => setShowMarginModal(false)} className="absolute top-2 right-2 ui-text-muted hover:text-[var(--ui-text)]"><X className="w-4 h-4" /></button>
                                                 <h5 className="text-sm font-medium ui-accent-text mb-3">Setup Margin (%)</h5>
                                                 <div className="grid grid-cols-3 gap-2 mb-3">
-                                                    {['basic', 'gold', 'platinum'].map((tier) => (
+                                                    {(['basic', 'gold', 'platinum'] as const).map((tier) => (
                                                         <div key={tier}>
                                                             <label className="text-[10px] uppercase ui-text-muted block mb-1">{tier}</label>
                                                             <input
                                                                 type="number"
                                                                 step="0.1"
-                                                                value={margins[tier as keyof typeof margins]}
+                                                                value={margins[tier]}
                                                                 onChange={(e) => {
-                                                                    const value = Number(e.target.value);
-                                                                    if (!Number.isFinite(value)) return;
-                                                                    setMargins({ ...margins, [tier]: Math.min(Math.max(value, 0), 500) });
+                                                                    setMargins({ ...margins, [tier]: parseMarginInput(e.target.value) });
+                                                                }}
+                                                                onBlur={() => {
+                                                                    if (margins[tier] === '') {
+                                                                        setMargins((prev) => ({ ...prev, [tier]: 0 }));
+                                                                    }
                                                                 }}
                                                                 min={0}
                                                                 max={500}
@@ -757,7 +804,12 @@ export default function ProductModal({ isOpen, onClose, onSubmit, initialData }:
                                                     <input
                                                         type="number"
                                                         value={formData.costPrice}
-                                                        onChange={(e) => setFormData({ ...formData, costPrice: sanitizeAmount(e.target.value) })}
+                                                        onChange={(e) => setFormData({ ...formData, costPrice: parseAmountInput(e.target.value) })}
+                                                        onBlur={() => {
+                                                            if (formData.costPrice === '') {
+                                                                setFormData((prev) => ({ ...prev, costPrice: 0 }));
+                                                            }
+                                                        }}
                                                         min={0}
                                                         step={1}
                                                         className="block w-full pl-8 border rounded-lg py-2 px-3 ui-field font-mono text-sm"
@@ -768,8 +820,10 @@ export default function ProductModal({ isOpen, onClose, onSubmit, initialData }:
                                             <div className="grid grid-cols-1 gap-3">
                                                 {['basic', 'gold', 'platinum'].map((tier) => {
                                                     const price = formData.price[tier as keyof typeof formData.price];
-                                                    const profit = price - formData.costPrice;
-                                                    const percent = formData.costPrice > 0 ? (profit / formData.costPrice * 100).toFixed(1) : '0';
+                                                    const cost = amountOrZero(formData.costPrice);
+                                                    const priceNum = amountOrZero(price);
+                                                    const profit = priceNum - cost;
+                                                    const percent = cost > 0 ? ((profit / cost) * 100).toFixed(1) : '0';
                                                     return (
                                                         <div key={tier} className="relative">
                                                             <label className="block text-xs font-medium ui-text-muted mb-1 capitalize">Harga {tier}</label>
@@ -778,7 +832,21 @@ export default function ProductModal({ isOpen, onClose, onSubmit, initialData }:
                                                                 <input
                                                                     type="number"
                                                                     value={price}
-                                                                    onChange={(e) => setFormData({ ...formData, price: { ...formData.price, [tier]: sanitizeAmount(e.target.value) } })}
+                                                                    onChange={(e) => setFormData({
+                                                                        ...formData,
+                                                                        price: {
+                                                                            ...formData.price,
+                                                                            [tier]: parseAmountInput(e.target.value),
+                                                                        },
+                                                                    })}
+                                                                    onBlur={() => {
+                                                                        if (formData.price[tier as keyof typeof formData.price] === '') {
+                                                                            setFormData((prev) => ({
+                                                                                ...prev,
+                                                                                price: { ...prev.price, [tier]: 0 },
+                                                                            }));
+                                                                        }
+                                                                    }}
                                                                     min={0}
                                                                     step={1}
                                                                     className="block w-full pl-8 pr-24 border rounded-lg py-2 px-3 ui-field font-mono text-sm"
@@ -832,7 +900,12 @@ export default function ProductModal({ isOpen, onClose, onSubmit, initialData }:
                                                 <input
                                                     type="number"
                                                     value={formData.rewardPoints}
-                                                    onChange={(e) => setFormData({ ...formData, rewardPoints: sanitizeAmount(e.target.value) })}
+                                                    onChange={(e) => setFormData({ ...formData, rewardPoints: parseAmountInput(e.target.value) })}
+                                                    onBlur={() => {
+                                                        if (formData.rewardPoints === '') {
+                                                            setFormData((prev) => ({ ...prev, rewardPoints: 0 }));
+                                                        }
+                                                    }}
                                                     min={0}
                                                     step={1}
                                                     className="block w-full border rounded-lg py-2 px-3 ui-field text-sm"

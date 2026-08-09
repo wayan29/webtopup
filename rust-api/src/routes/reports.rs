@@ -20,12 +20,14 @@ mod dates;
 mod export;
 mod mappers;
 mod pipelines;
+mod promo;
 mod types;
 use dashboard::*;
 use dates::*;
 use export::*;
 use mappers::*;
 use pipelines::*;
+pub use promo::{promo_export, promo_summary};
 pub use types::SalesSummaryQuery;
 use types::*;
 

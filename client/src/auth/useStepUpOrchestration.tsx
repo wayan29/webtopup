@@ -12,6 +12,7 @@ import {
   type StepUpOrchestrator,
 } from './withStepUp.ts';
 import type { ApiV2RequestConfig } from '../api/index.ts';
+import { useAuthStore } from '../store/useAuthStore.ts';
 
 export type UseStepUpOrchestrationResult = {
   run: <T>(
@@ -30,6 +31,7 @@ export type UseStepUpOrchestrationResult = {
 
 export function useStepUpOrchestration(): UseStepUpOrchestrationResult {
   const orchestrator = useMemo(() => getSharedStepUpOrchestrator(), []);
+  const twoFactorEnabled = useAuthStore((state) => state.user?.twoFactorEnabled === true);
   const [snapshot, setSnapshot] = useState<StepUpDialogSnapshot>(() => orchestrator.getDialog());
   const [ambiguousMessage, setAmbiguousMessage] = useState<string | null>(
     () => orchestrator.getAmbiguousMessage(),
@@ -46,6 +48,7 @@ export function useStepUpOrchestration(): UseStepUpOrchestrationResult {
       actionGroup={(snapshot.actionGroup ?? 'security.sessions_all') as StepUpActionGroup}
       error={snapshot.error}
       busy={snapshot.busy}
+      twoFactorEnabled={twoFactorEnabled}
       onClose={() => {
         orchestrator.cancel('dialog-close');
       }}

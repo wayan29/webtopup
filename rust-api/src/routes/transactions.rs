@@ -224,6 +224,7 @@ pub async fn create_transaction(
     let base_price = product_price_for_level(&product, &user_level);
     let mut price = base_price;
     let mut flash_sale_reservation = None;
+    let mut applied_discount = None;
 
     if payload.use_flash_sale.unwrap_or(false) {
         if let Some(reservation) =
@@ -231,6 +232,40 @@ pub async fn create_transaction(
         {
             price = reservation.price;
             flash_sale_reservation = Some(reservation);
+        }
+    }
+
+    // Optional checkout discount voucher (after flash sale so min-purchase uses discounted base).
+    let voucher_code = payload
+        .voucher_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_uppercase());
+    if let Some(code) = voucher_code {
+        let vouchers = db.collection::<Document>("vouchers");
+        let product_ctx = crate::routes::vouchers::DiscountProductContext {
+            product_id: product.get_object_id("_id").ok(),
+            category_id: product.get_object_id("categoryId").ok(),
+            operator_id: product.get_object_id("operatorId").ok(),
+        };
+        match crate::routes::vouchers::consume_discount_voucher(
+            &vouchers,
+            &code,
+            price,
+            Some(user_id),
+            &product_ctx,
+        )
+        .await
+        {
+            Ok(applied) => {
+                price = applied.final_price;
+                applied_discount = Some(applied);
+            }
+            Err(response) => {
+                rollback_flash_sale_stock(&db, flash_sale_reservation.as_ref()).await;
+                return response;
+            }
         }
     }
 
@@ -245,10 +280,18 @@ pub async fn create_transaction(
         Ok(value) => value,
         Err(_) => {
             rollback_flash_sale_stock(&db, flash_sale_reservation.as_ref()).await;
+            if let Some(applied) = applied_discount.as_ref() {
+                let vouchers = db.collection::<Document>("vouchers");
+                crate::routes::vouchers::release_discount_slot(&vouchers, applied, Some(user_id)).await;
+            }
             return internal_error();
         }
     }) else {
         rollback_flash_sale_stock(&db, flash_sale_reservation.as_ref()).await;
+        if let Some(applied) = applied_discount.as_ref() {
+            let vouchers = db.collection::<Document>("vouchers");
+            crate::routes::vouchers::release_discount_slot(&vouchers, applied, Some(user_id)).await;
+        }
         return status_message(StatusCode::BAD_REQUEST, "Insufficient balance");
     };
 
@@ -256,6 +299,10 @@ pub async fn create_transaction(
         Ok(value) => value,
         Err(_) => {
             rollback_flash_sale_stock(&db, flash_sale_reservation.as_ref()).await;
+            if let Some(applied) = applied_discount.as_ref() {
+                let vouchers = db.collection::<Document>("vouchers");
+                crate::routes::vouchers::release_discount_slot(&vouchers, applied, Some(user_id)).await;
+            }
             let _ = apply_user_balance_delta(&users, user_id, price).await;
             return internal_error();
         }
@@ -280,17 +327,30 @@ pub async fn create_transaction(
     if !server_id.is_empty() {
         transaction_doc.insert("serverId", server_id.clone());
     }
+    if let Some(applied) = applied_discount.as_ref() {
+        transaction_doc.insert("discountVoucherCode", &applied.code);
+        transaction_doc.insert("discountAmount", applied.discount_amount);
+        transaction_doc.insert("baseAmount", base_price);
+    }
     let transaction_id = match transactions.insert_one(transaction_doc).await {
         Ok(result) => match result.inserted_id.as_object_id() {
             Some(id) => id,
             None => {
                 rollback_flash_sale_stock(&db, flash_sale_reservation.as_ref()).await;
+                if let Some(applied) = applied_discount.as_ref() {
+                    let vouchers = db.collection::<Document>("vouchers");
+                    crate::routes::vouchers::release_discount_slot(&vouchers, applied, Some(user_id)).await;
+                }
                 let _ = apply_user_balance_delta(&users, user_id, price).await;
                 return internal_error();
             }
         },
         Err(_) => {
             rollback_flash_sale_stock(&db, flash_sale_reservation.as_ref()).await;
+            if let Some(applied) = applied_discount.as_ref() {
+                let vouchers = db.collection::<Document>("vouchers");
+                crate::routes::vouchers::release_discount_slot(&vouchers, applied, Some(user_id)).await;
+            }
             let _ = apply_user_balance_delta(&users, user_id, price).await;
             return internal_error();
         }
@@ -1338,6 +1398,14 @@ struct ManualTransactionItemJson {
     product: ProductBriefJson,
     #[serde(rename = "statusUpdatedBy", default)]
     status_updated_by: UserBriefJson,
+    #[serde(rename = "discountVoucherCode", default)]
+    discount_voucher_code: Option<String>,
+    #[serde(rename = "discountAmount", default)]
+    discount_amount: Option<i64>,
+    #[serde(rename = "baseAmount", default)]
+    base_amount: Option<i64>,
+    #[serde(rename = "flashSale", default)]
+    flash_sale: Option<String>,
 }
 
 #[derive(Default, serde::Deserialize)]
@@ -1385,6 +1453,10 @@ fn manual_item_from_json(value: ManualTransactionItemJson) -> ManualTransactionI
         updated_at: value.updated_at,
         status_updated_at: value.status_updated_at,
         status_update_note: value.status_update_note,
+        discount_voucher_code: value.discount_voucher_code,
+        discount_amount: value.discount_amount,
+        base_amount: value.base_amount,
+        flash_sale: value.flash_sale,
         user: UserBrief {
             id: value.user.id,
             name: value.user.name,
@@ -2070,6 +2142,40 @@ fn manual_transaction_item_from_doc(mut document: Document) -> ManualTransaction
             .ok()
             .and_then(user_brief_from_doc)
             .unwrap_or_default(),
+        discount_voucher_code: document
+            .get_str("discountVoucherCode")
+            .ok()
+            .map(ToString::to_string)
+            .filter(|value| !value.is_empty()),
+        discount_amount: document
+            .get("discountAmount")
+            .and_then(|value| match value {
+                Bson::Int32(v) => Some(i64::from(*v)),
+                Bson::Int64(v) => Some(*v),
+                Bson::Double(v) => Some(*v as i64),
+                _ => None,
+            })
+            .filter(|value| *value > 0),
+        base_amount: document
+            .get("baseAmount")
+            .and_then(|value| match value {
+                Bson::Int32(v) => Some(i64::from(*v)),
+                Bson::Int64(v) => Some(*v),
+                Bson::Double(v) => Some(*v as i64),
+                _ => None,
+            })
+            .filter(|value| *value > 0),
+        flash_sale: document
+            .get_object_id("flashSale")
+            .ok()
+            .map(|id| id.to_hex())
+            .or_else(|| {
+                document
+                    .get_str("flashSale")
+                    .ok()
+                    .map(ToString::to_string)
+                    .filter(|value| !value.is_empty())
+            }),
     }
 }
 
