@@ -11,7 +11,7 @@ use axum::{
 };
 use futures_util::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime, Document};
-use mongodb::{error::ErrorKind, options::IndexOptions, IndexModel};
+use mongodb::{error::ErrorKind, options::IndexOptions, ClientSession, IndexModel};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
@@ -22,7 +22,7 @@ use super::{internal_error, status_message, unavailable};
 use super::mappers::{id_from_doc, number_from_bson};
 use crate::{
     routes::auth::require_trusted_step_up_group,
-    security::{require_permission, ErrorResponse},
+    security::require_permission,
     state::AppState,
     utils::bson::{read_i64, read_string},
 };
@@ -34,7 +34,6 @@ const LIST_LIMIT_DEFAULT: i64 = 20;
 const GIVEAWAY_STATUS_IN_PROGRESS: &str = "in_progress";
 const GIVEAWAY_STATUS_RETRYABLE: &str = "retryable";
 const GIVEAWAY_STATUS_COMPLETED: &str = "completed";
-const GIVEAWAY_STATUS_COMMIT_UNKNOWN: &str = "commit_unknown";
 const GIVEAWAY_STATUS_FIELD: &str = "status";
 
 #[derive(Deserialize)]
@@ -117,7 +116,7 @@ struct GiveawayListItem {
     allocated_total: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct UserBrief {
     #[serde(rename = "_id")]
     id: String,
@@ -240,15 +239,34 @@ pub async fn ensure_giveaway_indexes(db: &mongodb::Database) -> mongodb::error::
         .map(|_| ())
 }
 
+fn winner_documents(winners: &[WinnerPreview]) -> Vec<Document> {
+    winners
+        .iter()
+        .filter_map(|winner| {
+            let user_id = ObjectId::parse_str(&winner.user_id).ok()?;
+            Some(doc! {
+                "userId": user_id,
+                "name": &winner.name,
+                "email": &winner.email,
+                "amount": winner.amount,
+            })
+        })
+        .collect()
+}
+
 fn giveaway_claim_document(
     payload: &NormalizedGiveaway,
     operator_id: ObjectId,
     idempotency_key: &str,
     request_digest: &str,
+    seed: u64,
+    winners: &[WinnerPreview],
+    allocated_total: i64,
     now: DateTime,
 ) -> Document {
     let payload_digest = giveaway_payload_digest(payload, operator_id);
-    let mut document = doc! {
+    let winner_docs = winner_documents(winners);
+    doc! {
         "name": &payload.name,
         "totalPool": payload.total_pool,
         "winnerCount": payload.winner_count,
@@ -256,9 +274,10 @@ fn giveaway_claim_document(
         "maxAmount": payload.max_amount,
         "note": &payload.note,
         "participantFilter": &payload.participant_filter,
+        "seed": seed.to_string(),
         "status": GIVEAWAY_STATUS_IN_PROGRESS,
-        "winners": Bson::Array(Vec::new()),
-        "allocatedTotal": 0_i64,
+        "winners": winner_docs,
+        "allocatedTotal": allocated_total,
         "idempotencyOperatorId": operator_id,
         "idempotencyKey": idempotency_key,
         "payloadDigest": payload_digest,
@@ -266,16 +285,16 @@ fn giveaway_claim_document(
         "createdBy": { "_id": operator_id },
         "createdAt": now,
         "updatedAt": now,
-    };
-    if let Some(seed) = payload.seed {
-        document.insert("seed", seed.to_string());
     }
-    document
 }
 
 #[derive(Debug)]
 enum GiveawayClaim {
-    Acquired { id: ObjectId, token: String },
+    Acquired {
+        id: ObjectId,
+        token: String,
+        existing: Option<Document>,
+    },
     Replay(Document),
     Conflict,
     InProgress,
@@ -286,6 +305,10 @@ async fn claim_giveaway(
     payload: &NormalizedGiveaway,
     operator_id: ObjectId,
     idempotency_key: &str,
+    request_digest: &str,
+    seed: u64,
+    winners: &[WinnerPreview],
+    allocated_total: i64,
 ) -> Result<GiveawayClaim, Response> {
     let now = DateTime::now();
     let payload_digest = giveaway_payload_digest(payload, operator_id);
@@ -294,7 +317,10 @@ async fn claim_giveaway(
         payload,
         operator_id,
         idempotency_key,
-        &payload_digest,
+        request_digest,
+        seed,
+        winners,
+        allocated_total,
         now,
     );
     claim.insert("claimToken", &token);
@@ -304,7 +330,11 @@ async fn claim_giveaway(
             let Some(id) = result.inserted_id.as_object_id() else {
                 return Err(internal_error());
             };
-            return Ok(GiveawayClaim::Acquired { id, token });
+            return Ok(GiveawayClaim::Acquired {
+                id,
+                token,
+                existing: None,
+            });
         }
         Err(error) if !is_duplicate_key_error(&error) => {
             eprintln!("Failed to claim giveaway idempotency key: {error}");
@@ -366,64 +396,17 @@ async fn claim_giveaway(
                     internal_error()
                 })?;
             if updated.matched_count == 1 {
-                Ok(GiveawayClaim::Acquired { id, token })
+                Ok(GiveawayClaim::Acquired {
+                    id,
+                    token,
+                    existing: Some(existing),
+                })
             } else {
                 Ok(GiveawayClaim::InProgress)
             }
         }
         _ => Ok(GiveawayClaim::InProgress),
     }
-}
-
-async fn update_claim_draw(
-    campaigns: &mongodb::Collection<Document>,
-    claim_id: ObjectId,
-    claim_token: &str,
-    payload_digest: &str,
-    request_digest: &str,
-    seed: u64,
-    winners: &[WinnerPreview],
-    allocated_total: i64,
-) -> Result<(), Response> {
-    let winner_docs = winners
-        .iter()
-        .filter_map(|winner| {
-            let user_id = ObjectId::parse_str(&winner.user_id).ok()?;
-            Some(doc! {
-                "userId": user_id,
-                "name": &winner.name,
-                "email": &winner.email,
-                "amount": winner.amount,
-            })
-        })
-        .collect::<Vec<_>>();
-    let updated = campaigns
-        .update_one(
-            doc! {
-                "_id": claim_id,
-                "claimToken": claim_token,
-                "payloadDigest": payload_digest,
-                GIVEAWAY_STATUS_FIELD: GIVEAWAY_STATUS_IN_PROGRESS,
-            },
-            doc! {
-                "$set": {
-                    "requestDigest": request_digest,
-                    "seed": seed.to_string(),
-                    "winners": winner_docs,
-                    "allocatedTotal": allocated_total,
-                    "updatedAt": DateTime::now(),
-                },
-            },
-        )
-        .await
-        .map_err(|error| {
-            eprintln!("Failed to persist giveaway draw claim: {error}");
-            internal_error()
-        })?;
-    if updated.matched_count != 1 {
-        return Err(giveaway_in_progress_response());
-    }
-    Ok(())
 }
 
 async fn mark_claim_retryable(
@@ -526,6 +509,20 @@ fn giveaway_in_progress_response() -> Response {
         .into_response()
 }
 
+fn giveaway_transactions_unavailable_response() -> Response {
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "message": "Eksekusi giveaway sementara tidak tersedia karena MongoDB transaction belum aktif",
+            "error": {
+                "code": "GIVEAWAY_TRANSACTIONS_UNAVAILABLE",
+                "message": "Eksekusi giveaway sementara tidak tersedia karena MongoDB transaction belum aktif",
+            },
+        })),
+    )
+        .into_response()
+}
+
 fn giveaway_commit_unknown_response() -> Response {
     (
         axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -540,15 +537,6 @@ fn giveaway_commit_unknown_response() -> Response {
         .into_response()
 }
 
-fn giveaway_idempotency_key(headers: &axum::http::HeaderMap) -> Option<String> {
-    headers
-        .get(crate::services::idempotency::IDEMPOTENCY_HEADER)
-        .or_else(|| headers.get("x-idempotency-key"))
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && value.len() <= 128)
-        .map(ToOwned::to_owned)
-}
 
 fn text_value(value: Option<Value>) -> Option<String> {
     match value {
@@ -703,8 +691,8 @@ fn allocate_random_amounts_with_rng<R: Rng + ?Sized>(
         return None;
     }
     // Random weights then scale into the free room above `min_amount`.
-    let headroom = max_amount - min_amount;
-    let mut weights: Vec<f64> = (0..n).map(|_| rng.gen::<f64>() + 0.001).collect();
+    let _headroom = max_amount - min_amount;
+    let weights: Vec<f64> = (0..n).map(|_| rng.gen::<f64>() + 0.001).collect();
     let weight_sum: f64 = weights.iter().sum();
     let free = (total - min_amount * n_i64) as f64;
     let mut amounts: Vec<i64> = weights
@@ -768,7 +756,7 @@ fn allocate_random_amounts_with_rng<R: Rng + ?Sized>(
             return None;
         }
     }
-    let _ = headroom; // documented constraint used via min/max clamps above
+    let _ = _headroom; // documented constraint used via min/max clamps above
     Some(amounts)
 }
 
@@ -777,7 +765,6 @@ async fn load_member_pool(
     filter: &str,
     emails: &[String],
 ) -> Result<Vec<MemberPick>, Response> {
-    let users = db.collection::<Document>("users");
     let mut query = doc! { "role": "member" };
     if filter == "emails" {
         query.insert("email", doc! { "$in": emails });
@@ -796,6 +783,7 @@ async fn load_member_pool(
             .collect::<Vec<_>>();
         query.insert("_id", doc! { "$in": tx_user_ids });
     }
+    let users = db.collection::<Document>("users");
     let cursor = users
         .find(query)
         .projection(doc! { "name": 1, "email": 1 })
@@ -1025,7 +1013,6 @@ pub async fn giveaway_preview(
         return unavailable();
     };
     let db = client.database(&state.mongo_db);
-    let users = db.collection::<Document>("users");
     let members = match load_member_pool(
         &db,
         &normalized.participant_filter,
@@ -1065,6 +1052,246 @@ pub async fn giveaway_preview(
     .into_response()
 }
 
+enum GiveawayTransactionError {
+    PreEffect(Response),
+    Ambiguous(Response),
+}
+
+async fn apply_giveaway_transaction(
+    session: &mut ClientSession,
+    db: &mongodb::Database,
+    claim_id: ObjectId,
+    claim_token: &str,
+    payload_digest: &str,
+    request_digest: &str,
+    idempotency_key: &str,
+    operator: &UserBrief,
+    payload: &NormalizedGiveaway,
+    winners: &[WinnerPreview],
+    allocated_total: i64,
+    seed: u64,
+) -> Result<GiveawayDetail, Response> {
+    let operator_id = ObjectId::parse_str(&operator.id).map_err(|_| internal_error())?;
+    let campaigns = db.collection::<Document>("balancegiveaways");
+    let users = db.collection::<Document>("users");
+    let adjustments = db.collection::<Document>("userbalanceadjustments");
+    let now = DateTime::now();
+
+    let winner_docs = winners
+        .iter()
+        .filter_map(|winner| {
+            let user_id = ObjectId::parse_str(&winner.user_id).ok()?;
+            Some(doc! {
+                "userId": user_id,
+                "name": &winner.name,
+                "email": &winner.email,
+                "amount": winner.amount,
+            })
+        })
+        .collect::<Vec<_>>();
+    let claimed = campaigns
+        .update_one(
+            doc! {
+                "_id": claim_id,
+                "claimToken": claim_token,
+                "idempotencyOperatorId": operator_id,
+                "idempotencyKey": idempotency_key,
+                "payloadDigest": payload_digest,
+                GIVEAWAY_STATUS_FIELD: GIVEAWAY_STATUS_IN_PROGRESS,
+            },
+            doc! {
+                "$set": {
+                    "requestDigest": request_digest,
+                    "seed": seed.to_string(),
+                    "winners": winner_docs,
+                    "allocatedTotal": allocated_total,
+                    "updatedAt": now,
+                },
+            },
+        )
+        .session(&mut *session)
+        .await
+        .map_err(|error| {
+            eprintln!("Failed to fence giveaway claim in transaction: {error}");
+            internal_error()
+        })?;
+    if claimed.matched_count != 1 {
+        return Err(giveaway_in_progress_response());
+    }
+
+    let reason_base = if payload.note.is_empty() {
+        format!("Bagikan saldo random: {}", payload.name)
+    } else {
+        format!("Bagikan saldo random: {} — {}", payload.name, payload.note)
+    };
+
+    for winner in winners {
+        let user_id = ObjectId::parse_str(&winner.user_id).map_err(|_| internal_error())?;
+        let amount = winner.amount;
+        let updated = users
+            .find_one_and_update(
+                doc! { "_id": user_id, "role": "member" },
+                doc! {
+                    "$inc": { "balance": amount },
+                    "$set": { "updatedAt": now },
+                },
+            )
+            .return_document(mongodb::options::ReturnDocument::After)
+            .session(&mut *session)
+            .await
+            .map_err(|error| {
+                eprintln!("Failed to credit giveaway winner in transaction: {error}");
+                internal_error()
+            })?;
+        let Some(user) = updated else {
+            return Err(status_message(
+                axum::http::StatusCode::BAD_REQUEST,
+                "Gagal mengkredit salah satu pemenang; transaksi dibatalkan",
+            ));
+        };
+        let balance_after = number_from_bson(user.get("balance")).unwrap_or(0);
+        let balance_before = balance_after - amount;
+        let audit = doc! {
+            "user": user_id,
+            "adjustedBy": operator_id,
+            "type": "add",
+            "amount": amount,
+            "balanceBefore": balance_before,
+            "balanceAfter": balance_after,
+            "reason": format!("{} (pemenang giveaway)", reason_base),
+            "source": "balance_giveaway",
+            "routeKey": "vouchers.giveaway.execute",
+            "idempotencyKey": idempotency_key,
+            "requestDigest": request_digest,
+            "createdAt": now,
+            "updatedAt": now,
+        };
+        adjustments
+            .insert_one(audit)
+            .session(&mut *session)
+            .await
+            .map_err(|error| {
+                eprintln!("Failed to insert giveaway audit in transaction: {error}");
+                internal_error()
+            })?;
+    }
+
+    let finalized = campaigns
+        .update_one(
+            doc! {
+                "_id": claim_id,
+                "claimToken": claim_token,
+                "idempotencyOperatorId": operator_id,
+                "idempotencyKey": idempotency_key,
+                "payloadDigest": payload_digest,
+                "requestDigest": request_digest,
+                GIVEAWAY_STATUS_FIELD: GIVEAWAY_STATUS_IN_PROGRESS,
+            },
+            doc! {
+                "$set": {
+                    GIVEAWAY_STATUS_FIELD: GIVEAWAY_STATUS_COMPLETED,
+                    "createdBy": {
+                        "_id": operator_id,
+                        "name": &operator.name,
+                        "email": &operator.email,
+                    },
+                    "updatedAt": now,
+                },
+            },
+        )
+        .session(&mut *session)
+        .await
+        .map_err(|error| {
+            eprintln!("Failed to finalize giveaway campaign in transaction: {error}");
+            internal_error()
+        })?;
+    if finalized.matched_count != 1 {
+        return Err(giveaway_in_progress_response());
+    }
+
+    Ok(GiveawayDetail {
+        id: claim_id.to_hex(),
+        name: payload.name.clone(),
+        total_pool: payload.total_pool,
+        winner_count: payload.winner_count,
+        min_amount: payload.min_amount,
+        max_amount: payload.max_amount,
+        status: GIVEAWAY_STATUS_COMPLETED.to_string(),
+        note: payload.note.clone(),
+        seed: seed.to_string(),
+        participant_filter: payload.participant_filter.clone(),
+        created_at: now.try_to_rfc3339_string().unwrap_or_default(),
+        created_by: Some(operator.clone()),
+        winners: winners.to_vec(),
+        allocated_total,
+    })
+}
+
+async fn execute_giveaway_transaction(
+    client: &mongodb::Client,
+    db: &mongodb::Database,
+    claim_id: ObjectId,
+    claim_token: &str,
+    payload_digest: &str,
+    request_digest: &str,
+    idempotency_key: &str,
+    operator: &UserBrief,
+    payload: &NormalizedGiveaway,
+    winners: &[WinnerPreview],
+    allocated_total: i64,
+    seed: u64,
+) -> Result<GiveawayDetail, GiveawayTransactionError> {
+    let mut session = client.start_session().await.map_err(|error| {
+        eprintln!("Failed to start giveaway Mongo session: {error}");
+        GiveawayTransactionError::PreEffect(giveaway_transactions_unavailable_response())
+    })?;
+    session.start_transaction().await.map_err(|error| {
+        eprintln!("Failed to start giveaway Mongo transaction: {error}");
+        GiveawayTransactionError::PreEffect(giveaway_transactions_unavailable_response())
+    })?;
+
+    let result = apply_giveaway_transaction(
+        &mut session,
+        db,
+        claim_id,
+        claim_token,
+        payload_digest,
+        request_digest,
+        idempotency_key,
+        operator,
+        payload,
+        winners,
+        allocated_total,
+        seed,
+    )
+    .await;
+    let detail = match result {
+        Ok(detail) => detail,
+        Err(response) => {
+            if session.abort_transaction().await.is_ok() {
+                return Err(GiveawayTransactionError::PreEffect(response));
+            }
+            eprintln!("Giveaway transaction abort failed; retaining claim in progress");
+            return Err(GiveawayTransactionError::Ambiguous(
+                giveaway_commit_unknown_response(),
+            ));
+        }
+    };
+
+    match crate::services::idempotency::commit_mongo_transaction_with_unknown_retry(&mut session)
+        .await
+    {
+        crate::services::idempotency::TransactionCommitOutcome::Committed => Ok(detail),
+        crate::services::idempotency::TransactionCommitOutcome::Ambiguous
+        | crate::services::idempotency::TransactionCommitOutcome::FailedDefinitely => {
+            eprintln!("Giveaway transaction commit was not positively acknowledged; retaining claim");
+            Err(GiveawayTransactionError::Ambiguous(
+                giveaway_commit_unknown_response(),
+            ))
+        }
+    }
+}
+
 pub async fn giveaway_execute(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
@@ -1074,7 +1301,6 @@ pub async fn giveaway_execute(
         Ok(user) => user,
         Err(response) => return response,
     };
-    // Same financial step-up as manual balance adjust — this credits real balances.
     if let Err(response) = require_trusted_step_up_group(&headers, "finance.adjust_balance") {
         return response;
     }
@@ -1082,32 +1308,19 @@ pub async fn giveaway_execute(
         Ok(value) => value,
         Err(response) => return response,
     };
+    if !state.mongo_transactions_enabled {
+        return giveaway_transactions_unavailable_response();
+    }
+    let idempotency_key = match crate::services::idempotency::require_idempotency_key(&headers) {
+        Ok(Some(value)) => value,
+        Ok(None) => return crate::services::idempotency::IdempotencyError::MissingKey.into_response(),
+        Err(error) => return error.into_response(),
+    };
     let Some(client) = &state.mongo_client else {
         return unavailable();
     };
     let db = client.database(&state.mongo_db);
-    let users = db.collection::<Document>("users");
-    let adjustments = db.collection::<Document>("userbalanceadjustments");
     let campaigns = db.collection::<Document>("balancegiveaways");
-
-    // Idempotency: same key returns the previous completed campaign without re-crediting.
-    let idempotency_key = giveaway_idempotency_key(&headers);
-    if let Some(key) = idempotency_key.as_ref() {
-        if let Ok(Some(existing)) = campaigns
-            .find_one(doc! {
-                "idempotencyKey": key,
-                "createdBy._id": proxy_user.id,
-            })
-            .await
-        {
-            return Json(ExecuteResponse {
-                message: "Bagikan saldo random (replay idempotent)",
-                campaign: campaign_from_doc(existing),
-            })
-            .into_response();
-        }
-    }
-
     let members = match load_member_pool(
         &db,
         &normalized.participant_filter,
@@ -1129,154 +1342,92 @@ pub async fn giveaway_execute(
         Ok(value) => value,
         Err(response) => return response,
     };
-
-    let now = DateTime::now();
-    let operator = operator_brief(&proxy_user);
-    let reason_base = if normalized.note.is_empty() {
-        format!("Bagikan saldo random: {}", normalized.name)
-    } else {
-        format!("Bagikan saldo random: {} — {}", normalized.name, normalized.note)
-    };
-
-    // Credit each winner; on failure roll back previous winners in this campaign.
-    let mut credited: Vec<(ObjectId, i64)> = Vec::new();
-    for winner in &winners {
-        let Ok(user_id) = ObjectId::parse_str(&winner.user_id) else {
-            rollback_credits(&users, &credited).await;
-            return internal_error();
-        };
-        let amount = winner.amount as f64;
-        let updated = users
-            .find_one_and_update(
-                doc! { "_id": user_id, "role": "member" },
-                doc! {
-                    "$inc": { "balance": amount },
-                    "$set": { "updatedAt": now },
-                },
-            )
-            .return_document(mongodb::options::ReturnDocument::After)
-            .await;
-        let Ok(Some(user)) = updated else {
-            rollback_credits(&users, &credited).await;
-            return status_message(
-                axum::http::StatusCode::BAD_REQUEST,
-                "Gagal mengkredit salah satu pemenang; transaksi dibatalkan",
-            );
-        };
-        let balance_after = number_from_bson(user.get("balance")).unwrap_or(0) as f64;
-        let balance_before = balance_after - amount;
-        let audit = doc! {
-            "userId": user_id,
-            "operatorId": proxy_user.id,
-            "type": "add",
-            "amount": amount,
-            "balanceBefore": balance_before,
-            "balanceAfter": balance_after,
-            "reason": format!("{} (pemenang giveaway)", reason_base),
-            "source": "balance_giveaway",
-            "createdAt": now,
-            "updatedAt": now,
-        };
-        if adjustments.insert_one(audit).await.is_err() {
-            // Best-effort reverse this credit and prior ones.
-            let _ = users
-                .update_one(
-                    doc! { "_id": user_id },
-                    doc! { "$inc": { "balance": -amount }, "$set": { "updatedAt": DateTime::now() } },
-                )
-                .await;
-            rollback_credits(&users, &credited).await;
-            return internal_error();
-        }
-        credited.push((user_id, winner.amount));
-    }
-
-    let winner_docs: Vec<Document> = winners
-        .iter()
-        .filter_map(|winner| {
-            let user_id = ObjectId::parse_str(&winner.user_id).ok()?;
-            Some(doc! {
-                "userId": user_id,
-                "name": &winner.name,
-                "email": &winner.email,
-                "amount": winner.amount,
-            })
-        })
-        .collect();
+    let payload_digest = giveaway_payload_digest(&normalized, proxy_user.id);
+    let request_digest = giveaway_request_digest(&normalized, proxy_user.id, &winners);
     let allocated_total: i64 = winners.iter().map(|winner| winner.amount).sum();
-    let mut campaign_doc = doc! {
-        "name": &normalized.name,
-        "totalPool": normalized.total_pool,
-        "winnerCount": normalized.winner_count,
-        "minAmount": normalized.min_amount,
-        "maxAmount": normalized.max_amount,
-        "note": &normalized.note,
-        "participantFilter": &normalized.participant_filter,
-        "seed": seed.to_string(),
-        "status": "completed",
-        "winners": winner_docs,
-        "allocatedTotal": allocated_total,
-        "createdBy": {
-            "_id": proxy_user.id,
-            "name": &operator.name,
-            "email": &operator.email,
-        },
-        "createdAt": now,
-        "updatedAt": now,
-    };
-    if let Some(key) = idempotency_key {
-        campaign_doc.insert("idempotencyKey", key);
-    }
-    let insert = campaigns.insert_one(campaign_doc).await;
-    let Ok(insert_result) = insert else {
-        // Credits already applied — do not roll back money silently; surface error for ops.
-        eprintln!("Giveaway credits applied but campaign document insert failed");
-        return status_message(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Saldo sudah dikredit tetapi gagal menyimpan campaign; hubungi teknisi",
-        );
-    };
-    let campaign_id = insert_result
-        .inserted_id
-        .as_object_id()
-        .map(|id| id.to_hex())
-        .unwrap_or_default();
 
-    Json(ExecuteResponse {
-        message: "Bagikan saldo random berhasil dijalankan",
-        campaign: GiveawayDetail {
-            id: campaign_id,
-            name: normalized.name,
-            total_pool: normalized.total_pool,
-            winner_count: normalized.winner_count,
-            min_amount: normalized.min_amount,
-            max_amount: normalized.max_amount,
-            status: "completed".to_string(),
-            note: normalized.note,
-            seed: seed.to_string(),
-            participant_filter: normalized.participant_filter,
-            created_at: now
-                .try_to_rfc3339_string()
-                .unwrap_or_default(),
-            created_by: Some(operator),
-            winners,
-            allocated_total,
-        },
-    })
-    .into_response()
-}
+    let claim = match claim_giveaway(
+        &campaigns,
+        &normalized,
+        proxy_user.id,
+        &idempotency_key,
+        &request_digest,
+        seed,
+        &winners,
+        allocated_total,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let (claim_id, claim_token, stored_draw) = match claim {
+        GiveawayClaim::Replay(existing) => {
+            return Json(ExecuteResponse {
+                message: "Bagikan saldo random (replay idempotent)",
+                campaign: campaign_from_doc(existing),
+            })
+            .into_response();
+        }
+        GiveawayClaim::Conflict => return giveaway_conflict_response(),
+        GiveawayClaim::InProgress => return giveaway_in_progress_response(),
+        GiveawayClaim::Acquired {
+            id,
+            token,
+            existing,
+        } => (id, token, existing),
+    };
 
-async fn rollback_credits(users: &mongodb::Collection<Document>, credited: &[(ObjectId, i64)]) {
-    for (user_id, amount) in credited.iter().rev() {
-        let _ = users
-            .update_one(
-                doc! { "_id": *user_id },
-                doc! {
-                    "$inc": { "balance": -(*amount as f64) },
-                    "$set": { "updatedAt": DateTime::now() },
-                },
+    let (winners, seed, request_digest, allocated_total) = if let Some(existing) = stored_draw {
+        let stored_request_digest = existing
+            .get_str("requestDigest")
+            .unwrap_or_default()
+            .to_string();
+        let stored = campaign_from_doc(existing);
+        let stored_seed = stored.seed.parse::<u64>().ok();
+        if !stored.winners.is_empty() && stored_seed.is_some() && !stored_request_digest.is_empty() {
+            (
+                stored.winners,
+                stored_seed.unwrap_or(seed),
+                stored_request_digest,
+                stored.allocated_total,
             )
-            .await;
+        } else {
+            (winners, seed, request_digest, allocated_total)
+        }
+    } else {
+        (winners, seed, request_digest, allocated_total)
+    };
+
+    let operator = operator_brief(&proxy_user);
+    match execute_giveaway_transaction(
+        client,
+        &db,
+        claim_id,
+        &claim_token,
+        &payload_digest,
+        &request_digest,
+        &idempotency_key,
+        &operator,
+        &normalized,
+        &winners,
+        allocated_total,
+        seed,
+    )
+    .await
+    {
+        Ok(campaign) => Json(ExecuteResponse {
+            message: "Bagikan saldo random berhasil dijalankan",
+            campaign,
+        })
+        .into_response(),
+        Err(GiveawayTransactionError::PreEffect(response)) => {
+            if !mark_claim_retryable(&campaigns, claim_id, &claim_token).await {
+                return giveaway_commit_unknown_response();
+            }
+            response
+        }
+        Err(GiveawayTransactionError::Ambiguous(response)) => response,
     }
 }
 
@@ -1284,13 +1435,13 @@ async fn rollback_credits(users: &mongodb::Collection<Document>, credited: &[(Ob
 mod tests {
     use super::{
         allocate_random_amounts, decide_idempotency, giveaway_claim_document,
-        giveaway_execution_available, giveaway_idempotency_index_model,
-        giveaway_idempotency_key, giveaway_request_digest, GiveawayListResponse,
-        GiveawayPreviewResponse, IdempotencyDecision, Meta, NormalizedGiveaway,
-        WinnerPreview, GIVEAWAY_STATUS_IN_PROGRESS,
+        giveaway_execution_available,
+        giveaway_idempotency_index_model, giveaway_request_digest,
+        giveaway_transactions_unavailable_response,
+        GiveawayListResponse, GiveawayPreviewResponse, IdempotencyDecision,
+        Meta, NormalizedGiveaway, WinnerPreview, GIVEAWAY_STATUS_IN_PROGRESS,
     };
-    use axum::http::{HeaderMap, HeaderValue};
-    use mongodb::bson::{oid::ObjectId, DateTime, Bson};
+    use mongodb::bson::{oid::ObjectId, Bson, DateTime};
 
     fn fixture_payload(name: &str, total_pool: i64) -> NormalizedGiveaway {
         NormalizedGiveaway {
@@ -1417,6 +1568,9 @@ mod tests {
             operator_id,
             "giveaway-claim-001",
             &digest,
+            42,
+            &[],
+            0,
             DateTime::from_millis(1_700_000_000_000),
         );
         assert_eq!(claim.get_object_id("idempotencyOperatorId").unwrap(), operator_id);
@@ -1426,23 +1580,20 @@ mod tests {
     }
 
     #[test]
-    fn giveaway_reads_standard_idempotency_header() {
-        let mut headers = HeaderMap::new();
-        headers.insert("Idempotency-Key", HeaderValue::from_static("giveaway-standard-001"));
-        assert_eq!(
-            giveaway_idempotency_key(&headers).as_deref(),
-            Some("giveaway-standard-001")
-        );
+    fn giveaway_execution_is_transaction_only_and_integer_based() {
+        let source = include_str!("giveaway.rs");
+        let production = source.split("#[cfg(test)]").next().expect("production source");
+        assert!(production.contains("state.mongo_transactions_enabled"));
+        assert!(production.contains("start_transaction"));
+        assert!(production.contains("commit_mongo_transaction_with_unknown_retry"));
+        assert!(!production.contains("rollback_credits"));
+        assert!(!production.contains("amount as f64"));
     }
 
     #[test]
-    fn giveaway_accepts_legacy_idempotency_alias() {
-        let mut headers = HeaderMap::new();
-        headers.insert("X-Idempotency-Key", HeaderValue::from_static("giveaway-legacy-001"));
-        assert_eq!(
-            giveaway_idempotency_key(&headers).as_deref(),
-            Some("giveaway-legacy-001")
-        );
+    fn giveaway_transactions_unavailable_response_is_503() {
+        let response = giveaway_transactions_unavailable_response();
+        assert_eq!(response.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
