@@ -64,6 +64,26 @@ const formatDateTime = (value?: string) =>
 
 const fieldClass = 'w-full rounded-xl border px-3 py-2.5 text-sm ui-field';
 
+export function giveawayExecutionErrorMessage(error: unknown): string {
+    const response = (error as {
+        response?: { status?: number; data?: { error?: { code?: string }; code?: string; message?: string } };
+    })?.response;
+    const code = response?.data?.error?.code || response?.data?.code;
+    if (response?.status === 503 && code === 'GIVEAWAY_TRANSACTIONS_UNAVAILABLE') {
+        return 'Eksekusi sementara tidak tersedia karena MongoDB transaction belum aktif. Preview dan riwayat tetap dapat digunakan.';
+    }
+    if (response?.status === 503 && code === 'GIVEAWAY_COMMIT_UNKNOWN') {
+        return 'Status commit belum dapat dipastikan. Jangan gunakan key baru; lakukan rekonsiliasi dengan Idempotency-Key yang sama.';
+    }
+    if (response?.status === 409 && code === 'IDEMPOTENCY_CONFLICT') {
+        return 'Idempotency-Key sudah digunakan untuk payload berbeda. Gunakan key baru setelah memeriksa riwayat campaign.';
+    }
+    if (response?.status === 409 && code === 'IDEMPOTENCY_IN_PROGRESS') {
+        return 'Giveaway dengan key yang sama masih diproses atau perlu rekonsiliasi. Jangan gunakan key baru.';
+    }
+    return response?.data?.message || 'Gagal mengeksekusi bagikan saldo';
+}
+
 export default function BalanceGiveawayPanel() {
     const stepUp = useStepUpOrchestration();
     const [campaigns, setCampaigns] = useState<Campaign[]>([]);
@@ -203,7 +223,7 @@ export default function BalanceGiveawayPanel() {
                 setSelected(response.data.campaign);
             }
         } catch (error: any) {
-            const text = stepUpActionErrorMessage(error, 'Gagal mengeksekusi bagikan saldo');
+            const text = stepUpActionErrorMessage(error, giveawayExecutionErrorMessage(error));
             if (text) setMessage({ type: 'error', text });
         } finally {
             setExecuting(false);
