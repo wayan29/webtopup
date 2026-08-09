@@ -179,6 +179,64 @@ struct MemberPick {
     email: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdempotencyDecision {
+    Start,
+    Retryable,
+    Replay,
+    Conflict,
+    InProgress,
+}
+
+fn decide_idempotency(stored_digest: Option<&str>, requested_digest: &str) -> IdempotencyDecision {
+    match stored_digest {
+        None => IdempotencyDecision::Start,
+        Some(digest) if digest == requested_digest => IdempotencyDecision::Replay,
+        Some(_) => IdempotencyDecision::Conflict,
+    }
+}
+
+fn giveaway_execution_available(mongo_transactions_enabled: bool) -> bool {
+    mongo_transactions_enabled
+}
+
+fn giveaway_request_digest(
+    payload: &NormalizedGiveaway,
+    operator_id: ObjectId,
+    winners: &[WinnerPreview],
+) -> String {
+    let mut canonical = String::new();
+    push_digest_part(&mut canonical, &operator_id.to_hex());
+    push_digest_part(&mut canonical, &payload.name);
+    push_digest_part(&mut canonical, &payload.total_pool.to_string());
+    push_digest_part(&mut canonical, &payload.winner_count.to_string());
+    push_digest_part(&mut canonical, &payload.min_amount.to_string());
+    push_digest_part(&mut canonical, &payload.max_amount.to_string());
+    push_digest_part(&mut canonical, &payload.note);
+    push_digest_part(&mut canonical, &payload.participant_filter);
+    let mut emails = payload.emails.clone();
+    emails.sort();
+    for email in emails {
+        push_digest_part(&mut canonical, &email);
+    }
+    push_digest_part(
+        &mut canonical,
+        &payload.seed.map(|seed| seed.to_string()).unwrap_or_default(),
+    );
+    for winner in winners {
+        push_digest_part(&mut canonical, &winner.user_id);
+        push_digest_part(&mut canonical, &winner.amount.to_string());
+    }
+    crate::services::idempotency::sha256_hex(canonical.as_bytes())
+}
+
+fn push_digest_part(canonical: &mut String, value: &str) {
+    canonical.push_str(&value.len().to_string());
+    canonical.push(':');
+    canonical.push_str(value);
+    canonical.push('|');
+}
+
 fn giveaway_idempotency_key(headers: &axum::http::HeaderMap) -> Option<String> {
     headers
         .get(crate::services::idempotency::IDEMPOTENCY_HEADER)
@@ -919,8 +977,68 @@ async fn rollback_credits(users: &mongodb::Collection<Document>, credited: &[(Ob
 
 #[cfg(test)]
 mod tests {
-    use super::{allocate_random_amounts, giveaway_idempotency_key};
+    use super::{
+        allocate_random_amounts, decide_idempotency, giveaway_execution_available,
+        giveaway_idempotency_key, giveaway_request_digest, IdempotencyDecision,
+        NormalizedGiveaway,
+    };
     use axum::http::{HeaderMap, HeaderValue};
+    use mongodb::bson::oid::ObjectId;
+
+    fn fixture_payload(name: &str, total_pool: i64) -> NormalizedGiveaway {
+        NormalizedGiveaway {
+            name: name.to_string(),
+            total_pool,
+            winner_count: 2,
+            min_amount: 1_000,
+            max_amount: 10_000,
+            note: "catatan".to_string(),
+            participant_filter: "emails".to_string(),
+            emails: vec!["z@example.com".to_string(), "a@example.com".to_string()],
+            seed: Some(42),
+        }
+    }
+
+    #[test]
+    fn giveaway_request_digest_is_stable_and_payload_bound() {
+        let first = giveaway_request_digest(
+            &fixture_payload("Promo", 10_000),
+            ObjectId::from_bytes([1; 12]),
+            &[],
+        );
+        let same = giveaway_request_digest(
+            &fixture_payload("Promo", 10_000),
+            ObjectId::from_bytes([1; 12]),
+            &[],
+        );
+        let changed_amount = giveaway_request_digest(
+            &fixture_payload("Promo", 20_000),
+            ObjectId::from_bytes([1; 12]),
+            &[],
+        );
+        let different_operator = giveaway_request_digest(
+            &fixture_payload("Promo", 10_000),
+            ObjectId::from_bytes([2; 12]),
+            &[],
+        );
+
+        assert_eq!(first, same);
+        assert_ne!(first, changed_amount);
+        assert_ne!(first, different_operator);
+    }
+
+    #[test]
+    fn giveaway_idempotency_decision_replays_only_same_digest() {
+        assert_eq!(decide_idempotency(Some("abc"), "abc"), IdempotencyDecision::Replay);
+        assert_eq!(decide_idempotency(Some("abc"), "xyz"), IdempotencyDecision::Conflict);
+        assert_eq!(decide_idempotency(None, "abc"), IdempotencyDecision::Start);
+    }
+
+    #[test]
+    fn giveaway_capability_is_false_when_transactions_are_disabled() {
+        assert!(!giveaway_execution_available(false));
+        assert!(giveaway_execution_available(true));
+    }
 
     #[test]
     fn giveaway_reads_standard_idempotency_header() {
