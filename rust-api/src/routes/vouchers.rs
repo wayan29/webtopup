@@ -20,7 +20,7 @@ pub use discount::{
     DiscountProductContext,
 };
 pub use giveaway::{
-    giveaway_detail, giveaway_execute, giveaway_list, giveaway_preview,
+    ensure_giveaway_indexes, giveaway_detail, giveaway_execute, giveaway_list, giveaway_preview,
 };
 pub use redeem::redeem;
 

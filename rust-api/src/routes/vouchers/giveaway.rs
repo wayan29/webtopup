@@ -11,6 +11,7 @@ use axum::{
 };
 use futures_util::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime, Document};
+use mongodb::{error::ErrorKind, options::IndexOptions, IndexModel};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
@@ -30,6 +31,11 @@ const MAX_WINNERS: i64 = 100;
 const MIN_WINNERS: i64 = 1;
 const MAX_POOL: i64 = 100_000_000;
 const LIST_LIMIT_DEFAULT: i64 = 20;
+const GIVEAWAY_STATUS_IN_PROGRESS: &str = "in_progress";
+const GIVEAWAY_STATUS_RETRYABLE: &str = "retryable";
+const GIVEAWAY_STATUS_COMPLETED: &str = "completed";
+const GIVEAWAY_STATUS_COMMIT_UNKNOWN: &str = "commit_unknown";
+const GIVEAWAY_STATUS_FIELD: &str = "status";
 
 #[derive(Deserialize)]
 pub struct GiveawayListQuery {
@@ -58,7 +64,7 @@ pub struct GiveawayPayload {
     seed: Option<Value>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct WinnerPreview {
     #[serde(rename = "userId")]
     user_id: String,
@@ -208,6 +214,246 @@ fn giveaway_execution_available(mongo_transactions_enabled: bool) -> bool {
     mongo_transactions_enabled
 }
 
+pub fn giveaway_idempotency_index_model() -> IndexModel {
+    IndexModel::builder()
+        .keys(doc! {
+            "idempotencyOperatorId": 1,
+            "idempotencyKey": 1,
+        })
+        .options(
+            IndexOptions::builder()
+                .name("uniq_balance_giveaway_operator_key".to_string())
+                .unique(true)
+                .partial_filter_expression(doc! {
+                    "idempotencyOperatorId": { "$exists": true },
+                    "idempotencyKey": { "$exists": true },
+                })
+                .build(),
+        )
+        .build()
+}
+
+pub async fn ensure_giveaway_indexes(db: &mongodb::Database) -> mongodb::error::Result<()> {
+    db.collection::<Document>("balancegiveaways")
+        .create_index(giveaway_idempotency_index_model())
+        .await
+        .map(|_| ())
+}
+
+fn giveaway_claim_document(
+    payload: &NormalizedGiveaway,
+    operator_id: ObjectId,
+    idempotency_key: &str,
+    request_digest: &str,
+    now: DateTime,
+) -> Document {
+    let payload_digest = giveaway_payload_digest(payload, operator_id);
+    let mut document = doc! {
+        "name": &payload.name,
+        "totalPool": payload.total_pool,
+        "winnerCount": payload.winner_count,
+        "minAmount": payload.min_amount,
+        "maxAmount": payload.max_amount,
+        "note": &payload.note,
+        "participantFilter": &payload.participant_filter,
+        "status": GIVEAWAY_STATUS_IN_PROGRESS,
+        "winners": Bson::Array(Vec::new()),
+        "allocatedTotal": 0_i64,
+        "idempotencyOperatorId": operator_id,
+        "idempotencyKey": idempotency_key,
+        "payloadDigest": payload_digest,
+        "requestDigest": request_digest,
+        "createdBy": { "_id": operator_id },
+        "createdAt": now,
+        "updatedAt": now,
+    };
+    if let Some(seed) = payload.seed {
+        document.insert("seed", seed.to_string());
+    }
+    document
+}
+
+#[derive(Debug)]
+enum GiveawayClaim {
+    Acquired { id: ObjectId, token: String },
+    Replay(Document),
+    Conflict,
+    InProgress,
+}
+
+async fn claim_giveaway(
+    campaigns: &mongodb::Collection<Document>,
+    payload: &NormalizedGiveaway,
+    operator_id: ObjectId,
+    idempotency_key: &str,
+) -> Result<GiveawayClaim, Response> {
+    let now = DateTime::now();
+    let payload_digest = giveaway_payload_digest(payload, operator_id);
+    let token = ObjectId::new().to_hex();
+    let mut claim = giveaway_claim_document(
+        payload,
+        operator_id,
+        idempotency_key,
+        &payload_digest,
+        now,
+    );
+    claim.insert("claimToken", &token);
+
+    match campaigns.insert_one(claim).await {
+        Ok(result) => {
+            let Some(id) = result.inserted_id.as_object_id() else {
+                return Err(internal_error());
+            };
+            return Ok(GiveawayClaim::Acquired { id, token });
+        }
+        Err(error) if !is_duplicate_key_error(&error) => {
+            eprintln!("Failed to claim giveaway idempotency key: {error}");
+            return Err(internal_error());
+        }
+        Err(_) => {}
+    }
+
+    let existing = campaigns
+        .find_one(doc! {
+            "idempotencyOperatorId": operator_id,
+            "idempotencyKey": idempotency_key,
+        })
+        .await
+        .map_err(|error| {
+            eprintln!("Failed to read existing giveaway claim: {error}");
+            internal_error()
+        })?;
+    let Some(existing) = existing else {
+        return Err(internal_error());
+    };
+    let stored_payload_digest = existing
+        .get_str("payloadDigest")
+        .or_else(|_| existing.get_str("requestDigest"))
+        .unwrap_or_default();
+    if stored_payload_digest != payload_digest {
+        return Ok(GiveawayClaim::Conflict);
+    }
+
+    match existing
+        .get_str(GIVEAWAY_STATUS_FIELD)
+        .unwrap_or(GIVEAWAY_STATUS_IN_PROGRESS)
+    {
+        GIVEAWAY_STATUS_COMPLETED => Ok(GiveawayClaim::Replay(existing)),
+        GIVEAWAY_STATUS_RETRYABLE => {
+            let Some(id) = existing.get_object_id("_id").ok() else {
+                return Err(internal_error());
+            };
+            let updated = campaigns
+                .update_one(
+                    doc! {
+                        "_id": id,
+                        "idempotencyOperatorId": operator_id,
+                        "idempotencyKey": idempotency_key,
+                        "payloadDigest": &payload_digest,
+                        GIVEAWAY_STATUS_FIELD: GIVEAWAY_STATUS_RETRYABLE,
+                    },
+                    doc! {
+                        "$set": {
+                            GIVEAWAY_STATUS_FIELD: GIVEAWAY_STATUS_IN_PROGRESS,
+                            "claimToken": &token,
+                            "updatedAt": DateTime::now(),
+                        },
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    eprintln!("Failed to reacquire retryable giveaway claim: {error}");
+                    internal_error()
+                })?;
+            if updated.matched_count == 1 {
+                Ok(GiveawayClaim::Acquired { id, token })
+            } else {
+                Ok(GiveawayClaim::InProgress)
+            }
+        }
+        _ => Ok(GiveawayClaim::InProgress),
+    }
+}
+
+async fn update_claim_draw(
+    campaigns: &mongodb::Collection<Document>,
+    claim_id: ObjectId,
+    claim_token: &str,
+    payload_digest: &str,
+    request_digest: &str,
+    seed: u64,
+    winners: &[WinnerPreview],
+    allocated_total: i64,
+) -> Result<(), Response> {
+    let winner_docs = winners
+        .iter()
+        .filter_map(|winner| {
+            let user_id = ObjectId::parse_str(&winner.user_id).ok()?;
+            Some(doc! {
+                "userId": user_id,
+                "name": &winner.name,
+                "email": &winner.email,
+                "amount": winner.amount,
+            })
+        })
+        .collect::<Vec<_>>();
+    let updated = campaigns
+        .update_one(
+            doc! {
+                "_id": claim_id,
+                "claimToken": claim_token,
+                "payloadDigest": payload_digest,
+                GIVEAWAY_STATUS_FIELD: GIVEAWAY_STATUS_IN_PROGRESS,
+            },
+            doc! {
+                "$set": {
+                    "requestDigest": request_digest,
+                    "seed": seed.to_string(),
+                    "winners": winner_docs,
+                    "allocatedTotal": allocated_total,
+                    "updatedAt": DateTime::now(),
+                },
+            },
+        )
+        .await
+        .map_err(|error| {
+            eprintln!("Failed to persist giveaway draw claim: {error}");
+            internal_error()
+        })?;
+    if updated.matched_count != 1 {
+        return Err(giveaway_in_progress_response());
+    }
+    Ok(())
+}
+
+async fn mark_claim_retryable(
+    campaigns: &mongodb::Collection<Document>,
+    claim_id: ObjectId,
+    claim_token: &str,
+) -> bool {
+    campaigns
+        .update_one(
+            doc! {
+                "_id": claim_id,
+                "claimToken": claim_token,
+                GIVEAWAY_STATUS_FIELD: GIVEAWAY_STATUS_IN_PROGRESS,
+            },
+            doc! {
+                "$set": {
+                    GIVEAWAY_STATUS_FIELD: GIVEAWAY_STATUS_RETRYABLE,
+                    "updatedAt": DateTime::now(),
+                },
+            },
+        )
+        .await
+        .map(|result| result.matched_count == 1)
+        .unwrap_or(false)
+}
+
+fn giveaway_payload_digest(payload: &NormalizedGiveaway, operator_id: ObjectId) -> String {
+    giveaway_request_digest(payload, operator_id, &[])
+}
+
 fn giveaway_request_digest(
     payload: &NormalizedGiveaway,
     operator_id: ObjectId,
@@ -243,6 +489,55 @@ fn push_digest_part(canonical: &mut String, value: &str) {
     canonical.push(':');
     canonical.push_str(value);
     canonical.push('|');
+}
+
+fn is_duplicate_key_error(error: &mongodb::error::Error) -> bool {
+    matches!(
+        error.kind.as_ref(),
+        ErrorKind::Write(_) | ErrorKind::InsertMany(_)
+    ) && error.to_string().contains("E11000")
+}
+
+fn giveaway_conflict_response() -> Response {
+    (
+        axum::http::StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "message": "Idempotency-Key sudah digunakan untuk payload giveaway berbeda",
+            "error": {
+                "code": "IDEMPOTENCY_CONFLICT",
+                "message": "Idempotency-Key sudah digunakan untuk payload giveaway berbeda",
+            },
+        })),
+    )
+        .into_response()
+}
+
+fn giveaway_in_progress_response() -> Response {
+    (
+        axum::http::StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "message": "Giveaway dengan Idempotency-Key yang sama sedang diproses atau perlu rekonsiliasi",
+            "error": {
+                "code": "IDEMPOTENCY_IN_PROGRESS",
+                "message": "Giveaway dengan Idempotency-Key yang sama sedang diproses atau perlu rekonsiliasi",
+            },
+        })),
+    )
+        .into_response()
+}
+
+fn giveaway_commit_unknown_response() -> Response {
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "message": "Status commit giveaway belum dapat dipastikan; jangan gunakan key baru",
+            "error": {
+                "code": "GIVEAWAY_COMMIT_UNKNOWN",
+                "message": "Status commit giveaway belum dapat dipastikan; ulangi dengan Idempotency-Key yang sama setelah rekonsiliasi",
+            },
+        })),
+    )
+        .into_response()
 }
 
 fn giveaway_idempotency_key(headers: &axum::http::HeaderMap) -> Option<String> {
@@ -988,13 +1283,14 @@ async fn rollback_credits(users: &mongodb::Collection<Document>, credited: &[(Ob
 #[cfg(test)]
 mod tests {
     use super::{
-        allocate_random_amounts, decide_idempotency, giveaway_execution_available,
+        allocate_random_amounts, decide_idempotency, giveaway_claim_document,
+        giveaway_execution_available, giveaway_idempotency_index_model,
         giveaway_idempotency_key, giveaway_request_digest, GiveawayListResponse,
         GiveawayPreviewResponse, IdempotencyDecision, Meta, NormalizedGiveaway,
-        WinnerPreview,
+        WinnerPreview, GIVEAWAY_STATUS_IN_PROGRESS,
     };
     use axum::http::{HeaderMap, HeaderValue};
-    use mongodb::bson::oid::ObjectId;
+    use mongodb::bson::{oid::ObjectId, DateTime, Bson};
 
     fn fixture_payload(name: &str, total_pool: i64) -> NormalizedGiveaway {
         NormalizedGiveaway {
@@ -1090,6 +1386,43 @@ mod tests {
         };
         let json = serde_json::to_value(response).expect("preview response json");
         assert_eq!(json["executionAvailable"], true);
+    }
+
+    #[test]
+    fn giveaway_idempotency_index_is_unique_and_partial_without_ttl() {
+        let model = giveaway_idempotency_index_model();
+        let options = model.options.expect("index options");
+        assert_eq!(options.unique, Some(true));
+        assert_eq!(options.name.as_deref(), Some("uniq_balance_giveaway_operator_key"));
+        assert!(options.expire_after.is_none());
+        assert_eq!(
+            model.keys,
+            mongodb::bson::doc! {
+                "idempotencyOperatorId": 1,
+                "idempotencyKey": 1,
+            }
+        );
+        let partial = options.partial_filter_expression.expect("partial filter");
+        assert_eq!(partial["idempotencyOperatorId"]["$exists"], Bson::Boolean(true));
+        assert_eq!(partial["idempotencyKey"]["$exists"], Bson::Boolean(true));
+    }
+
+    #[test]
+    fn giveaway_claim_fields_bind_operator_key_and_digest() {
+        let operator_id = ObjectId::from_bytes([3; 12]);
+        let payload = fixture_payload("Promo", 10_000);
+        let digest = giveaway_request_digest(&payload, operator_id, &[]);
+        let claim = giveaway_claim_document(
+            &payload,
+            operator_id,
+            "giveaway-claim-001",
+            &digest,
+            DateTime::from_millis(1_700_000_000_000),
+        );
+        assert_eq!(claim.get_object_id("idempotencyOperatorId").unwrap(), operator_id);
+        assert_eq!(claim.get_str("idempotencyKey").unwrap(), "giveaway-claim-001");
+        assert_eq!(claim.get_str("requestDigest").unwrap(), digest);
+        assert_eq!(claim.get_str("status").unwrap(), GIVEAWAY_STATUS_IN_PROGRESS);
     }
 
     #[test]
