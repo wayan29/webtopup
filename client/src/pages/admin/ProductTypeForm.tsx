@@ -317,7 +317,7 @@ export default function ProductTypeForm() {
                             className="mb-1 inline-flex items-center gap-2 text-sm ui-text-muted hover:text-[var(--ui-text)] transition-colors disabled:cursor-not-allowed disabled:opacity-50"
                         >
                             <ArrowLeft className="w-4 h-4" />
-                            Kembali ke daftar jenis produk
+                            Kembali ke Daftar Jenis Produk
                         </button>
                         <h1 className="truncate text-xl font-black ui-text sm:text-2xl">
                             {isEdit ? 'Edit Jenis Produk' : 'Tambah Jenis Produk'}
@@ -365,7 +365,7 @@ export default function ProductTypeForm() {
             <form id="product-type-form" onSubmit={handleSubmit} className="space-y-4">
                 <FormSection
                     id="identity"
-                    title="1. Identitas Jenis Produk"
+                    title="1. Identitas Produk"
                     icon={Tag}
                     open={openSections.identity}
                     onToggle={toggleSection}

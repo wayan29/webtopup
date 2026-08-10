@@ -52,6 +52,8 @@ tests/*
 !tests/e2e/
 tests/e2e/*
 !tests/e2e/admin-notifications.spec.ts
+!tests/e2e/login-return-to.spec.ts
+!tests/e2e/public-routes.spec.ts
 test-results/
 playwright-report/
 playwright/.auth/

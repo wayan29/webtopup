@@ -295,7 +295,7 @@ export default function ProductOperatorForm() {
                             className="mb-1 inline-flex items-center gap-2 text-sm ui-text-muted hover:text-[var(--ui-text)] transition-colors"
                         >
                             <ArrowLeft className="w-4 h-4" />
-                            Kembali ke daftar operator
+                            Kembali ke Daftar Operator
                         </button>
                         <h1 className="truncate text-xl font-black ui-text sm:text-2xl">
                             {isEdit ? 'Edit Operator' : 'Tambah Operator'}
