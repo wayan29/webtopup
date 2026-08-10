@@ -200,6 +200,52 @@ test('giveaway execution is atomic, permanently idempotent, and fails closed wit
     assert.equal(await users.findOne({ _id: targetId }).then((row) => Number(row?.balance ?? 0)), targetBeforeFailure + 1_000);
     assert.equal(await users.findOne({ _id: extraUserId }).then((row) => Number(row?.balance ?? 0)), originalExtraBalance + 1_000);
 
+    const crashKey = crypto.randomUUID();
+    idempotencyKeys.push(crashKey);
+    const crashName = `${runId}-crash-before-transaction`;
+    campaignNames.push(crashName);
+    const crashPayload = {
+      name: crashName,
+      totalPool: 3_000,
+      winnerCount: 1,
+      minAmount: 3_000,
+      maxAmount: 3_000,
+      participantFilter: 'emails',
+      emails: targetEmail,
+      note: 'recover pre-transaction claim',
+      seed: '447711',
+    };
+    const crashWinner = { userId: targetId.toHexString(), name: 'Crash target', email: targetEmail, amount: 3_000 };
+    await db.collection('balancegiveaways').insertOne({
+      name: crashName,
+      totalPool: 3_000,
+      winnerCount: 1,
+      minAmount: 3_000,
+      maxAmount: 3_000,
+      participantFilter: 'emails',
+      seed: crashPayload.seed,
+      status: 'in_progress',
+      note: crashPayload.note,
+      winners: [{ userId: targetId, name: crashWinner.name, email: targetEmail, amount: crashWinner.amount }],
+      allocatedTotal: 3_000,
+      idempotencyOperatorId: actorId,
+      idempotencyKey: crashKey,
+      payloadDigest: giveawayPayloadDigest(crashPayload, actorId),
+      requestDigest: giveawayRequestDigest(crashPayload, actorId, [crashWinner]),
+      createdBy: { _id: actorId },
+      createdAt: new Date(),
+      leaseExpiresAt: new Date(Date.now() - 1_000),
+      commitUnknown: false,
+      claimToken: 'crashed-before-transaction',
+      updatedAt: new Date(),
+    });
+    const targetBeforeCrashRecovery = Number((await users.findOne({ _id: targetId }, { projection: { balance: 1 } }))?.balance ?? 0);
+    const crashRecovery = await execute(rustBase, trustedHeaders, crashPayload, crashKey);
+    assert.equal(crashRecovery.status, 200, crashRecovery.text);
+    assert.equal(await users.findOne({ _id: targetId }).then((row) => Number(row?.balance ?? 0)), targetBeforeCrashRecovery + 3_000);
+    assert.equal(await db.collection('userbalanceadjustments').countDocuments({ source: 'balance_giveaway', idempotencyKey: crashKey }), 1);
+    assert.equal(await db.collection('balancegiveaways').countDocuments({ name: crashName, status: 'completed' }), 1);
+
     await assertAbortLeavesNoGiveawayEffect(shared.MONGO_URI, db, targetId, runId);
     const disabledPayload = {
       name: `${runId}-disabled`,
@@ -290,6 +336,28 @@ async function execute(rustBase: string, headers: Record<string, string>, payloa
     headers: { ...headers, 'Idempotency-Key': key },
     body: JSON.stringify(payload),
   });
+}
+
+function giveawayPayloadDigest(payload: Record<string, unknown>, operatorId: ObjectId): string {
+  return giveawayRequestDigest(payload, operatorId, []);
+}
+
+function giveawayRequestDigest(payload: Record<string, unknown>, operatorId: ObjectId, winners: Array<{ userId: string; amount: number }>): string {
+  const values = [
+    operatorId.toHexString(),
+    String(payload.name),
+    String(payload.totalPool),
+    String(payload.winnerCount),
+    String(payload.minAmount),
+    String(payload.maxAmount),
+    String(payload.note ?? ''),
+    String(payload.participantFilter ?? 'all'),
+    ...String(payload.emails ?? '').split(/[,;\n\r]/u).map((email) => email.trim().toLowerCase()).filter(Boolean).sort(),
+    String(payload.seed ?? ''),
+    ...winners.flatMap((winner) => [winner.userId, String(winner.amount)]),
+  ];
+  const canonical = values.map((value) => `${value.length}:${value}|`).join('');
+  return crypto.createHash('sha256').update(canonical).digest('hex');
 }
 
 async function assertAbortLeavesNoGiveawayEffect(mongoUri: string, db: Db, targetId: ObjectId, runId: string): Promise<void> {

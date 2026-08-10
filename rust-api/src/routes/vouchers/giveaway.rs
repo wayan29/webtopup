@@ -567,34 +567,6 @@ async fn claim_giveaway(
     }
 }
 
-async fn mark_claim_execution_started(
-    campaigns: &mongodb::Collection<Document>,
-    claim_id: ObjectId,
-    claim_token: &str,
-) -> bool {
-    let now = DateTime::now();
-    campaigns
-        .update_one(
-            doc! {
-                "_id": claim_id,
-                "claimToken": claim_token,
-                GIVEAWAY_STATUS_FIELD: GIVEAWAY_STATUS_IN_PROGRESS,
-                GIVEAWAY_COMMIT_UNKNOWN_FIELD: { "$ne": true },
-                GIVEAWAY_TRANSACTION_STARTED_FIELD: { "$exists": false },
-            },
-            doc! {
-                "$set": {
-                    GIVEAWAY_TRANSACTION_STARTED_FIELD: now,
-                    GIVEAWAY_CLAIM_LEASE_FIELD: claim_lease_expires_at(now),
-                    "updatedAt": now,
-                },
-            },
-        )
-        .await
-        .map(|result| result.matched_count == 1)
-        .unwrap_or(false)
-}
-
 async fn mark_claim_retryable(
     campaigns: &mongodb::Collection<Document>,
     claim_id: ObjectId,
@@ -1314,7 +1286,7 @@ async fn apply_giveaway_transaction(
                 "idempotencyKey": idempotency_key,
                 "payloadDigest": payload_digest,
                 GIVEAWAY_STATUS_FIELD: GIVEAWAY_STATUS_IN_PROGRESS,
-                GIVEAWAY_TRANSACTION_STARTED_FIELD: { "$exists": true },
+                GIVEAWAY_TRANSACTION_STARTED_FIELD: { "$exists": false },
                 GIVEAWAY_COMMIT_UNKNOWN_FIELD: { "$ne": true },
             },
             doc! {
@@ -1474,17 +1446,6 @@ async fn execute_giveaway_transaction(
         eprintln!("Failed to start giveaway Mongo transaction: {error}");
         GiveawayTransactionError::PreEffect(giveaway_transactions_unavailable_response())
     })?;
-
-    let campaigns = db.collection::<Document>("balancegiveaways");
-    if !mark_claim_execution_started(&campaigns, claim_id, claim_token).await {
-        let response = internal_error();
-        if session.abort_transaction().await.is_ok() {
-            return Err(GiveawayTransactionError::PreEffect(response));
-        }
-        return Err(GiveawayTransactionError::Ambiguous(
-            giveaway_commit_unknown_response(),
-        ));
-    }
 
     let result = apply_giveaway_transaction(
         &mut session,
@@ -1724,11 +1685,13 @@ pub async fn giveaway_execute(
 mod tests {
     use super::{
         allocate_random_amounts, decide_idempotency, giveaway_claim_document,
-        giveaway_execution_available,
+        claim_can_be_reclaimed, giveaway_execution_available,
         giveaway_idempotency_index_model, giveaway_request_digest,
         giveaway_transactions_unavailable_response,
         GiveawayListResponse, GiveawayPreviewResponse, IdempotencyDecision,
-        Meta, NormalizedGiveaway, WinnerPreview, GIVEAWAY_STATUS_IN_PROGRESS,
+        Meta, NormalizedGiveaway, WinnerPreview, GIVEAWAY_CLAIM_LEASE_FIELD,
+        GIVEAWAY_COMMIT_UNKNOWN_FIELD, GIVEAWAY_STATUS_IN_PROGRESS,
+        GIVEAWAY_TRANSACTION_STARTED_FIELD,
     };
     use mongodb::bson::{oid::ObjectId, Bson, DateTime};
 
@@ -1845,6 +1808,53 @@ mod tests {
         let partial = options.partial_filter_expression.expect("partial filter");
         assert_eq!(partial["idempotencyOperatorId"]["$exists"], Bson::Boolean(true));
         assert_eq!(partial["idempotencyKey"]["$exists"], Bson::Boolean(true));
+    }
+
+    #[test]
+    fn stale_claim_recovery_requires_no_transaction_marker() {
+        let now = DateTime::from_millis(1_700_000_000_000);
+        let stale_pre_transaction = mongodb::bson::doc! {
+            "status": GIVEAWAY_STATUS_IN_PROGRESS,
+            GIVEAWAY_COMMIT_UNKNOWN_FIELD: false,
+            GIVEAWAY_CLAIM_LEASE_FIELD: DateTime::from_millis(now.timestamp_millis() - 1),
+        };
+        assert!(claim_can_be_reclaimed(&stale_pre_transaction, now));
+
+        let stale_started = mongodb::bson::doc! {
+            "status": GIVEAWAY_STATUS_IN_PROGRESS,
+            GIVEAWAY_COMMIT_UNKNOWN_FIELD: false,
+            GIVEAWAY_TRANSACTION_STARTED_FIELD: now,
+            GIVEAWAY_CLAIM_LEASE_FIELD: DateTime::from_millis(now.timestamp_millis() - 1),
+        };
+        assert!(!claim_can_be_reclaimed(&stale_started, now));
+
+        let live_pre_transaction = mongodb::bson::doc! {
+            "status": GIVEAWAY_STATUS_IN_PROGRESS,
+            GIVEAWAY_COMMIT_UNKNOWN_FIELD: false,
+            GIVEAWAY_CLAIM_LEASE_FIELD: DateTime::from_millis(now.timestamp_millis() + 1),
+        };
+        assert!(!claim_can_be_reclaimed(&live_pre_transaction, now));
+
+        let ambiguous = mongodb::bson::doc! {
+            "status": GIVEAWAY_STATUS_IN_PROGRESS,
+            GIVEAWAY_COMMIT_UNKNOWN_FIELD: true,
+            GIVEAWAY_CLAIM_LEASE_FIELD: DateTime::from_millis(now.timestamp_millis() - 1),
+        };
+        assert!(!claim_can_be_reclaimed(&ambiguous, now));
+    }
+
+    #[test]
+    fn giveaway_claim_fence_is_transaction_scoped() {
+        let source = include_str!("giveaway.rs");
+        let production = source.split("#[cfg(test)]").next().expect("production source");
+        assert!(!production.contains("mark_claim_execution_started(&campaigns"));
+        let apply = production
+            .split("async fn apply_giveaway_transaction")
+            .nth(1)
+            .expect("transaction function");
+        assert!(apply.contains("GIVEAWAY_TRANSACTION_STARTED_FIELD: { \"$exists\": false }"));
+        assert!(apply.contains("GIVEAWAY_TRANSACTION_STARTED_FIELD: now"));
+        assert!(apply.contains(".session(&mut *session)"));
     }
 
     #[test]
