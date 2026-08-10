@@ -368,6 +368,7 @@ fn claim_can_be_reclaimed(existing: &Document, now: DateTime) -> bool {
         && !existing
             .get_bool(GIVEAWAY_COMMIT_UNKNOWN_FIELD)
             .unwrap_or(false)
+        && existing.get(GIVEAWAY_TRANSACTION_STARTED_FIELD).is_none()
         && existing
             .get_datetime(GIVEAWAY_CLAIM_LEASE_FIELD)
             .is_ok_and(|expires_at| *expires_at <= now)
@@ -448,6 +449,7 @@ async fn resolve_existing_claim(
                         "payloadDigest": payload_digest,
                         GIVEAWAY_STATUS_FIELD: GIVEAWAY_STATUS_IN_PROGRESS,
                         GIVEAWAY_COMMIT_UNKNOWN_FIELD: { "$ne": true },
+                        GIVEAWAY_TRANSACTION_STARTED_FIELD: { "$exists": false },
                         GIVEAWAY_CLAIM_LEASE_FIELD: { "$lte": now },
                     },
                     doc! {
