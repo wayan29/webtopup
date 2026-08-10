@@ -790,6 +790,11 @@ export function initAuthStoreRuntime(options?: { channel?: AuthChannel | null })
 
 export function disposeAuthStoreRuntime(): void {
     runtimeGeneration++;
+    // Runtime teardown invalidates every bootstrap started by the previous React tree. This is
+    // especially important under StrictMode, which can dispose an effect and immediately mount
+    // it again: a rejected request from the disposed coordinator must not publish an offline or
+    // retry phase into the replacement runtime.
+    useAuthStore.setState((state) => ({ authSessionEpoch: nextAuthSessionEpoch(state.authSessionEpoch) }));
     if (idleInterceptor !== null) apiV2.interceptors.response.eject(idleInterceptor);
     idleInterceptor = null;
     disposeRuntime?.();

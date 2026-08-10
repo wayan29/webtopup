@@ -28,13 +28,13 @@ test('staff enrollment grace permits dashboard and shows bounded setup guidance'
   if (testInfo.project.name === 'chromium-mobile') expect({ narrow: page.viewportSize()!.width < 600, touch: await page.evaluate(() => navigator.maxTouchPoints > 0) }).toEqual({ narrow: true, touch: true });
 });
 
-test('overdue staff is redirected to security while the security route remains usable', async ({ page }, testInfo) => {
+test('overdue staff is redirected to the authoritative profile security surface', async ({ page }, testInfo) => {
   await login(page, `staff-overdue-${testInfo.project.name === 'chromium-mobile' ? 'mobile' : 'desktop'}`);
-  await expect(page).toHaveURL(/\/admin\/security$/);
+  await expect(page).toHaveURL(/\/admin\/profile$/);
   await expect(page.getByRole('status').filter({ hasText: '2FA wajib untuk akun staf' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Mulai setup 2FA' })).toBeEnabled();
   await page.goto('/admin/dashboard');
-  await expect(page).toHaveURL(/\/admin\/security$/);
+  await expect(page).toHaveURL(/\/admin\/profile$/);
   if (testInfo.project.name === 'chromium-mobile') expect({ narrow: page.viewportSize()!.width < 600, touch: await page.evaluate(() => navigator.maxTouchPoints > 0) }).toEqual({ narrow: true, touch: true });
 });
 

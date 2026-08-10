@@ -51,7 +51,7 @@ test('wrong step-up password stays inline before exact protected action succeeds
     await dialog.getByRole('button', { name: 'Lanjutkan' }).click();
     await expect.poll(() => stepUpOutcomes.length).toBe(2);
     expect(stepUpOutcomes[1]).toEqual({ status: 200, code: null, group: 'security.sessions_all', grantPresent: true });
-    await expect(page).toHaveURL(/\/login$/);
+    await expect(page).toHaveURL(/\/staff\/login(?:\?|$)/);
     const state = await mongo.db(shared.MONGO_DB).collection('authsessions').countDocuments({ userId: user!._id, status: { $in: ['active', 'locked'] }, ownsSlot: true });
     expect(state).toBe(0);
     const browserProjection = await page.evaluate(() => ({ urlHasCredentialMaterial: /token|otp|password|sid|grant/i.test(location.search + location.hash), localKeys: Object.keys(localStorage), sessionKeys: Object.keys(sessionStorage) }));

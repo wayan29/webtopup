@@ -70,6 +70,12 @@ test('accepts only exact Compose container and volume labels for destructive pro
   assert.throws(() => assertStackOwnershipInspection(container, { ...volume, Name: 'other' }), /volume ownership/);
 });
 
+test('disposable Mongo raises its file descriptor limit for replica-set startup', () => {
+  const compose = fs.readFileSync(path.resolve(import.meta.dirname, '../../../compose.dev-verification.yml'), 'utf8');
+  const mongoSection = compose.slice(compose.indexOf('  mongo:'), compose.indexOf('  mongo-init:'));
+  assert.match(mongoSection, /ulimits:\s*\n\s+nofile:\s*\n\s+soft:\s+65536\s*\n\s+hard:\s+65536/u);
+});
+
 test('Mongo uses host networking so its advertised loopback endpoint is reachable by host binaries', () => {
   const compose = fs.readFileSync(path.resolve(import.meta.dirname, '../../../compose.dev-verification.yml'), 'utf8');
   assert.match(compose, /network_mode: host/u);

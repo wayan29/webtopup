@@ -50,7 +50,7 @@ test('matrix executor switches profiles, stops before self-managed checks, and v
     verifyStopped: async () => { calls.push('verify-stopped'); },
   });
   assert.equal(aggregateVerdict(checks), 'LOCAL DEV VERIFIED');
-  assert.deepEqual(calls, ['run:unit', 'db', 'up:session-cs', 'run:session', 'down', 'run:rollout', 'verify-stopped']);
+  assert.deepEqual(calls, ['run:unit', 'db', 'up:session-cs', 'run:session', 'down', 'db', 'run:rollout', 'verify-stopped']);
 });
 
 test('isolated checks reset and restart even when the bounded profile is unchanged', async () => {

@@ -12,7 +12,7 @@ export const verificationMatrix = (): readonly MatrixCheck[] => [
   check('server-build', 'none', 'npm', ['--prefix', 'server', 'run', 'build']),
   check('rust-build', 'none', 'npm', ['run', 'api-v2:build']),
   check('mongo', 'disabled', 'node', ['--import', 'tsx', '--test', 'tools/dev-verification/integration/mongo.test.ts'], true),
-  check('public-origin', 'disabled', 'npx', ['playwright', 'test', '--config', 'tools/dev-verification/playwright.config.ts', 'public-origin.spec.ts', '--project=chromium-desktop', '--workers=1'], true),
+  check('public-origin', 'session-device-policy', 'npx', ['playwright', 'test', '--config', 'tools/dev-verification/playwright.config.ts', 'public-origin.spec.ts', '--project=chromium-desktop', '--workers=1'], true),
   check('login-return-to-desktop', 'session-device-policy', 'npx', ['playwright', 'test', '--config', 'tools/dev-verification/playwright.config.ts', 'login-return-to.spec.ts', '--project=chromium-desktop', '--workers=1'], true),
   ...sessionSpecs.flatMap((spec) => { const profile = spec === 'session-refresh-race' || spec === 'session-response-loss' ? 'session-cs-fault' : 'session-cs'; return [browserCheck(spec, 'chromium-desktop', profile), browserCheck(spec, 'chromium-mobile', profile)]; }),
   ...deviceSpecs.flatMap((spec) => [browserCheck(spec, 'chromium-desktop', 'session-device-policy'), browserCheck(spec, 'chromium-mobile', 'session-device-policy')]),

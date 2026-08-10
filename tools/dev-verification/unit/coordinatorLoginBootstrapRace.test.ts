@@ -130,6 +130,79 @@ test('remote ACCESS_UPDATED atomically supersedes an in-flight store bootstrap',
   }
 });
 
+test('a disposed bootstrap cannot overwrite a newer runtime loading state', async () => {
+  const originalAdapter = apiV2.defaults.adapter;
+  const originalWindow = globalThis.window;
+  const originalLocalStorage = globalThis.localStorage;
+  let resolvePending!: (response: unknown) => void;
+  const pending = new Promise((resolve) => { resolvePending = resolve; });
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: { location: { pathname: '/', search: '', hash: '' } },
+  });
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: { getItem: () => null, removeItem: () => undefined },
+  });
+  apiV2.defaults.adapter = (() => pending) as typeof apiV2.defaults.adapter;
+
+  const resetStore = () => {
+    disposeAuthStoreRuntime();
+    accessTokenStore.clear();
+    useAuthStore.setState({
+      user: null,
+      token: null,
+      isAuthenticated: false,
+      isAdmin: false,
+      isOwner: false,
+      isTeamMember: false,
+      isAuthLoading: false,
+      authPhase: 'unauthenticated',
+      offlineReturnTo: '/',
+      authFailureMessage: null,
+      authSessionEpoch: 0,
+      serverTimeOffsetMs: null,
+    });
+  };
+
+  let activeChannelListener: ((message: AuthChannelMessage) => void) | null = null;
+  const channel = {
+    post: () => undefined,
+    subscribe: (listener: (message: AuthChannelMessage) => void) => {
+      activeChannelListener = listener;
+      return () => { activeChannelListener = null; };
+    },
+    close: () => undefined,
+  };
+
+  resetStore();
+  initAuthStoreRuntime({ channel });
+  const abandonedBootstrap = useAuthStore.getState().checkAuth();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  // React StrictMode can dispose the first effect and immediately create a new runtime.
+  // The abandoned request must not write an offline/error phase after that replacement starts.
+  disposeAuthStoreRuntime();
+  initAuthStoreRuntime({ channel });
+  const currentBootstrap = useAuthStore.getState().checkAuth();
+  await new Promise((resolve) => setImmediate(resolve));
+  await abandonedBootstrap;
+
+  const stateAfterAbandonedRequest = useAuthStore.getState();
+  assert.equal(stateAfterAbandonedRequest.isAuthLoading, true);
+  assert.notEqual(stateAfterAbandonedRequest.authPhase, 'offline-stale');
+  assert.notEqual(stateAfterAbandonedRequest.authPhase, 'bootstrap-retry');
+  assert.equal(typeof activeChannelListener, 'function');
+
+  disposeAuthStoreRuntime();
+  resolvePending({ data: {}, status: 499, statusText: 'abandoned', headers: {}, config: {} });
+  await currentBootstrap;
+  apiV2.defaults.adapter = originalAdapter;
+  accessTokenStore.clear();
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: originalLocalStorage });
+});
+
 test('real refresh envelopes derive role class only from exact authoritative user roles', () => {
   for (const [role, expected] of [['member', 'member'], ['owner', 'staff'], ['admin', 'staff'], ['cs', 'staff']] as const) {
     const parsed = parseValidatedRefreshResponse({

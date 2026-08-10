@@ -8,6 +8,7 @@ test('aggregate matrix names every required evidence group exactly once', () => 
   for (const name of ['unit', 'client-build', 'server-build', 'rust-build', 'mongo', 'public-origin', 'login-return-to-desktop', 'finance-idempotency', 'rollout-transition', 'diff-check', 'report-secrecy', 'stopped-state']) assert.ok(names.includes(name));
   for (const platform of ['desktop', 'mobile']) for (const spec of ['session-cookies', 'session-lifecycle', 'session-multitab', 'session-device-replacement', 'session-enrollment', 'session-step-up']) assert.ok(names.includes(`${spec}-${platform}`));
   assert.equal(matrix.find(({ name }) => name === 'session-cookies-desktop')?.profile, 'session-cs');
+  assert.equal(matrix.find(({ name }) => name === 'public-origin')?.profile, 'session-device-policy');
   assert.equal(matrix.find(({ name }) => name === 'session-refresh-race-desktop')?.profile, 'session-cs-fault');
   assert.equal(matrix.find(({ name }) => name === 'session-response-loss-mobile')?.profile, 'session-cs-fault');
   assert.equal(matrix.find(({ name }) => name === 'session-enrollment-desktop')?.profile, 'session-device-policy');

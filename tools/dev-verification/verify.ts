@@ -44,6 +44,7 @@ export async function executeVerificationMatrix(matrix: readonly MatrixCheck[], 
         phase = 'verify-stopped'; await deps.verifyStopped();
       } else if (item.profile === 'self-managed') {
         if (active !== 'none') { await deps.stopHost(); active = 'none'; }
+        phase = 'prepare'; await deps.prepareDatabase();
         phase = 'run'; await deps.runCommand(item.command, item.args, item.name);
       } else {
         if (item.profile !== 'none' && (item.profile !== active || item.isolated)) {

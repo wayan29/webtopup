@@ -4,6 +4,10 @@ services:
     image: mongo:7
     network_mode: host
     command: ["mongod", "--replSet", "rs0", "--port", "27018", "--bind_ip", "127.0.0.1"]
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     restart: unless-stopped
     volumes:
       - mongo-data:/data/db
