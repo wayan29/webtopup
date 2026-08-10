@@ -92,7 +92,7 @@ async function runLogged(config: VerificationConfig, command: string, args: read
   } finally { await handle.close(); }
 }
 
-const processProfile = (profile: 'disabled' | 'session-cs' | 'session-cs-fault' | 'session-device-policy' | 'session-finance-fault'): ProcessProfile => profile;
+const processProfile = (profile: 'disabled' | 'session-cs' | 'session-cs-fault' | 'session-device-policy' | 'session-finance-policy' | 'session-finance-fault'): ProcessProfile => profile;
 
 export async function beginVerificationReport(reportPath: string): Promise<{ runId: string; startedAt: string }> {
   const run = { runId: crypto.randomUUID(), startedAt: new Date().toISOString() };

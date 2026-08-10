@@ -16,6 +16,7 @@ test('aggregate matrix names every required evidence group exactly once', () => 
     command: 'npx', args: ['playwright', 'test', '--config', 'tools/dev-verification/playwright.config.ts', 'login-return-to.spec.ts', '--project=chromium-desktop', '--workers=1'],
   });
   assert.equal(matrix.find(({ name }) => name === 'finance-idempotency')?.profile, 'session-finance-fault');
+  assert.equal(matrix.find(({ name }) => name === 'giveaway-atomic')?.profile, 'session-finance-policy');
   assert.equal(matrix.find(({ name }) => name === 'rollout-transition')?.profile, 'self-managed');
   assert.equal(matrix.at(-1)?.profile, 'stopped');
   assert.ok(matrix.filter(({ profile }) => profile === 'session-cs' || profile === 'session-device-policy').every(({ isolated }) => isolated));
