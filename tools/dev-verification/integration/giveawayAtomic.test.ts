@@ -120,6 +120,21 @@ test('giveaway execution is atomic, permanently idempotent, and fails closed wit
     assert.equal(await users.findOne({ _id: targetId }).then((row) => Number(row?.balance ?? 0)), originalBalance + 10_000);
     assert.equal(await db.collection('userbalanceadjustments').countDocuments({ source: 'balance_giveaway', idempotencyKey: firstKey }), 1);
     await users.updateOne({ _id: targetId }, { $set: { role: originalTargetRole } });
+    await db.collection('balancegiveaways').updateOne(
+      { _id: new ObjectId(firstCampaignId) },
+      {
+        $set: { status: 'in_progress', commitUnknown: true, leaseExpiresAt: new Date(Date.now() - 1_000) },
+        $unset: { transactionStartedAt: '' },
+      },
+    );
+    const ambiguousReplay = await execute(rustBase, trustedHeaders, firstPayload, firstKey);
+    assert.equal(ambiguousReplay.status, 409, ambiguousReplay.text);
+    assert.equal(ambiguousReplay.body.error?.code, 'IDEMPOTENCY_IN_PROGRESS');
+    assert.equal(await users.findOne({ _id: targetId }).then((row) => Number(row?.balance ?? 0)), originalBalance + 10_000);
+    await db.collection('balancegiveaways').updateOne(
+      { _id: new ObjectId(firstCampaignId) },
+      { $set: { status: 'completed', commitUnknown: false }, $unset: { leaseExpiresAt: '', transactionStartedAt: '' } },
+    );
 
     const conflict = await execute(rustBase, trustedHeaders, { ...firstPayload, note: 'different payload' }, firstKey);
     assert.equal(conflict.status, 409, conflict.text);
@@ -175,6 +190,10 @@ test('giveaway execution is atomic, permanently idempotent, and fails closed wit
     assert.equal(await users.findOne({ _id: extraUserId }).then((row) => row?.balance), 'corrupt-balance');
 
     await users.updateOne({ _id: extraUserId }, { $set: { balance: originalExtraBalance } });
+    await db.collection('balancegiveaways').updateOne(
+      { name: failureName, idempotencyOperatorId: actorId, idempotencyKey: failureKey },
+      { $set: { status: 'in_progress', leaseExpiresAt: new Date(Date.now() - 1_000) } },
+    );
     const recoveredExecution = await execute(rustBase, trustedHeaders, failurePayload, failureKey);
     assert.equal(recoveredExecution.status, 200, recoveredExecution.text);
     assert.equal(await db.collection('userbalanceadjustments').countDocuments({ source: 'balance_giveaway', idempotencyKey: failureKey }), 2);

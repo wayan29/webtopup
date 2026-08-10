@@ -35,6 +35,10 @@ const GIVEAWAY_STATUS_IN_PROGRESS: &str = "in_progress";
 const GIVEAWAY_STATUS_RETRYABLE: &str = "retryable";
 const GIVEAWAY_STATUS_COMPLETED: &str = "completed";
 const GIVEAWAY_STATUS_FIELD: &str = "status";
+const GIVEAWAY_CLAIM_LEASE_SECONDS: i64 = 5 * 60;
+const GIVEAWAY_CLAIM_LEASE_FIELD: &str = "leaseExpiresAt";
+const GIVEAWAY_TRANSACTION_STARTED_FIELD: &str = "transactionStartedAt";
+const GIVEAWAY_COMMIT_UNKNOWN_FIELD: &str = "commitUnknown";
 
 #[derive(Deserialize)]
 pub struct GiveawayListQuery {
@@ -239,6 +243,10 @@ pub async fn ensure_giveaway_indexes(db: &mongodb::Database) -> mongodb::error::
         .map(|_| ())
 }
 
+fn claim_lease_expires_at(now: DateTime) -> DateTime {
+    DateTime::from_millis(now.timestamp_millis() + GIVEAWAY_CLAIM_LEASE_SECONDS * 1_000)
+}
+
 fn draw_from_claim_document(document: &Document) -> Result<GiveawayDraw, Response> {
     let winners = document
         .get_array("winners")
@@ -325,6 +333,8 @@ fn giveaway_claim_document(
         "requestDigest": request_digest,
         "createdBy": { "_id": operator_id },
         "createdAt": now,
+        GIVEAWAY_CLAIM_LEASE_FIELD: claim_lease_expires_at(now),
+        GIVEAWAY_COMMIT_UNKNOWN_FIELD: false,
         "updatedAt": now,
     }
 }
@@ -350,6 +360,19 @@ enum GiveawayClaim {
     InProgress,
 }
 
+fn claim_can_be_reclaimed(existing: &Document, now: DateTime) -> bool {
+    existing
+        .get_str(GIVEAWAY_STATUS_FIELD)
+        .unwrap_or(GIVEAWAY_STATUS_IN_PROGRESS)
+        == GIVEAWAY_STATUS_IN_PROGRESS
+        && !existing
+            .get_bool(GIVEAWAY_COMMIT_UNKNOWN_FIELD)
+            .unwrap_or(false)
+        && existing
+            .get_datetime(GIVEAWAY_CLAIM_LEASE_FIELD)
+            .is_ok_and(|expires_at| *expires_at <= now)
+}
+
 async fn resolve_existing_claim(
     campaigns: &mongodb::Collection<Document>,
     existing: Document,
@@ -372,6 +395,7 @@ async fn resolve_existing_claim(
                 return Err(internal_error());
             };
             let token = ObjectId::new().to_hex();
+            let now = DateTime::now();
             let updated = campaigns
                 .update_one(
                     doc! {
@@ -385,13 +409,58 @@ async fn resolve_existing_claim(
                         "$set": {
                             GIVEAWAY_STATUS_FIELD: GIVEAWAY_STATUS_IN_PROGRESS,
                             "claimToken": &token,
-                            "updatedAt": DateTime::now(),
+                            GIVEAWAY_CLAIM_LEASE_FIELD: claim_lease_expires_at(now),
+                            GIVEAWAY_COMMIT_UNKNOWN_FIELD: false,
+                            "updatedAt": now,
+                        },
+                        "$unset": {
+                            GIVEAWAY_TRANSACTION_STARTED_FIELD: "",
                         },
                     },
                 )
                 .await
                 .map_err(|error| {
                     eprintln!("Failed to reacquire retryable giveaway claim: {error}");
+                    internal_error()
+                })?;
+            if updated.matched_count == 1 {
+                Ok(GiveawayClaim::Acquired {
+                    id,
+                    token,
+                    existing: Some(existing),
+                })
+            } else {
+                Ok(GiveawayClaim::InProgress)
+            }
+        }
+        GIVEAWAY_STATUS_IN_PROGRESS if claim_can_be_reclaimed(&existing, DateTime::now()) => {
+            let Some(id) = existing.get_object_id("_id").ok() else {
+                return Err(internal_error());
+            };
+            let token = ObjectId::new().to_hex();
+            let now = DateTime::now();
+            let updated = campaigns
+                .update_one(
+                    doc! {
+                        "_id": id,
+                        "idempotencyOperatorId": operator_id,
+                        "idempotencyKey": idempotency_key,
+                        "payloadDigest": payload_digest,
+                        GIVEAWAY_STATUS_FIELD: GIVEAWAY_STATUS_IN_PROGRESS,
+                        GIVEAWAY_COMMIT_UNKNOWN_FIELD: { "$ne": true },
+                        GIVEAWAY_CLAIM_LEASE_FIELD: { "$lte": now },
+                    },
+                    doc! {
+                        "$set": {
+                            "claimToken": &token,
+                            GIVEAWAY_CLAIM_LEASE_FIELD: claim_lease_expires_at(now),
+                            "updatedAt": now,
+                        },
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    eprintln!("Failed to reclaim stale giveaway claim: {error}");
                     internal_error()
                 })?;
             if updated.matched_count == 1 {
@@ -496,7 +565,65 @@ async fn claim_giveaway(
     }
 }
 
+async fn mark_claim_execution_started(
+    campaigns: &mongodb::Collection<Document>,
+    claim_id: ObjectId,
+    claim_token: &str,
+) -> bool {
+    let now = DateTime::now();
+    campaigns
+        .update_one(
+            doc! {
+                "_id": claim_id,
+                "claimToken": claim_token,
+                GIVEAWAY_STATUS_FIELD: GIVEAWAY_STATUS_IN_PROGRESS,
+                GIVEAWAY_COMMIT_UNKNOWN_FIELD: { "$ne": true },
+                GIVEAWAY_TRANSACTION_STARTED_FIELD: { "$exists": false },
+            },
+            doc! {
+                "$set": {
+                    GIVEAWAY_TRANSACTION_STARTED_FIELD: now,
+                    GIVEAWAY_CLAIM_LEASE_FIELD: claim_lease_expires_at(now),
+                    "updatedAt": now,
+                },
+            },
+        )
+        .await
+        .map(|result| result.matched_count == 1)
+        .unwrap_or(false)
+}
+
 async fn mark_claim_retryable(
+    campaigns: &mongodb::Collection<Document>,
+    claim_id: ObjectId,
+    claim_token: &str,
+) -> bool {
+    let now = DateTime::now();
+    campaigns
+        .update_one(
+            doc! {
+                "_id": claim_id,
+                "claimToken": claim_token,
+                GIVEAWAY_STATUS_FIELD: GIVEAWAY_STATUS_IN_PROGRESS,
+            },
+            doc! {
+                "$set": {
+                    GIVEAWAY_STATUS_FIELD: GIVEAWAY_STATUS_RETRYABLE,
+                    GIVEAWAY_COMMIT_UNKNOWN_FIELD: false,
+                    "updatedAt": now,
+                },
+                "$unset": {
+                    GIVEAWAY_TRANSACTION_STARTED_FIELD: "",
+                    GIVEAWAY_CLAIM_LEASE_FIELD: "",
+                },
+            },
+        )
+        .await
+        .map(|result| result.matched_count == 1)
+        .unwrap_or(false)
+}
+
+async fn mark_claim_commit_unknown(
     campaigns: &mongodb::Collection<Document>,
     claim_id: ObjectId,
     claim_token: &str,
@@ -510,7 +637,7 @@ async fn mark_claim_retryable(
             },
             doc! {
                 "$set": {
-                    GIVEAWAY_STATUS_FIELD: GIVEAWAY_STATUS_RETRYABLE,
+                    GIVEAWAY_COMMIT_UNKNOWN_FIELD: true,
                     "updatedAt": DateTime::now(),
                 },
             },
@@ -1185,6 +1312,8 @@ async fn apply_giveaway_transaction(
                 "idempotencyKey": idempotency_key,
                 "payloadDigest": payload_digest,
                 GIVEAWAY_STATUS_FIELD: GIVEAWAY_STATUS_IN_PROGRESS,
+                GIVEAWAY_TRANSACTION_STARTED_FIELD: { "$exists": true },
+                GIVEAWAY_COMMIT_UNKNOWN_FIELD: { "$ne": true },
             },
             doc! {
                 "$set": {
@@ -1192,6 +1321,8 @@ async fn apply_giveaway_transaction(
                     "seed": seed.to_string(),
                     "winners": winner_docs,
                     "allocatedTotal": allocated_total,
+                    GIVEAWAY_TRANSACTION_STARTED_FIELD: now,
+                    GIVEAWAY_CLAIM_LEASE_FIELD: claim_lease_expires_at(now),
                     "updatedAt": now,
                 },
             },
@@ -1282,7 +1413,12 @@ async fn apply_giveaway_transaction(
                         "name": &operator.name,
                         "email": &operator.email,
                     },
+                    GIVEAWAY_COMMIT_UNKNOWN_FIELD: false,
                     "updatedAt": now,
+                },
+                "$unset": {
+                    GIVEAWAY_TRANSACTION_STARTED_FIELD: "",
+                    GIVEAWAY_CLAIM_LEASE_FIELD: "",
                 },
             },
         )
@@ -1337,6 +1473,17 @@ async fn execute_giveaway_transaction(
         GiveawayTransactionError::PreEffect(giveaway_transactions_unavailable_response())
     })?;
 
+    let campaigns = db.collection::<Document>("balancegiveaways");
+    if !mark_claim_execution_started(&campaigns, claim_id, claim_token).await {
+        let response = internal_error();
+        if session.abort_transaction().await.is_ok() {
+            return Err(GiveawayTransactionError::PreEffect(response));
+        }
+        return Err(GiveawayTransactionError::Ambiguous(
+            giveaway_commit_unknown_response(),
+        ));
+    }
+
     let result = apply_giveaway_transaction(
         &mut session,
         db,
@@ -1369,9 +1516,17 @@ async fn execute_giveaway_transaction(
         .await
     {
         crate::services::idempotency::TransactionCommitOutcome::Committed => Ok(detail),
-        crate::services::idempotency::TransactionCommitOutcome::Ambiguous
-        | crate::services::idempotency::TransactionCommitOutcome::FailedDefinitely => {
-            eprintln!("Giveaway transaction commit was not positively acknowledged; retaining claim");
+        crate::services::idempotency::TransactionCommitOutcome::Ambiguous => {
+            eprintln!("Giveaway transaction commit was ambiguous; retaining claim");
+            Err(GiveawayTransactionError::Ambiguous(
+                giveaway_commit_unknown_response(),
+            ))
+        }
+        crate::services::idempotency::TransactionCommitOutcome::FailedDefinitely => {
+            // The shared helper deliberately does not treat a non-labelled commit error as proof
+            // that server-side writes were absent. Retain the claim exactly like an ambiguous
+            // commit; only an explicit successful abort is retryable.
+            eprintln!("Giveaway transaction commit failed without durable proof; retaining claim");
             Err(GiveawayTransactionError::Ambiguous(
                 giveaway_commit_unknown_response(),
             ))
@@ -1556,7 +1711,10 @@ pub async fn giveaway_execute(
             }
             response
         }
-        Err(GiveawayTransactionError::Ambiguous(response)) => response,
+        Err(GiveawayTransactionError::Ambiguous(response)) => {
+            let _ = mark_claim_commit_unknown(&campaigns, claim_id, &claim_token).await;
+            response
+        }
     }
 }
 
