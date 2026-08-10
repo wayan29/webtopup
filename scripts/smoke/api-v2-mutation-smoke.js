@@ -188,6 +188,24 @@ function skip(name, reason) {
   console.log(`skip ${name} ${reason}`);
 }
 
+function assertStepUpRequired(name, response, body) {
+  const code = body?.error?.code || body?.code;
+  if (response.status !== 403 || code !== 'AUTH_STEP_UP_REQUIRED') {
+    reporter.record('failed', name, {
+      expectedStatus: 403,
+      expectedCode: 'AUTH_STEP_UP_REQUIRED',
+      status: response.status,
+      code,
+      message: body?.message || JSON.stringify(body),
+    });
+    throw new Error(
+      `${name} expected AUTH_STEP_UP_REQUIRED, got ${response.status} ${code || body?.message || JSON.stringify(body)}`,
+    );
+  }
+  passedChecks += 1;
+  reporter.record('passed', name, { status: response.status, code });
+}
+
 async function withSmokeDb(callback) {
   if (!smokeMongoUri) {
     skip('mongo-backed e2e smoke', 'no mongo uri');
@@ -1682,14 +1700,14 @@ async function main() {
     const invalidDepositReject = await authedJson(token, 'PUT', '/api/v2/deposits/not-an-id/reject', {
       note: 'Smoke invalid id',
     });
-    assertStatus('deposit reject invalid id', invalidDepositReject.response, invalidDepositReject.body, 400);
-    console.log(`ok deposit reject invalid id ${invalidDepositReject.response.status}`);
+    assertStepUpRequired('deposit reject invalid id', invalidDepositReject.response, invalidDepositReject.body);
+    console.log(`ok deposit reject invalid id ${invalidDepositReject.response.status} AUTH_STEP_UP_REQUIRED`);
 
     const invalidDepositApprove = await authedJson(token, 'PUT', '/api/v2/deposits/not-an-id/approve', {
       note: 'Smoke invalid id',
     });
-    assertStatus('deposit approve invalid id', invalidDepositApprove.response, invalidDepositApprove.body, 400);
-    console.log(`ok deposit approve invalid id ${invalidDepositApprove.response.status}`);
+    assertStepUpRequired('deposit approve invalid id', invalidDepositApprove.response, invalidDepositApprove.body);
+    console.log(`ok deposit approve invalid id ${invalidDepositApprove.response.status} AUTH_STEP_UP_REQUIRED`);
 
     const missingDepositApprove = await authedJson(
       token,
@@ -1697,8 +1715,8 @@ async function main() {
       '/api/v2/deposits/000000000000000000000000/approve',
       { note: 'Smoke missing deposit' },
     );
-    assertStatus('deposit approve missing deposit', missingDepositApprove.response, missingDepositApprove.body, 409);
-    console.log(`ok deposit approve missing deposit ${missingDepositApprove.response.status}`);
+    assertStepUpRequired('deposit approve missing deposit', missingDepositApprove.response, missingDepositApprove.body);
+    console.log(`ok deposit approve missing deposit ${missingDepositApprove.response.status} AUTH_STEP_UP_REQUIRED`);
 
     const missingDepositRejectNote = await authedJson(
       token,
@@ -1706,8 +1724,8 @@ async function main() {
       '/api/v2/deposits/000000000000000000000000/reject',
       { note: '' },
     );
-    assertStatus('deposit reject missing note', missingDepositRejectNote.response, missingDepositRejectNote.body, 400);
-    console.log(`ok deposit reject missing note ${missingDepositRejectNote.response.status}`);
+    assertStepUpRequired('deposit reject missing note', missingDepositRejectNote.response, missingDepositRejectNote.body);
+    console.log(`ok deposit reject missing note ${missingDepositRejectNote.response.status} AUTH_STEP_UP_REQUIRED`);
 
     const missingPointsUser = await authedJson(token, 'POST', '/api/v2/points/adjust', {
       userId: '000000000000000000000000',

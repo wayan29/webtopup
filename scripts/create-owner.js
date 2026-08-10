@@ -8,11 +8,11 @@ const mongoose = serverRequire('mongoose');
 
 const MONGO_URI = (process.env.MONGO_URI || '').trim();
 const MONGO_DB = (process.env.MONGO_DB || 'POBB').trim();
-const EMAIL = (process.env.OWNER_EMAIL || 'owner@danayasa.biz.id').trim();
+const EMAIL = (process.env.OWNER_EMAIL || '').trim();
 const PASSWORD = (process.env.OWNER_PASSWORD || '').trim();
 const NAME = (process.env.OWNER_NAME || 'Owner').trim();
 
-if (!MONGO_URI || !PASSWORD) { console.error('Butuh MONGO_URI dan OWNER_PASSWORD'); process.exit(1); }
+if (!MONGO_URI || !EMAIL || !PASSWORD) { console.error('Butuh MONGO_URI, OWNER_EMAIL dan OWNER_PASSWORD'); process.exit(1); }
 
 (async () => {
   await mongoose.connect(MONGO_URI, { dbName: MONGO_DB });
