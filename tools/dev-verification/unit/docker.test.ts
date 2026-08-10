@@ -43,6 +43,12 @@ test('HTTPS edge uses host networking to reach loopback-only host services', () 
   assert.match(caddy, /127\.0\.0\.1:\{\$DEV_VERIFY_VITE_PORT\}/u);
 });
 
+test('disposable Caddy isolates its admin endpoint from production Caddy', () => {
+  const caddy = fs.readFileSync(path.resolve(import.meta.dirname, '../../../infra/dev-verification/Caddyfile'), 'utf8');
+  assert.match(caddy, /admin\s+127\.0\.0\.1:2020/u);
+  assert.doesNotMatch(caddy, /admin\s+127\.0\.0\.1:2019/u);
+});
+
 test('volume purge accepts only the exact inspected verification volume', () => {
   assert.doesNotThrow(() => assertExactVolumeRemovalTarget('webtopup-task14-dev_mongo-data'));
   assert.throws(() => assertExactVolumeRemovalTarget('other'), /exact verification Mongo volume/);
