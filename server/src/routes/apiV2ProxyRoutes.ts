@@ -1492,6 +1492,12 @@ const proxyUnlock = async (request: AuthRequest, reply: FastifyReply) => {
     app.all('/vendors/:id', { preHandler: [authenticate, hasPermission('manageVendors')] }, proxyRequest);
     app.all('/vendors/*', { preHandler: [authenticate, hasPermission('viewVendors')] }, proxyRequest);
     app.post('/vouchers/redeem', { preHandler: [voucherRedeemRateLimit, authenticate] }, proxyRequest);
+    // Giveaway reads and preview must remain available even when execution is disabled. Keep
+    // these routes before the generic voucher catch-all so their method-specific guards win over
+    // the legacy /vouchers/:id routes.
+    app.get('/vouchers/giveaways', { preHandler: [authenticate, hasPermission('manageVouchers')] }, proxyRequest);
+    app.get('/vouchers/giveaways/:id', { preHandler: [authenticate, hasPermission('manageVouchers')] }, proxyRequest);
+    app.post('/vouchers/giveaways/preview', { preHandler: [authenticate, hasPermission('manageVouchers')] }, proxyRequest);
     // Giveaway execution credits member balances, so it needs both a bounded idempotency key
     // and the same server-selected finance step-up as direct balance adjustments. Keep this
     // route before the generic voucher catch-all so the trusted group is stamped upstream.

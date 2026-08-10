@@ -63,7 +63,7 @@ pub struct GiveawayPayload {
     seed: Option<Value>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct WinnerPreview {
     #[serde(rename = "userId")]
     user_id: String,
@@ -239,6 +239,47 @@ pub async fn ensure_giveaway_indexes(db: &mongodb::Database) -> mongodb::error::
         .map(|_| ())
 }
 
+fn draw_from_claim_document(document: &Document) -> Result<GiveawayDraw, Response> {
+    let winners = document
+        .get_array("winners")
+        .ok()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_document())
+                .map(|winner| WinnerPreview {
+                    user_id: winner
+                        .get_object_id("userId")
+                        .map(|id| id.to_hex())
+                        .unwrap_or_else(|_| read_string(winner, "userId")),
+                    name: read_string(winner, "name"),
+                    email: read_string(winner, "email"),
+                    amount: read_i64(winner, "amount"),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let seed = document
+        .get_str("seed")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(internal_error)?;
+    let request_digest = document
+        .get_str("requestDigest")
+        .map(str::to_string)
+        .map_err(|_| internal_error())?;
+    if winners.is_empty() || request_digest.is_empty() {
+        return Err(internal_error());
+    }
+    let allocated_total = read_i64(document, "allocatedTotal");
+    Ok(GiveawayDraw {
+        request_digest,
+        seed,
+        winners,
+        allocated_total,
+    })
+}
+
 fn winner_documents(winners: &[WinnerPreview]) -> Vec<Document> {
     winners
         .iter()
@@ -289,7 +330,16 @@ fn giveaway_claim_document(
 }
 
 #[derive(Debug)]
+struct GiveawayDraw {
+    request_digest: String,
+    seed: u64,
+    winners: Vec<WinnerPreview>,
+    allocated_total: i64,
+}
+
+#[derive(Debug)]
 enum GiveawayClaim {
+    NeedDraw,
     Acquired {
         id: ObjectId,
         token: String,
@@ -300,66 +350,14 @@ enum GiveawayClaim {
     InProgress,
 }
 
-async fn claim_giveaway(
+async fn resolve_existing_claim(
     campaigns: &mongodb::Collection<Document>,
-    payload: &NormalizedGiveaway,
+    existing: Document,
+    payload_digest: &str,
     operator_id: ObjectId,
     idempotency_key: &str,
-    request_digest: &str,
-    seed: u64,
-    winners: &[WinnerPreview],
-    allocated_total: i64,
 ) -> Result<GiveawayClaim, Response> {
-    let now = DateTime::now();
-    let payload_digest = giveaway_payload_digest(payload, operator_id);
-    let token = ObjectId::new().to_hex();
-    let mut claim = giveaway_claim_document(
-        payload,
-        operator_id,
-        idempotency_key,
-        request_digest,
-        seed,
-        winners,
-        allocated_total,
-        now,
-    );
-    claim.insert("claimToken", &token);
-
-    match campaigns.insert_one(claim).await {
-        Ok(result) => {
-            let Some(id) = result.inserted_id.as_object_id() else {
-                return Err(internal_error());
-            };
-            return Ok(GiveawayClaim::Acquired {
-                id,
-                token,
-                existing: None,
-            });
-        }
-        Err(error) if !is_duplicate_key_error(&error) => {
-            eprintln!("Failed to claim giveaway idempotency key: {error}");
-            return Err(internal_error());
-        }
-        Err(_) => {}
-    }
-
-    let existing = campaigns
-        .find_one(doc! {
-            "idempotencyOperatorId": operator_id,
-            "idempotencyKey": idempotency_key,
-        })
-        .await
-        .map_err(|error| {
-            eprintln!("Failed to read existing giveaway claim: {error}");
-            internal_error()
-        })?;
-    let Some(existing) = existing else {
-        return Err(internal_error());
-    };
-    let stored_payload_digest = existing
-        .get_str("payloadDigest")
-        .or_else(|_| existing.get_str("requestDigest"))
-        .unwrap_or_default();
+    let stored_payload_digest = existing.get_str("payloadDigest").unwrap_or_default();
     if stored_payload_digest != payload_digest {
         return Ok(GiveawayClaim::Conflict);
     }
@@ -373,13 +371,14 @@ async fn claim_giveaway(
             let Some(id) = existing.get_object_id("_id").ok() else {
                 return Err(internal_error());
             };
+            let token = ObjectId::new().to_hex();
             let updated = campaigns
                 .update_one(
                     doc! {
                         "_id": id,
                         "idempotencyOperatorId": operator_id,
                         "idempotencyKey": idempotency_key,
-                        "payloadDigest": &payload_digest,
+                        "payloadDigest": payload_digest,
                         GIVEAWAY_STATUS_FIELD: GIVEAWAY_STATUS_RETRYABLE,
                     },
                     doc! {
@@ -406,6 +405,94 @@ async fn claim_giveaway(
             }
         }
         _ => Ok(GiveawayClaim::InProgress),
+    }
+}
+
+async fn claim_giveaway(
+    campaigns: &mongodb::Collection<Document>,
+    payload: &NormalizedGiveaway,
+    operator_id: ObjectId,
+    idempotency_key: &str,
+    draw: Option<&GiveawayDraw>,
+) -> Result<GiveawayClaim, Response> {
+    let payload_digest = giveaway_payload_digest(payload, operator_id);
+    let key_filter = doc! {
+        "idempotencyOperatorId": operator_id,
+        "idempotencyKey": idempotency_key,
+    };
+
+    // Resolve an existing durable claim before loading the participant pool. A completed replay
+    // must not depend on the current member role/filter state or perform a new random draw.
+    match campaigns.find_one(key_filter.clone()).await {
+        Ok(Some(existing)) => {
+            return resolve_existing_claim(
+                campaigns,
+                existing,
+                &payload_digest,
+                operator_id,
+                idempotency_key,
+            )
+            .await;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("Failed to read giveaway idempotency claim: {error}");
+            return Err(internal_error());
+        }
+    }
+
+    let Some(draw) = draw else {
+        return Ok(GiveawayClaim::NeedDraw);
+    };
+    let now = DateTime::now();
+    let token = ObjectId::new().to_hex();
+    let mut claim = giveaway_claim_document(
+        payload,
+        operator_id,
+        idempotency_key,
+        &draw.request_digest,
+        draw.seed,
+        &draw.winners,
+        draw.allocated_total,
+        now,
+    );
+    claim.insert("claimToken", &token);
+
+    match campaigns.insert_one(claim).await {
+        Ok(result) => {
+            let Some(id) = result.inserted_id.as_object_id() else {
+                return Err(internal_error());
+            };
+            Ok(GiveawayClaim::Acquired {
+                id,
+                token,
+                existing: None,
+            })
+        }
+        Err(error) if is_duplicate_key_error(&error) => {
+            let existing = campaigns
+                .find_one(key_filter)
+                .await
+                .map_err(|read_error| {
+                    eprintln!("Failed to read raced giveaway idempotency claim: {read_error}");
+                    internal_error()
+                })?;
+            let Some(existing) = existing else {
+                return Err(internal_error());
+            };
+            resolve_existing_claim(
+                campaigns,
+                existing,
+                &payload_digest,
+                operator_id,
+                idempotency_key,
+            )
+            .await
+        }
+        Err(error) => {
+            eprintln!("Failed to claim giveaway idempotency key: {error}");
+            Err(internal_error())
+        }
     }
 }
 
@@ -1321,47 +1408,25 @@ pub async fn giveaway_execute(
     };
     let db = client.database(&state.mongo_db);
     let campaigns = db.collection::<Document>("balancegiveaways");
-    let members = match load_member_pool(
-        &db,
-        &normalized.participant_filter,
-        &normalized.emails,
-    )
-    .await
-    {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    let (winners, seed) = match pick_winners(
-        &members,
-        normalized.winner_count,
-        normalized.total_pool,
-        normalized.min_amount,
-        normalized.max_amount,
-        normalized.seed,
-    ) {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
     let payload_digest = giveaway_payload_digest(&normalized, proxy_user.id);
-    let request_digest = giveaway_request_digest(&normalized, proxy_user.id, &winners);
-    let allocated_total: i64 = winners.iter().map(|winner| winner.amount).sum();
 
-    let claim = match claim_giveaway(
+    // Resolve the durable claim before reading the current member pool. Completed replays must
+    // return the stored campaign even if a member was later deactivated or removed from the
+    // original participant filter; a replay must never perform a fresh draw.
+    let initial_claim = match claim_giveaway(
         &campaigns,
         &normalized,
         proxy_user.id,
         &idempotency_key,
-        &request_digest,
-        seed,
-        &winners,
-        allocated_total,
+        None,
     )
     .await
     {
         Ok(value) => value,
         Err(response) => return response,
     };
-    let (claim_id, claim_token, stored_draw) = match claim {
+
+    let (claim_id, claim_token, draw) = match initial_claim {
         GiveawayClaim::Replay(existing) => {
             return Json(ExecuteResponse {
                 message: "Bagikan saldo random (replay idempotent)",
@@ -1374,30 +1439,94 @@ pub async fn giveaway_execute(
         GiveawayClaim::Acquired {
             id,
             token,
-            existing,
-        } => (id, token, existing),
+            existing: Some(existing),
+        } => {
+            let draw = match draw_from_claim_document(&existing) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            (id, token, draw)
+        }
+        GiveawayClaim::Acquired {
+            existing: None, ..
+        } => return internal_error(),
+        GiveawayClaim::NeedDraw => {
+            let members = match load_member_pool(
+                &db,
+                &normalized.participant_filter,
+                &normalized.emails,
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            let (winners, seed) = match pick_winners(
+                &members,
+                normalized.winner_count,
+                normalized.total_pool,
+                normalized.min_amount,
+                normalized.max_amount,
+                normalized.seed,
+            ) {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            let draw = GiveawayDraw {
+                request_digest: giveaway_request_digest(&normalized, proxy_user.id, &winners),
+                seed,
+                allocated_total: winners.iter().map(|winner| winner.amount).sum(),
+                winners,
+            };
+            let claim = match claim_giveaway(
+                &campaigns,
+                &normalized,
+                proxy_user.id,
+                &idempotency_key,
+                Some(&draw),
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(response) => return response,
+            };
+            match claim {
+                GiveawayClaim::Replay(existing) => {
+                    return Json(ExecuteResponse {
+                        message: "Bagikan saldo random (replay idempotent)",
+                        campaign: campaign_from_doc(existing),
+                    })
+                    .into_response();
+                }
+                GiveawayClaim::Conflict => return giveaway_conflict_response(),
+                GiveawayClaim::InProgress => return giveaway_in_progress_response(),
+                GiveawayClaim::Acquired {
+                    id,
+                    token,
+                    existing: None,
+                } => (id, token, draw),
+                GiveawayClaim::Acquired {
+                    id,
+                    token,
+                    existing: Some(existing),
+                } => {
+                    let stored_draw = match draw_from_claim_document(&existing) {
+                        Ok(value) => value,
+                        Err(response) => return response,
+                    };
+                    (id, token, stored_draw)
+                }
+                GiveawayClaim::NeedDraw => return internal_error(),
+            }
+        }
     };
 
-    let (winners, seed, request_digest, allocated_total) = if let Some(existing) = stored_draw {
-        let stored_request_digest = existing
-            .get_str("requestDigest")
-            .unwrap_or_default()
-            .to_string();
-        let stored = campaign_from_doc(existing);
-        let stored_seed = stored.seed.parse::<u64>().ok();
-        if !stored.winners.is_empty() && stored_seed.is_some() && !stored_request_digest.is_empty() {
-            (
-                stored.winners,
-                stored_seed.unwrap_or(seed),
-                stored_request_digest,
-                stored.allocated_total,
-            )
-        } else {
-            (winners, seed, request_digest, allocated_total)
-        }
-    } else {
-        (winners, seed, request_digest, allocated_total)
-    };
+    let GiveawayDraw {
+        request_digest,
+        seed,
+        winners,
+        allocated_total,
+    } = draw;
 
     let operator = operator_brief(&proxy_user);
     match execute_giveaway_transaction(

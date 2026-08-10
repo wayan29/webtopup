@@ -76,6 +76,25 @@ test('gateway idempotency key normalization is bounded and rejects duplicates', 
     assert.equal(validRequest.headers['idempotency-key'], 'giveaway-2026-01');
 });
 
+test('giveaway read and preview routes precede the voucher catch-all', () => {
+    const sourcePath = join(__dirname, '..', '..', 'src', 'routes', 'apiV2ProxyRoutes.ts');
+    const source = readFileSync(sourcePath, 'utf8');
+    const catchAll = source.indexOf("app.all('/vouchers*'");
+    for (const route of [
+        "app.get('/vouchers/giveaways'",
+        "app.get('/vouchers/giveaways/:id'",
+        "app.post('/vouchers/giveaways/preview'",
+    ]) {
+        const position = source.indexOf(route);
+        assert.ok(position >= 0, `${route} route is missing`);
+        assert.ok(position < catchAll, `${route} must precede voucher catch-all`);
+    }
+    const routeStart = source.indexOf("app.get('/vouchers/giveaways'");
+    const route = source.slice(routeStart, catchAll);
+    assert.match(route, /authenticate/);
+    assert.match(route, /hasPermission\('manageVouchers'\)/);
+});
+
 test('giveaway execution has dedicated step-up and idempotency gateway route', () => {
     const sourcePath = join(__dirname, '..', '..', 'src', 'routes', 'apiV2ProxyRoutes.ts');
     const source = readFileSync(sourcePath, 'utf8');

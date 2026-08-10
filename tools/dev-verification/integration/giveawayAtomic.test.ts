@@ -36,7 +36,11 @@ test('giveaway execution is atomic, permanently idempotent, and fails closed wit
   let primary: unknown = null;
   let actorId: ObjectId | undefined;
   let targetId: ObjectId | undefined;
+  let extraUserId: ObjectId | undefined;
   let originalBalance = 0;
+  let originalExtraBalance = 0;
+  let originalTargetRole = 'member';
+  let originalExtraRole = 'member';
   let originalPermissions: Record<string, unknown> | undefined;
   const campaignNames: string[] = [];
   const idempotencyKeys: string[] = [];
@@ -47,12 +51,21 @@ test('giveaway execution is atomic, permanently idempotent, and fails closed wit
     const users = db.collection('users');
     const actor = await users.findOne({ email: actorEmail, task14Fixture: true }, { projection: { _id: 1, email: 1, role: 1, permissions: 1 } });
     const target = await users.findOne({ email: targetEmail, task14Fixture: true }, { projection: { _id: 1, balance: 1, role: 1 } });
-    assert.ok(actor && target, 'fixture users must exist');
+    const extraFixture = manifest.find((item) => item.alias === 'member-standard');
+    assert.ok(actor && target && extraFixture, 'fixture users must exist');
+    const extraEmail = `member-standard.${extraFixture.fixtureRunId}@task14.invalid`;
+    const extra = await users.findOne({ email: extraEmail, task14Fixture: true }, { projection: { _id: 1, balance: 1, role: 1 } });
+    assert.ok(extra, 'second member fixture must exist');
     actorId = actor._id;
     targetId = target._id;
+    extraUserId = extra._id;
     assert.equal(actor.role, 'admin');
     assert.equal(target.role, 'member');
+    assert.equal(extra.role, 'member');
     originalBalance = Number(target.balance ?? 0);
+    originalExtraBalance = Number(extra.balance ?? 0);
+    originalTargetRole = String(target.role ?? 'member');
+    originalExtraRole = String(extra.role ?? 'member');
     originalPermissions = { ...(actor.permissions as Record<string, unknown> ?? {}) };
 
     await users.updateOne({ _id: actorId }, { $set: { 'permissions.manageVouchers': true } });
@@ -100,11 +113,13 @@ test('giveaway execution is atomic, permanently idempotent, and fails closed wit
     assert.equal(await db.collection('userbalanceadjustments').countDocuments({ source: 'balance_giveaway', idempotencyKey: firstKey }), 1);
     assert.equal(await db.collection('balancegiveaways').countDocuments({ _id: new ObjectId(firstCampaignId), status: 'completed' }), 1);
 
+    await users.updateOne({ _id: targetId }, { $set: { role: 'suspended' } });
     const replay = await execute(rustBase, trustedHeaders, firstPayload, firstKey);
     assert.equal(replay.status, 200, replay.text);
     assert.equal(replay.body.campaign._id, firstCampaignId);
     assert.equal(await users.findOne({ _id: targetId }).then((row) => Number(row?.balance ?? 0)), originalBalance + 10_000);
     assert.equal(await db.collection('userbalanceadjustments').countDocuments({ source: 'balance_giveaway', idempotencyKey: firstKey }), 1);
+    await users.updateOne({ _id: targetId }, { $set: { role: originalTargetRole } });
 
     const conflict = await execute(rustBase, trustedHeaders, { ...firstPayload, note: 'different payload' }, firstKey);
     assert.equal(conflict.status, 409, conflict.text);
@@ -134,6 +149,37 @@ test('giveaway execution is atomic, permanently idempotent, and fails closed wit
     assert.equal(concurrentCampaigns[0]?.status, 'completed');
     assert.equal(await db.collection('userbalanceadjustments').countDocuments({ source: 'balance_giveaway', idempotencyKey: concurrentKey }), 1);
     assert.equal(await users.findOne({ _id: targetId }).then((row) => Number(row?.balance ?? 0)), originalBalance + 17_000);
+
+    const failureKey = crypto.randomUUID();
+    idempotencyKeys.push(failureKey);
+    const failureName = `${runId}-abort-handler`;
+    campaignNames.push(failureName);
+    const targetBeforeFailure = Number((await users.findOne({ _id: targetId }, { projection: { balance: 1 } }))?.balance ?? 0);
+    await users.updateOne({ _id: extraUserId }, { $set: { balance: 'corrupt-balance' } });
+    const failurePayload = {
+      name: failureName,
+      totalPool: 2_000,
+      winnerCount: 2,
+      minAmount: 1_000,
+      maxAmount: 1_000,
+      participantFilter: 'emails',
+      emails: `${targetEmail},${extraEmail}`,
+      note: 'atomic handler abort',
+      seed: '773311',
+    };
+    const failedExecution = await execute(rustBase, trustedHeaders, failurePayload, failureKey);
+    assert.equal(failedExecution.status, 500, failedExecution.text);
+    assert.equal(await db.collection('balancegiveaways').countDocuments({ name: failureName, status: 'retryable' }), 1);
+    assert.equal(await db.collection('userbalanceadjustments').countDocuments({ source: 'balance_giveaway', idempotencyKey: failureKey }), 0);
+    assert.equal(await users.findOne({ _id: targetId }).then((row) => Number(row?.balance ?? 0)), targetBeforeFailure);
+    assert.equal(await users.findOne({ _id: extraUserId }).then((row) => row?.balance), 'corrupt-balance');
+
+    await users.updateOne({ _id: extraUserId }, { $set: { balance: originalExtraBalance } });
+    const recoveredExecution = await execute(rustBase, trustedHeaders, failurePayload, failureKey);
+    assert.equal(recoveredExecution.status, 200, recoveredExecution.text);
+    assert.equal(await db.collection('userbalanceadjustments').countDocuments({ source: 'balance_giveaway', idempotencyKey: failureKey }), 2);
+    assert.equal(await users.findOne({ _id: targetId }).then((row) => Number(row?.balance ?? 0)), targetBeforeFailure + 1_000);
+    assert.equal(await users.findOne({ _id: extraUserId }).then((row) => Number(row?.balance ?? 0)), originalExtraBalance + 1_000);
 
     await assertAbortLeavesNoGiveawayEffect(shared.MONGO_URI, db, targetId, runId);
     const disabledPayload = {
@@ -182,7 +228,8 @@ test('giveaway execution is atomic, permanently idempotent, and fails closed wit
       if (campaignNames.length) await db.collection('balancegiveaways').deleteMany({ name: { $in: campaignNames } });
       if (idempotencyKeys.length) await db.collection('userbalanceadjustments').deleteMany({ source: 'balance_giveaway', idempotencyKey: { $in: idempotencyKeys } });
       if (actorId && originalPermissions) await db.collection('users').updateOne({ _id: actorId }, { $set: { permissions: originalPermissions } });
-      if (targetId) await db.collection('users').updateOne({ _id: targetId }, { $set: { balance: originalBalance } });
+      if (targetId) await db.collection('users').updateOne({ _id: targetId }, { $set: { balance: originalBalance, role: originalTargetRole } });
+      if (extraUserId) await db.collection('users').updateOne({ _id: extraUserId }, { $set: { balance: originalExtraBalance, role: originalExtraRole } });
       if (actorId) await db.collection('authsessions').deleteMany({ userId: actorId });
     } catch (error) {
       primary = primary ? new AggregateError([primary, error], 'giveaway verification cleanup failed') : error;
