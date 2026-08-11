@@ -5,9 +5,13 @@ import { verificationMatrix } from '../verificationMatrix.ts';
 test('aggregate matrix names every required evidence group exactly once', () => {
   const matrix = verificationMatrix(); const names = matrix.map(({ name }) => name);
   assert.equal(new Set(names).size, names.length); assert.ok(matrix.every(({ required }) => required));
-  for (const name of ['unit', 'client-build', 'server-build', 'rust-build', 'mongo', 'public-origin', 'login-return-to-desktop', 'finance-idempotency', 'rollout-transition', 'diff-check', 'report-secrecy', 'stopped-state']) assert.ok(names.includes(name));
+  for (const name of ['unit', 'client-build', 'server-build', 'rust-build', 'mongo', 'public-origin', 'login-return-to-desktop', 'team-access-desktop', 'team-access-mobile', 'catalog-permissions', 'finance-idempotency', 'rollout-transition', 'diff-check', 'report-secrecy', 'stopped-state']) assert.ok(names.includes(name));
   for (const platform of ['desktop', 'mobile']) for (const spec of ['session-cookies', 'session-lifecycle', 'session-multitab', 'session-device-replacement', 'session-enrollment', 'session-step-up']) assert.ok(names.includes(`${spec}-${platform}`));
   assert.equal(matrix.find(({ name }) => name === 'session-cookies-desktop')?.profile, 'session-cs');
+  for (const name of ['team-access-desktop', 'team-access-mobile', 'catalog-permissions']) {
+    assert.equal(matrix.find(({ name: candidate }) => candidate === name)?.profile, 'session-cs');
+    assert.equal(matrix.find(({ name: candidate }) => candidate === name)?.isolated, true);
+  }
   assert.equal(matrix.find(({ name }) => name === 'public-origin')?.profile, 'session-device-policy');
   assert.equal(matrix.find(({ name }) => name === 'session-refresh-race-desktop')?.profile, 'session-cs-fault');
   assert.equal(matrix.find(({ name }) => name === 'session-response-loss-mobile')?.profile, 'session-cs-fault');
