@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
 import {
     TEAM_PERMISSION_KEYS,
@@ -8,6 +10,13 @@ import {
     summarizeEffectiveTeamAccess,
     type EffectiveTeamAccess,
 } from '../../../client/src/lib/teamAccess.ts';
+
+test('auth store delegates permission resolution to the canonical client helper', () => {
+    const root = path.resolve(process.cwd());
+    const source = fs.readFileSync(path.join(root, 'client/src/store/useAuthStore.ts'), 'utf8');
+    assert.match(source, /normalizeTeamPermissions/);
+    assert.doesNotMatch(source, /const hasResolvedPermission/);
+});
 
 test('sparse permissions fail closed and canonical implications are applied', () => {
     const sparse = normalizeTeamPermissions({

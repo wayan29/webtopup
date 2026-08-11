@@ -358,6 +358,20 @@ mod auth_2fa_enrollment_tests {
     use mongodb::bson::DateTime;
 
     #[test]
+    fn deposit_permission_approval_implies_view_only() {
+        assert!(team_user_has_any_permission(
+            "admin",
+            &["approveDeposits".to_string()],
+            &["viewDeposits"],
+        ));
+        assert!(!team_user_has_any_permission(
+            "admin",
+            &["approveDeposits".to_string()],
+            &["viewProducts"],
+        ));
+    }
+
+    #[test]
     fn auth_2fa_enrollment_assigns_exact_seven_day_utc_deadline() {
         let assigned_at = DateTime::from_millis(1_800_000_000_000);
         assert_eq!(

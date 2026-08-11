@@ -17,40 +17,44 @@ export interface AuthRequest extends FastifyRequest {
 
 export type PermissionKey = keyof ITeamPermissions;
 
-const hasResolvedPermission = (permissions: ITeamPermissions | undefined, permission: PermissionKey) => {
+export const hasResolvedPermission = (permissions: ITeamPermissions | undefined, permission: PermissionKey) => {
     if (!permissions) {
         return false;
     }
 
-    if (permissions[permission]) {
+    if (permissions[permission] === true) {
         return true;
     }
 
-    if (permission === 'viewTeam' && permissions.manageTeam) {
+    if (permission === 'viewTeam' && permissions.manageTeam === true) {
         return true;
     }
 
-    if (permission === 'viewVendors' && permissions.manageVendors) {
+    if (permission === 'viewVendors' && permissions.manageVendors === true) {
         return true;
     }
 
-    if (permission === 'viewProducts' && permissions.manageProducts) {
+    if (permission === 'viewProducts' && permissions.manageProducts === true) {
         return true;
     }
 
-    if (permission === 'manageVouchers' && permissions.manageProducts) {
+    if (permission === 'manageVouchers' && permissions.manageProducts === true) {
         return true;
     }
 
-    if (permission === 'viewPayment' && permissions.managePayment) {
+    if (permission === 'viewPayment' && permissions.managePayment === true) {
         return true;
     }
 
-    if (permission === 'viewUsers' && permissions.manageUsers) {
+    if (permission === 'viewUsers' && permissions.manageUsers === true) {
         return true;
     }
 
-    if (permission === 'viewSettings' && permissions.manageSettings) {
+    if (permission === 'viewSettings' && permissions.manageSettings === true) {
+        return true;
+    }
+
+    if (permission === 'viewDeposits' && permissions.approveDeposits === true) {
         return true;
     }
 

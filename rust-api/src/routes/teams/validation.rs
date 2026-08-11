@@ -115,6 +115,9 @@ pub(super) fn build_permissions(input: Option<&Value>, role: &str) -> Document {
     if permissions.get_bool("manageVendors").unwrap_or(false) {
         permissions.insert("viewVendors", true);
     }
+    if permissions.get_bool("approveDeposits").unwrap_or(false) {
+        permissions.insert("viewDeposits", true);
+    }
     permissions
 }
 
@@ -124,13 +127,29 @@ pub(super) fn clamp_permissions_to_actor(
 ) -> Document {
     for key in TEAM_PERMISSIONS {
         if permissions.get_bool(key).unwrap_or(false)
-            && !actor_permissions.get_bool(key).unwrap_or(false)
+            && !has_effective_permission(actor_permissions, key)
         {
             permissions.insert(key, false);
         }
     }
     permissions.insert("viewDashboard", true);
     permissions
+}
+
+fn has_effective_permission(permissions: &Document, permission: &str) -> bool {
+    permissions.get_bool(permission).unwrap_or(false)
+        || match permission {
+            "viewDeposits" => permissions.get_bool("approveDeposits").unwrap_or(false),
+            "viewProducts" | "manageVouchers" => {
+                permissions.get_bool("manageProducts").unwrap_or(false)
+            }
+            "viewPayment" => permissions.get_bool("managePayment").unwrap_or(false),
+            "viewUsers" => permissions.get_bool("manageUsers").unwrap_or(false),
+            "viewTeam" => permissions.get_bool("manageTeam").unwrap_or(false),
+            "viewSettings" => permissions.get_bool("manageSettings").unwrap_or(false),
+            "viewVendors" => permissions.get_bool("manageVendors").unwrap_or(false),
+            _ => false,
+        }
 }
 
 pub(super) fn ensure_manage_scope(actor_role: &str, target_role: &str) -> Result<(), Response> {
@@ -164,4 +183,36 @@ pub(super) fn build_update_summary(changes: &[&str]) -> String {
         return "Tidak ada perubahan terdeteksi".to_string();
     }
     format!("Memperbarui {}", changes.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deposit_permission_normalization_sets_view() {
+        let input = serde_json::json!({
+            "approveDeposits": true,
+            "viewDeposits": false,
+        });
+        let permissions = build_permissions(Some(&input), "cs");
+        assert_eq!(permissions.get_bool("approveDeposits"), Ok(true));
+        assert_eq!(permissions.get_bool("viewDeposits"), Ok(true));
+    }
+
+    #[test]
+    fn deposit_permission_clamp_uses_effective_actor() {
+        let target = doc! {
+            "approveDeposits": true,
+            "viewDeposits": true,
+        };
+        let actor = doc! {
+            "approveDeposits": true,
+            "viewDeposits": false,
+        };
+
+        let clamped = clamp_permissions_to_actor(target, &actor);
+        assert_eq!(clamped.get_bool("approveDeposits"), Ok(true));
+        assert_eq!(clamped.get_bool("viewDeposits"), Ok(true));
+    }
 }

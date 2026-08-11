@@ -20,32 +20,17 @@ import {
     type LoginAudience,
 } from '../auth/loginIntent.ts';
 import { buildUnlockPayload } from '../auth/unlockPayload.ts';
+import {
+    normalizeTeamPermissions,
+    type TeamPermissionInput,
+    type TeamPermissionKey,
+} from '../lib/teamAccess.ts';
 import type { AuthChannel } from '../auth/channel.ts';
 import { computeServerTimeOffsetMs } from '../auth/twoFactorEnrollmentClock.ts';
 import { applyValidatedLoginResponse, getAuthCoordinator, initAuthSessionRuntime, parseValidatedLoginResponse, parseValidatedUnlockResponse } from '../auth/sessionRuntime.ts';
 import type { AuthPhase as CoordinatorPhase } from '../auth/types.ts';
 
-interface Permissions {
-    viewDashboard?: boolean;
-    viewReports?: boolean;
-    viewTransactions?: boolean;
-    processManualTransaction?: boolean;
-    viewDeposits?: boolean;
-    approveDeposits?: boolean;
-    viewProducts?: boolean;
-    manageProducts?: boolean;
-    manageVouchers?: boolean;
-    viewPayment?: boolean;
-    managePayment?: boolean;
-    viewUsers?: boolean;
-    manageUsers?: boolean;
-    viewTeam?: boolean;
-    manageTeam?: boolean;
-    viewSettings?: boolean;
-    manageSettings?: boolean;
-    viewVendors?: boolean;
-    manageVendors?: boolean;
-}
+type Permissions = TeamPermissionInput;
 
 export interface User {
     id: string;
@@ -110,43 +95,8 @@ interface AuthState {
     syncProfile: () => Promise<void>;
     lockForIdle: () => void;
     unlockIdleSession: (password: string, otp?: string) => Promise<void>;
-    hasPermission: (permission: keyof Permissions) => boolean;
+    hasPermission: (permission: TeamPermissionKey) => boolean;
 }
-
-const hasResolvedPermission = (permissions: Permissions | undefined, permission: keyof Permissions) => {
-    if (!permissions) return false;
-    if (permissions[permission]) return true;
-
-    if (permission === 'viewTeam' && permissions.manageTeam) {
-        return true;
-    }
-
-    if (permission === 'viewVendors' && permissions.manageVendors) {
-        return true;
-    }
-
-    if (permission === 'viewProducts' && permissions.manageProducts) {
-        return true;
-    }
-
-    if (permission === 'manageVouchers' && permissions.manageProducts) {
-        return true;
-    }
-
-    if (permission === 'viewPayment' && permissions.managePayment) {
-        return true;
-    }
-
-    if (permission === 'viewUsers' && permissions.manageUsers) {
-        return true;
-    }
-
-    if (permission === 'viewSettings' && permissions.manageSettings) {
-        return true;
-    }
-
-    return false;
-};
 
 /**
  * Authoritative install/bootstrap/profile/session replacement offset resolver.
@@ -763,7 +713,7 @@ export const useAuthStore = create<AuthState>((set, get) => {
             const { user } = get();
             if (!user) return false;
             if (user.role === 'owner') return true;
-            return hasResolvedPermission(user.permissions, permission);
+            return normalizeTeamPermissions(user.permissions)[permission];
         },
     };
 });
