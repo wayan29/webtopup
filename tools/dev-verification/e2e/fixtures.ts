@@ -55,12 +55,16 @@ const currentOtp = (secret: string): string => {
 
 export async function loginFixture(alias: string): Promise<FixtureLogin> {
   const [manifest, secrets] = await Promise.all([
-    fs.readFile(path.join(root, '.dev-verification', 'fixture-manifest.json'), 'utf8').then((text) => JSON.parse(text) as Array<{ alias: string; fixtureRunId: string; role: 'member' | 'cs' | 'admin' }>),
+    fs.readFile(path.join(root, '.dev-verification', 'fixture-manifest.json'), 'utf8').then((text) => JSON.parse(text) as Array<{ alias: string; fixtureRunId: string; role: 'member' | 'cs' | 'admin' | 'owner' }>),
     envFile(path.join(root, '.dev-verification', 'env', 'node.env')),
   ]);
   const fixture = manifest.find((item) => item.alias === alias);
   if (!fixture) throw new Error('required synthetic fixture alias is unavailable');
-  const password = fixture.role === 'member' ? secrets.FIXTURE_MEMBER_PASSWORD : fixture.role === 'cs' ? secrets.FIXTURE_STAFF_PASSWORD : secrets.FIXTURE_ADMIN_PASSWORD;
+  const password = fixture.role === 'member'
+    ? secrets.FIXTURE_MEMBER_PASSWORD
+    : fixture.role === 'cs'
+      ? secrets.FIXTURE_STAFF_PASSWORD
+      : secrets.FIXTURE_ADMIN_PASSWORD;
   if (!password) throw new Error('required synthetic fixture credential is unavailable');
   // Login channels are separate and server-enforced: a staff credential posted to the member
   // endpoint is rejected with the generic message, so the fixture must carry its own channel.

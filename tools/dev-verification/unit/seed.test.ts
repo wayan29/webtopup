@@ -19,6 +19,14 @@ test('fixture definitions are scenario-isolated and marked', () => {
   assert.ok(definitions.some((item) => item.alias === 'staff-step-up-mobile' && item.scenario === 'staff-step-up-mobile'));
   assert.ok(definitions.some((item) => item.alias === 'finance-actor' && item.role === 'admin'));
   assert.ok(definitions.some((item) => item.alias === 'finance-target' && item.role === 'member'));
+  assert.ok(definitions.some((item) => item.alias === 'team-access-viewer-desktop'));
+  assert.ok(definitions.some((item) => item.alias === 'team-access-viewer-mobile'));
+  assert.ok(definitions.some((item) => item.alias === 'team-access-owner-target' && item.role === 'owner'));
+  assert.ok(definitions.some((item) => item.alias === 'team-access-suspended-target' && item.active === false));
+  assert.ok(definitions.some((item) => item.alias === 'catalog-viewer'));
+  assert.ok(definitions.some((item) => item.alias === 'catalog-manager'));
+  assert.ok(definitions.some((item) => item.alias === 'catalog-viewer' && item.permissions?.viewProducts === true && item.permissions?.manageProducts === false));
+  assert.ok(definitions.some((item) => item.alias === 'catalog-manager' && item.permissions?.manageProducts === true));
   assert.ok(definitions.some((item) => item.scenario === 'member-device-limit'));
   assert.deepEqual(definitions.filter((item) => item.scenario.includes('login-return')).map((item) => ({ alias: item.alias, role: item.role, twoFactorEnabled: item.twoFactorEnabled })), [
     { alias: 'member-login-return-a', role: 'member', twoFactorEnabled: false },

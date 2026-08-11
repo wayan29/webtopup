@@ -11,10 +11,11 @@ export type FixtureDefinition = {
   alias: string;
   scenario: string;
   email: string;
-  role: 'member' | 'cs' | 'admin';
+  role: 'member' | 'cs' | 'admin' | 'owner';
   task14Fixture: true;
   fixtureRunId: string;
-  active: true;
+  active: boolean;
+  permissions?: Record<string, boolean>;
   twoFactorEnabled: boolean;
   twoFactorEnrollmentRequiredAt?: Date;
   activeDeviceCount: number;
@@ -94,6 +95,37 @@ export function fixtureDefinitions(fixtureRunId: string, now = new Date()): Fixt
     make('refresh-healthy', 'refresh-family-isolation', 'member'),
     make('finance-actor', 'finance-idempotency', 'admin', { twoFactorEnabled: true }),
     make('finance-target', 'finance-idempotency-target', 'member', { twoFactorEnabled: false }),
+    make('team-access-viewer-desktop', 'team-access-review-desktop', 'cs', {
+      twoFactorEnabled: false,
+      twoFactorEnrollmentRequiredAt: future,
+      permissions: { viewDashboard: true, viewTeam: true },
+    }),
+    make('team-access-viewer-mobile', 'team-access-review-mobile', 'cs', {
+      twoFactorEnabled: false,
+      twoFactorEnrollmentRequiredAt: future,
+      permissions: { viewDashboard: true, viewTeam: true },
+    }),
+    make('team-access-owner-target', 'team-access-owner-target', 'owner', {
+      twoFactorEnabled: false,
+      twoFactorEnrollmentRequiredAt: future,
+      permissions: {},
+    }),
+    make('team-access-suspended-target', 'team-access-suspended-target', 'cs', {
+      active: false,
+      twoFactorEnabled: false,
+      twoFactorEnrollmentRequiredAt: future,
+      permissions: { viewDashboard: true, viewTeam: true },
+    }),
+    make('catalog-viewer', 'catalog-permission-viewer', 'cs', {
+      twoFactorEnabled: false,
+      twoFactorEnrollmentRequiredAt: future,
+      permissions: { viewProducts: true, manageProducts: false },
+    }),
+    make('catalog-manager', 'catalog-permission-manager', 'cs', {
+      twoFactorEnabled: false,
+      twoFactorEnrollmentRequiredAt: future,
+      permissions: { viewProducts: false, manageProducts: true },
+    }),
   ];
 }
 
@@ -144,6 +176,7 @@ async function seedFixtureDefinitions(
     member: secrets.FIXTURE_MEMBER_PASSWORD,
     cs: secrets.FIXTURE_STAFF_PASSWORD,
     admin: secrets.FIXTURE_ADMIN_PASSWORD,
+    owner: secrets.FIXTURE_ADMIN_PASSWORD,
   };
   const requiredRoles = new Set(definitions.map(({ role }) => role));
   if ([...requiredRoles].some((role) => !passwords[role] || passwords[role]!.length < 12)) throw new Error('fixture passwords are unavailable');
@@ -158,15 +191,15 @@ async function seedFixtureDefinitions(
       const user = new User({
         email: fixture.email, password: passwords[fixture.role], name: `Task 14 ${fixture.alias}`,
         role: fixture.role, level: 'basic', balance: fixture.scenario === 'finance-idempotency' ? 100_000 : 0,
-        permissions: fixture.scenario === 'finance-idempotency'
-          ? { manageUsers: true, processManualTransaction: true }
-          : fixture.scenario.startsWith('staff-login-return')
-            ? { manageVendors: true }
-            : undefined,
+        permissions: {
+          ...(fixture.permissions ?? {}),
+          ...(fixture.scenario === 'finance-idempotency' ? { manageUsers: true, processManualTransaction: true } : {}),
+          ...(fixture.scenario.startsWith('staff-login-return') ? { manageVendors: true } : {}),
+        },
         points: 0, twoFactorEnabled: fixture.twoFactorEnabled, twoFactorEnrollmentRequiredAt: fixture.twoFactorEnrollmentRequiredAt,
         twoFactorSecret: fixture.twoFactorEnabled && (fixture.role === 'admin' || fixture.scenario.startsWith('all-device-logout-') || fixture.scenario.startsWith('staff-step-up-') || fixture.scenario === 'staff-login-return-2fa') ? syntheticTotpSecret() : undefined,
         twoFactorEnrollmentCompletedAt: fixture.twoFactorEnabled && (fixture.role === 'admin' || fixture.scenario.startsWith('all-device-logout-')) ? new Date() : undefined,
-        sessionVersion: 0, active: true,
+        sessionVersion: 0, active: fixture.active,
       });
       await user.save();
       await User.collection.updateOne({ _id: user._id }, { $set: {
