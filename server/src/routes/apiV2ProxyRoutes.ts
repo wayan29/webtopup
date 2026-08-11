@@ -1387,16 +1387,35 @@ const proxyUnlock = async (request: AuthRequest, reply: FastifyReply) => {
     app.get('/margins', { preHandler: [authenticate, hasPermission('viewProducts')] }, proxyRequest);
     app.put('/margins', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);
     app.all('/notifications/*', { preHandler: [authenticate, hasPermission('viewDashboard')] }, proxyRequest);
+
+    // Catalog reads are deliberately explicit and precede mutation wildcards. A staff member
+    // with viewProducts may inspect catalog data without receiving any write capability.
+    app.get('/categories/admin/all', { preHandler: [authenticate, hasPermission('viewProducts')] }, proxyRequest);
+    app.get('/operators/admin/all', { preHandler: [authenticate, hasPermission('viewProducts')] }, proxyRequest);
+    app.get('/operators/admin/:id', { preHandler: [authenticate, hasPermission('viewProducts')] }, proxyRequest);
+    app.get('/product-types/admin/all', { preHandler: [authenticate, hasPermission('viewProducts')] }, proxyRequest);
+    app.get('/product-types/admin/:id', { preHandler: [authenticate, hasPermission('viewProducts')] }, proxyRequest);
+    app.get('/products/admin/all', { preHandler: [authenticate, hasPermission('viewProducts')] }, proxyRequest);
+    app.get('/products/admin/sorting', { preHandler: [authenticate, hasPermission('viewProducts')] }, proxyRequest);
+
     app.post('/categories/admin/create', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);
-    app.all('/categories/admin/sort-order', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);
+    app.put('/categories/admin/sort-order', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);
     app.put('/categories/admin/:id', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);
     app.delete('/categories/admin/:id', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);
     app.all('/categories/admin/*', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);
     app.all('/flash-sales/admin/*', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);
+    app.post('/operators/admin/create', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);
+    app.put('/operators/admin/sort-order', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);
+    app.put('/operators/admin/:id', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);
+    app.delete('/operators/admin/:id', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);
     app.all('/operators/admin/*', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);
+    app.post('/product-types/admin/create', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);
+    app.put('/product-types/admin/sort-order', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);
+    app.put('/product-types/admin/:id', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);
+    app.delete('/product-types/admin/:id', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);
     app.all('/product-types/admin/*', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);
-    app.all('/products/admin/sort-order', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);
-    app.all('/products/admin/sort-by-price', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);
+    app.post('/products/admin/sort-order', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);
+    app.post('/products/admin/sort-by-price', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);
     app.all('/products/admin/*', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);
     app.all('/points/history', { preHandler: [authenticate] }, proxyRequest);
     app.all('/points/*', { preHandler: [authenticate, hasPermission('manageProducts')] }, proxyRequest);

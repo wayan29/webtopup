@@ -117,3 +117,77 @@ test('giveaway execution has dedicated step-up and idempotency gateway route', (
     assert.ok(criticalPatterns.includes("'/vouchers/giveaways'"));
     assert.ok(criticalPatterns.includes("'/api/v2/vouchers/giveaways'"));
 });
+
+test('catalog read routes use viewProducts before mutation catch-alls', () => {
+    const sourcePath = join(__dirname, '..', '..', 'src', 'routes', 'apiV2ProxyRoutes.ts');
+    const source = readFileSync(sourcePath, 'utf8');
+    const reads = [
+        "app.get('/categories/admin/all'",
+        "app.get('/operators/admin/all'",
+        "app.get('/operators/admin/:id'",
+        "app.get('/product-types/admin/all'",
+        "app.get('/product-types/admin/:id'",
+        "app.get('/products/admin/all'",
+        "app.get('/products/admin/sorting'",
+    ];
+    const catchAlls = [
+        "app.all('/categories/admin/*'",
+        "app.all('/operators/admin/*'",
+        "app.all('/product-types/admin/*'",
+        "app.all('/products/admin/*'",
+    ];
+
+    for (const route of reads) {
+        const position = source.indexOf(route);
+        assert.ok(position >= 0, `${route} route is missing`);
+        const nextRoute = source.indexOf('\n    app.', position + route.length);
+        const block = source.slice(position, nextRoute < 0 ? source.length : nextRoute);
+        assert.match(block, /hasPermission\('viewProducts'\)/, `${route} must use viewProducts`);
+    }
+
+    for (const catchAll of catchAlls) {
+        const position = source.indexOf(catchAll);
+        assert.ok(position >= 0, `${catchAll} route is missing`);
+        assert.match(source.slice(position, position + 180), /hasPermission\('manageProducts'\)/);
+    }
+
+    const earliestMutationCatchAll = Math.min(...catchAlls.map((route) => source.indexOf(route)));
+    for (const route of reads) {
+        assert.ok(source.indexOf(route) < earliestMutationCatchAll, `${route} must precede catalog catch-alls`);
+    }
+});
+
+test('catalog mutations use explicit methods and manageProducts', () => {
+    const sourcePath = join(__dirname, '..', '..', 'src', 'routes', 'apiV2ProxyRoutes.ts');
+    const source = readFileSync(sourcePath, 'utf8');
+    const mutations = [
+        "app.post('/categories/admin/create'",
+        "app.put('/categories/admin/sort-order'",
+        "app.put('/categories/admin/:id'",
+        "app.delete('/categories/admin/:id'",
+        "app.post('/operators/admin/create'",
+        "app.put('/operators/admin/sort-order'",
+        "app.put('/operators/admin/:id'",
+        "app.delete('/operators/admin/:id'",
+        "app.post('/product-types/admin/create'",
+        "app.put('/product-types/admin/sort-order'",
+        "app.put('/product-types/admin/:id'",
+        "app.delete('/product-types/admin/:id'",
+        "app.post('/products'",
+        "app.put('/products/:id'",
+        "app.delete('/products/:id'",
+        "app.post('/products/admin/sort-order'",
+        "app.post('/products/admin/sort-by-price'",
+    ];
+
+    for (const route of mutations) {
+        const position = source.indexOf(route);
+        assert.ok(position >= 0, `${route} route is missing`);
+        const nextRoute = source.indexOf('\n    app.', position + route.length);
+        const block = source.slice(position, nextRoute < 0 ? source.length : nextRoute);
+        assert.match(block, /hasPermission\('manageProducts'\)/, `${route} must use manageProducts`);
+    }
+
+    assert.doesNotMatch(source, /app\.all\('\/(?:categories|operators|product-types)\/admin\/sort-order'/);
+    assert.doesNotMatch(source, /app\.all\('\/products\/admin\/sort-(?:order|by-price)'/);
+});
