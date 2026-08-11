@@ -40,7 +40,7 @@ pub async fn product_types_update_sort_order(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<SortOrderPayload>,
 ) -> Response {
-    if let Err(response) = require_proxy_context(&headers, &state) {
+    if let Err(response) = require_permission(&headers, &state, "manageProducts").await {
         return response;
     }
     let Some(client) = &state.mongo_client else {
@@ -220,6 +220,9 @@ pub async fn product_types_admin_all(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Response {
+    if let Err(response) = require_permission(&headers, &state, "viewProducts").await {
+        return response;
+    }
     product_types_admin_all_inner(headers, state).await
 }
 
@@ -269,7 +272,7 @@ pub async fn product_type_admin_detail(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(response) = require_proxy_context(&headers, &state) {
+    if let Err(response) = require_permission(&headers, &state, "viewProducts").await {
         return response;
     }
     let Some(client) = &state.mongo_client else {
@@ -316,7 +319,7 @@ pub async fn product_type_admin_create(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<UpdateProductTypePayload>,
 ) -> Response {
-    if let Err(response) = require_proxy_context(&headers, &state) {
+    if let Err(response) = require_permission(&headers, &state, "manageProducts").await {
         return response;
     }
     let Some(client) = &state.mongo_client else {
@@ -519,7 +522,7 @@ pub async fn product_type_admin_update(
     Path(id): Path<String>,
     Json(payload): Json<UpdateProductTypePayload>,
 ) -> Response {
-    if let Err(response) = require_proxy_context(&headers, &state) {
+    if let Err(response) = require_permission(&headers, &state, "manageProducts").await {
         return response;
     }
     let Some(client) = &state.mongo_client else {
@@ -760,7 +763,7 @@ pub async fn product_type_admin_delete(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(response) = require_proxy_context(&headers, &state) {
+    if let Err(response) = require_permission(&headers, &state, "manageProducts").await {
         return response;
     }
     let Some(client) = &state.mongo_client else {

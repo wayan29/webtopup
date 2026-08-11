@@ -20,7 +20,7 @@ pub async fn admin_sorting(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ProductSortingQuery>,
 ) -> Response {
-    if let Err(response) = require_permission(&headers, &state, "manageProducts").await {
+    if let Err(response) = require_permission(&headers, &state, "viewProducts").await {
         return response;
     }
     let Some(client) = &state.mongo_client else {

@@ -25,7 +25,7 @@ pub async fn admin_all(
     State(state): State<Arc<AppState>>,
     Query(query): Query<AdminProductsQuery>,
 ) -> Response {
-    if let Err(response) = require_permission(&headers, &state, "manageProducts").await {
+    if let Err(response) = require_permission(&headers, &state, "viewProducts").await {
         return response;
     }
 

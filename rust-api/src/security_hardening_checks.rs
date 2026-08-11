@@ -79,7 +79,7 @@ fn sensitive_routes_use_db_backed_authorization_helpers() {
     assert!(products.contains("require_permission(&headers, &state, \"manageProducts\")"));
     assert!(product_mutations.contains("require_permission(&headers, &state, \"manageProducts\")"));
     assert!(product_sorting.contains("require_permission(&headers, &state, \"manageProducts\")"));
-    assert!(product_read.contains("require_permission(&headers, &state, \"manageProducts\")"));
+    assert!(product_read.contains("require_permission(&headers, &state, \"viewProducts\")"));
     assert!(payment_methods.contains("require_permission(&headers, &state, \"viewPayment\")"));
     assert!(payment_methods.contains("require_permission(&headers, &state, \"managePayment\")"));
     assert!(payment_categories.contains("require_permission(&headers, &state, \"viewPayment\")"));
@@ -118,6 +118,25 @@ fn validation_taxonomy_reads_require_manage_settings_in_rust_and_node() {
     assert!(node_proxy.contains(
         "app.post('/categories/admin/create', { preHandler: [authenticate, hasPermission('manageProducts')] }"
     ));
+}
+
+#[test]
+fn catalog_taxonomy_handlers_enforce_read_write_permissions_in_rust() {
+    let categories = include_str!("routes/taxonomy/categories.rs");
+    let operators = include_str!("routes/taxonomy/operators.rs");
+    let product_types = include_str!("routes/taxonomy/product_types.rs");
+
+    for source in [categories, operators, product_types] {
+        assert!(source.contains("require_permission(&headers, &state, \"viewProducts\")"));
+        assert!(source.contains("require_permission(&headers, &state, \"manageProducts\")"));
+        assert!(source.contains("require_permission(&headers, &state, \"manageSettings\")"));
+    }
+
+    assert!(categories.contains("pub async fn categories_admin_all"));
+    assert!(operators.contains("pub async fn operators_admin_all"));
+    assert!(operators.contains("pub async fn operator_admin_detail"));
+    assert!(product_types.contains("pub async fn product_types_admin_all"));
+    assert!(product_types.contains("pub async fn product_type_admin_detail"));
 }
 
 #[test]
