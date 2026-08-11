@@ -182,10 +182,32 @@ test('settings and account pages remove intro copy without losing security or CR
     assertChromeRemoved('PaymentMethods.tsx', [/Pusat Metode Pembayaran/i], [/Tambah Metode/, /Filter/, /stepUp\.dialog/]);
     assertChromeRemoved('PaymentCategories.tsx', [/Matriks Kategori Pembayaran/i], [/Tambah Kategori/, /Filter/]);
     assertChromeRemoved('Teams.tsx', [/Manajemen Tim<\/h1>/], [/Tambah Tim/, /Log Login/]);
+    const teams = readAdminPage('Teams.tsx');
+    assert.match(teams, /TeamAccessDialog/);
+    assert.match(teams, /TeamAccessPreview/);
+    assert.match(teams, /Lihat akses/);
+    assert.match(teams, /normalizeTeamPermissions/);
+    assert.match(teams, /canManageMember/);
+    assert.match(teams, /isOwner/);
+    assert.doesNotMatch(teams, /JSON\.stringify\(member\.permissions/);
     assertChromeRemoved('Users.tsx', [/User Management<\/h1>/], [/summary/, /filters/i]);
     assertChromeRemoved('Vendors.tsx', [/Kelola multiple vendor/i], [/Add Vendor/, /handleAddNew/]);
     assertChromeRemoved('Margins.tsx', [/Pengaturan Margin<\/h1>/], [/formatUpdatedAt/, /meta/]);
     assertChromeRemoved('SiteConfig.tsx', [/Pengaturan Situs<\/h1>/], [/activeTab/, /handleSave/]);
     assertChromeRemoved('Profile.tsx', [/Kelola identitas akun/i], [/Identitas Akun/, /Ubah Password/, /<Security \/>/, /stepUp\.dialog/]);
     assertChromeRemoved('Security.tsx', [/Autentikasi Dua Faktor<\/h1>/], [/twoFactorEnrollmentRequiredAt/, /Manajemen Sesi/, /enabled/]);
+});
+
+test('team access dialog preserves accessible interaction semantics', () => {
+    const dialog = fs.readFileSync(path.join(root, 'client/src/components/admin/TeamAccessDialog.tsx'), 'utf8');
+    const preview = fs.readFileSync(path.join(root, 'client/src/components/admin/TeamAccessPreview.tsx'), 'utf8');
+    assert.match(dialog, /role="dialog"/);
+    assert.match(dialog, /aria-modal="true"/);
+    assert.match(dialog, /aria-label="Tutup detail akses"/);
+    assert.match(dialog, /Escape/);
+    assert.match(dialog, /focus\(\)/);
+    assert.match(dialog, /isConnected/);
+    assert.match(dialog, /Keamanan pribadi/);
+    assert.match(preview, /Preview akses setelah disimpan/);
+    assert.match(preview, /summarizeEffectiveTeamAccess/);
 });

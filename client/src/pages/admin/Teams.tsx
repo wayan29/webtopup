@@ -3,6 +3,15 @@ import { Plus, ShieldCheck, ShieldX, Trash2, Edit, X, Eye, EyeOff, History, Sear
 import { apiV2 } from '../../api';
 import { useStepUpOrchestration } from '../../auth/useStepUpOrchestration';
 import { stepUpActionErrorMessage } from '../../auth/withStepUp';
+import TeamAccessDialog, { type TeamAccessDialogMember } from '../../components/admin/TeamAccessDialog';
+import TeamAccessPreview from '../../components/admin/TeamAccessPreview';
+import {
+    getEffectiveTeamAccess,
+    normalizeTeamPermissions,
+    summarizeEffectiveTeamAccess,
+    type TeamPermissionKey,
+    type TeamPermissions,
+} from '../../lib/teamAccess.ts';
 import { useAuthStore } from '../../store/useAuthStore';
 
 interface LoginLog {
@@ -16,27 +25,7 @@ interface LoginLog {
     createdAt: string;
 }
 
-interface Permissions {
-    viewDashboard: boolean;
-    viewReports: boolean;
-    viewTransactions: boolean;
-    processManualTransaction: boolean;
-    viewDeposits: boolean;
-    approveDeposits: boolean;
-    viewProducts: boolean;
-    manageProducts: boolean;
-    manageVouchers: boolean;
-    viewPayment: boolean;
-    managePayment: boolean;
-    viewUsers: boolean;
-    manageUsers: boolean;
-    viewTeam: boolean;
-    manageTeam: boolean;
-    viewSettings: boolean;
-    manageSettings: boolean;
-    viewVendors: boolean;
-    manageVendors: boolean;
-}
+type Permissions = TeamPermissions;
 
 interface TeamMember {
     _id: string;
@@ -221,15 +210,9 @@ const defaultForm: FormData = {
     permissions: { ...csDefaultPermissions },
 };
 
-const normalizePermissions = (permissions: Permissions) => {
-    const next = { ...permissions };
-
-    if (next.manageTeam) {
-        next.viewTeam = true;
-    }
-
-    return next;
-};
+const normalizePermissions = (permissions: Permissions | null | undefined): Permissions => (
+    normalizeTeamPermissions(permissions)
+);
 
 export default function Teams() {
     const stepUp = useStepUpOrchestration();
@@ -250,6 +233,7 @@ export default function Teams() {
     const [editingMember, setEditingMember] = useState<TeamMember | null>(null);
     const [form, setForm] = useState<FormData>(defaultForm);
     const [showPassword, setShowPassword] = useState(false);
+    const [accessMember, setAccessMember] = useState<TeamAccessDialogMember | null>(null);
 
     // Login logs state
     const [showLogsModal, setShowLogsModal] = useState(false);
@@ -283,6 +267,23 @@ export default function Teams() {
         if (!canManageTeam) return false;
         if (isOwner) return true;
         return member.role === 'cs';
+    };
+
+    const accessSummaryFor = (member: TeamMember) => summarizeEffectiveTeamAccess(getEffectiveTeamAccess({
+        role: member.role,
+        active: member.active,
+        permissions: member.permissions,
+    }));
+
+    const accessSummaryLabelFor = (member: TeamMember) => {
+        if (member.role === 'owner') {
+            return member.active ? 'Akses penuh' : 'Akses penuh dikonfigurasi · ditangguhkan';
+        }
+        if (!member.active) return 'Akses ditangguhkan';
+        const summary = accessSummaryFor(member);
+        if (summary.labels.length === 0) return 'Tidak ada akses operasional';
+        const remaining = summary.remainingGroupCount > 0 ? ` · +${summary.remainingGroupCount} area akses` : '';
+        return `${summary.labels.join(' · ')}${remaining}`;
     };
 
     const closeTeamModal = () => {
@@ -667,17 +668,18 @@ export default function Teams() {
                                 <th className="px-4 py-3 text-left font-semibold">Nama</th>
                                 <th className="px-4 py-3 text-left font-semibold">Role</th>
                                 <th className="px-4 py-3 text-left font-semibold">Status</th>
+                                <th className="px-4 py-3 text-left font-semibold">Akses efektif</th>
                                 {canManageTeam && <th className="px-4 py-3 text-left font-semibold">Aksi</th>}
                             </tr>
                         </thead>
                         <tbody className="divide-y ui-border">
                             {loading ? (
                                 <tr>
-                                    <td colSpan={canManageTeam ? 5 : 4} className="px-4 py-6 text-center ui-text-muted">Memuat...</td>
+                                    <td colSpan={canManageTeam ? 6 : 5} className="px-4 py-6 text-center ui-text-muted">Memuat...</td>
                                 </tr>
                             ) : filteredMembers.length === 0 ? (
                                 <tr>
-                                    <td colSpan={canManageTeam ? 5 : 4} className="px-4 py-6 text-center ui-text-muted">Tidak ada anggota tim yang cocok.</td>
+                                    <td colSpan={canManageTeam ? 6 : 5} className="px-4 py-6 text-center ui-text-muted">Tidak ada anggota tim yang cocok.</td>
                                 </tr>
                             ) : (
                                 filteredMembers.map((member, idx) => (
@@ -713,6 +715,28 @@ export default function Teams() {
                                                     2FA
                                                 </span>
                                             )}
+                                        </td>
+                                        <td className="px-4 py-3 text-sm ui-text">
+                                            <div className="flex min-w-[15rem] flex-col items-start gap-2">
+                                                <span className={`text-xs font-semibold ${member.active ? 'ui-text' : 'ui-warning-text'}`}>
+                                                    {accessSummaryLabelFor(member)}
+                                                </span>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => setAccessMember({
+                                                        name: member.name,
+                                                        email: member.email,
+                                                        role: member.role,
+                                                        active: member.active,
+                                                        permissions: member.permissions,
+                                                        twoFactorEnabled: member.twoFactorEnabled,
+                                                    })}
+                                                    aria-label={`Lihat akses ${member.name}`}
+                                                    className="ui-muted-action rounded-lg border px-2.5 py-1.5 text-xs font-semibold"
+                                                >
+                                                    Lihat akses
+                                                </button>
+                                            </div>
                                         </td>
                                         {canManageTeam && (
                                             <td className="px-4 py-3 text-sm ui-text">
@@ -901,9 +925,9 @@ export default function Teams() {
                                                     <label key={perm.key} className="flex items-center gap-2 text-sm ui-text cursor-pointer hover:text-[var(--ui-accent-strong)]">
                                                         <input
                                                             type="checkbox"
-                                                            checked={form.permissions[perm.key as keyof Permissions]}
-                                                            onChange={() => handlePermissionChange(perm.key as keyof Permissions)}
-                                                            disabled={!isOwner && !user?.permissions?.[perm.key as keyof Permissions]}
+                                                            checked={form.permissions[perm.key as TeamPermissionKey]}
+                                                            onChange={() => handlePermissionChange(perm.key as TeamPermissionKey)}
+                                                            disabled={!isOwner && !user?.permissions?.[perm.key as TeamPermissionKey]}
                                                             className="w-4 h-4 rounded border-[var(--ui-border)] bg-[var(--ui-card-bg)] text-[var(--ui-accent)] focus:ring-[var(--ui-accent)]"
                                                         />
                                                         {perm.label}
@@ -914,6 +938,12 @@ export default function Teams() {
                                     ))}
                                 </div>
                             </div>
+
+                            <TeamAccessPreview
+                                role={form.role}
+                                permissions={form.permissions}
+                                provisional={!isOwner}
+                            />
 
                             <div className="flex justify-end gap-3 pt-4">
                                 <button
@@ -933,6 +963,13 @@ export default function Teams() {
                         </form>
                     </div>
                 </div>
+            )}
+
+            {accessMember && (
+                <TeamAccessDialog
+                    member={accessMember}
+                    onClose={() => setAccessMember(null)}
+                />
             )}
 
             {/* Login Logs Modal */}
