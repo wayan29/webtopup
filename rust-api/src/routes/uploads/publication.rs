@@ -216,7 +216,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("webtopup-upload-test-{nanos}"));
+        // Unique parent so sibling staging `.webtopup-upload-staging` does not collide across
+        // parallel tests that would otherwise share std::env::temp_dir().
+        let base = std::env::temp_dir().join(format!("webtopup-upload-test-{nanos}"));
+        let root = base.join("uploads");
         fs::create_dir_all(root.join("icons")).unwrap();
         root
     }
@@ -287,8 +290,9 @@ mod tests {
         assert!(temp.exists());
         drop(staged);
         assert!(!temp.exists());
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(staging_root(&root));
+        if let Some(base) = root.parent() {
+            let _ = fs::remove_dir_all(base);
+        }
     }
 
     #[test]
@@ -300,8 +304,9 @@ mod tests {
         assert!(existing.exists());
         assert!(public_batch_files(&root).is_empty());
         assert!(private_stage_files(&root).is_empty());
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(staging_root(&root));
+        if let Some(base) = root.parent() {
+            let _ = fs::remove_dir_all(base);
+        }
     }
 
     #[test]
@@ -315,8 +320,9 @@ mod tests {
         assert!(!published[0].filename.contains("client"));
         assert!(published[0].path.exists());
         assert!(!temp.exists());
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(staging_root(&root));
+        if let Some(base) = root.parent() {
+            let _ = fs::remove_dir_all(base);
+        }
     }
 
     #[test]
@@ -333,8 +339,9 @@ mod tests {
         assert!(staged.filename().ends_with(".jpg"));
         assert!(!staged.filename().contains('/'));
         drop(staged);
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(staging_root(&root));
+        if let Some(base) = root.parent() {
+            let _ = fs::remove_dir_all(base);
+        }
     }
 
     #[test]
@@ -349,7 +356,8 @@ mod tests {
             .create_new(true)
             .open(&path);
         assert!(result.is_err());
-        let _ = fs::remove_dir_all(&root);
-        let _ = fs::remove_dir_all(staging);
+        if let Some(base) = root.parent() {
+            let _ = fs::remove_dir_all(base);
+        }
     }
 }

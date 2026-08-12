@@ -7,6 +7,7 @@ use axum::{
 };
 use crate::{
     security::{require_any_permission, ErrorResponse},
+    services::managed_assets::{count_asset_references, normalize_managed_asset},
     state::AppState,
 };
 
@@ -18,9 +19,9 @@ use super::{
     publication::{publish_batch, stage_canonical_image, UploadStorageError},
     storage::{list_uploaded_files, upload_root},
     types::{
-        UploadDeleteQuery, UploadDeleteResponse, UploadErrorBody, UploadErrorEnvelope,
-        UploadListQuery, UploadListResponse, UploadMultipleResponse, UploadResponse,
-        UploadedFileResponse,
+        AssetInUseErrorBody, AssetInUseErrorEnvelope, UploadDeleteQuery, UploadDeleteResponse,
+        UploadErrorBody, UploadErrorEnvelope, UploadListQuery, UploadListResponse,
+        UploadMultipleResponse, UploadResponse, UploadedFileResponse,
     },
     validation::{is_safe_filename, resolve_upload_folder},
 };
@@ -187,8 +188,52 @@ pub async fn delete_file(
     }
 
     let folder = resolve_upload_folder(query.upload_type.as_deref());
-    let file_path = upload_root().join(&folder).join(filename);
-    match std::fs::remove_file(file_path) {
+    let root = upload_root();
+    let managed = match normalize_managed_asset(&root, &folder, filename) {
+        Ok(managed) => managed,
+        Err(_) => return status_message(axum::http::StatusCode::NOT_FOUND, "File not found"),
+    };
+
+    if !managed.filesystem_path.is_file() {
+        return status_message(axum::http::StatusCode::NOT_FOUND, "File not found");
+    }
+
+    let Some(client) = state.mongo_client.as_ref() else {
+        return status_message(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Database unavailable",
+        );
+    };
+    let db = client.database(&state.mongo_db);
+
+    let first = match count_asset_references(&db, &managed.url).await {
+        Ok(value) => value,
+        Err(_) => {
+            return status_message(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to check asset references",
+            )
+        }
+    };
+    if !first.is_empty() {
+        return asset_in_use(first);
+    }
+
+    // Second immediate scan bounds the filesystem/database race before unlink.
+    let second = match count_asset_references(&db, &managed.url).await {
+        Ok(value) => value,
+        Err(_) => {
+            return status_message(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to check asset references",
+            )
+        }
+    };
+    if !second.is_empty() {
+        return asset_in_use(second);
+    }
+
+    match std::fs::remove_file(&managed.filesystem_path) {
         Ok(()) => Json(UploadDeleteResponse {
             success: true,
             message: "File deleted successfully",
@@ -245,6 +290,22 @@ fn batch_error(status: axum::http::StatusCode, code: &'static str, message: &'st
         status,
         Json(UploadErrorEnvelope {
             error: UploadErrorBody { code, message },
+        }),
+    )
+        .into_response()
+}
+
+fn asset_in_use(
+    references: Vec<crate::services::managed_assets::AssetReferenceSummary>,
+) -> Response {
+    (
+        axum::http::StatusCode::CONFLICT,
+        Json(AssetInUseErrorEnvelope {
+            error: AssetInUseErrorBody {
+                code: "ASSET_IN_USE",
+                message: "Asset masih digunakan",
+                references,
+            },
         }),
     )
         .into_response()

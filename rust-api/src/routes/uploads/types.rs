@@ -64,3 +64,15 @@ pub struct UploadErrorBody {
     pub code: &'static str,
     pub message: &'static str,
 }
+
+#[derive(Serialize)]
+pub struct AssetInUseErrorEnvelope {
+    pub error: AssetInUseErrorBody,
+}
+
+#[derive(Serialize)]
+pub struct AssetInUseErrorBody {
+    pub code: &'static str,
+    pub message: &'static str,
+    pub references: Vec<crate::services::managed_assets::AssetReferenceSummary>,
+}
