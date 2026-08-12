@@ -1,6 +1,7 @@
 mod export;
 mod filters;
 pub mod mappers;
+mod sanitize;
 mod types;
 
 use std::sync::Arc;
@@ -141,7 +142,7 @@ pub async fn export_audit_logs(
     let cursor = match collection
         .find(filter)
         .sort(doc! { "createdAt": -1 })
-        .limit(AUDIT_EXPORT_LIMIT)
+        .limit(AUDIT_EXPORT_LIMIT + 1)
         .await
     {
         Ok(cursor) => cursor,
@@ -150,15 +151,19 @@ pub async fn export_audit_logs(
             return internal_error();
         }
     };
-    let items = match cursor.try_collect::<Vec<_>>().await {
+    let mut items = match cursor.try_collect::<Vec<_>>().await {
         Ok(items) => items,
         Err(error) => {
             eprintln!("Failed to collect admin audit logs export: {error}");
             return internal_error();
         }
     };
+    let truncated = items.len() as i64 > AUDIT_EXPORT_LIMIT;
+    if truncated {
+        items.truncate(AUDIT_EXPORT_LIMIT as usize);
+    }
 
-    csv_response(&items)
+    csv_response(&items, truncated)
 }
 
 fn internal_error() -> Response {
