@@ -159,7 +159,7 @@ Create:
 scripts/security/scrub-admin-audit-secrets.js
 ```
 
-The tool scans only the explicitly named MongoDB database and the `adminauditlogs` collection. It uses the same normalized sensitive-key contract and replaces only sensitive leaf values with `[redacted]`. It preserves all non-sensitive metadata and document identity.
+The tool scans only the explicitly named MongoDB database and the `adminauditlogs` collection. It uses the same normalized sensitive-key contract and replaces only sensitive-key values with `[redacted]`. Unlike runtime disclosure sanitizers, the historical scrubber does not apply the runtime depth, array-entry, object-entry, or string-length truncation limits: it must preserve every non-sensitive key, value, BSON scalar type, array entry, nesting level allowed by stored MongoDB BSON, and document identity. Its only metadata content change is replacement of a sensitive-key value with `[redacted]`.
 
 Required command contract:
 
@@ -190,6 +190,7 @@ Safety rules are exact:
 - The implementation plan and automated verification must never use `--allow-protected-database`.
 - Running against production, even in dry-run mode, is a separate operational action requiring explicit user approval. This design and its implementation do not authorize it.
 - The tool uses targeted updates and reports only aggregate counts.
+- Traversal is cycle-safe for in-memory test objects and rejects an unsupported/cyclic document without partially updating it; stored MongoDB BSON is acyclic.
 - Running apply a second time is idempotent and reports zero newly affected sensitive fields.
 
 Machine-readable output contains only:
