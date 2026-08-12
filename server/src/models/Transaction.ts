@@ -7,6 +7,7 @@ export interface ITransaction extends Document {
     serverId?: string;
     amount: number;
     status: 'pending' | 'processing' | 'success' | 'failed';
+    referenceId?: string;
     vendorTrxId?: string;
     customerRefId?: string;
     sn?: string;
@@ -34,6 +35,7 @@ const TransactionSchema: Schema = new Schema({
         enum: ['pending', 'processing', 'success', 'failed'],
         default: 'pending'
     },
+    referenceId: { type: String },
     vendorTrxId: { type: String },
     customerRefId: { type: String },
     sn: { type: String },

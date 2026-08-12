@@ -10,14 +10,19 @@ use mongodb::{
     bson::{doc, oid::ObjectId, DateTime, Document},
     options::ReturnDocument,
 };
-use rand::{distributions::Alphanumeric, Rng};
-
 use crate::{
     routes::{
         transactions::{provider::top_up_vendor, types::RecheckProduct},
         validation_engine::{product_validation_config, run_paid_validation, PaidValidationStatus},
     },
     security::require_proxy_context,
+    services::{
+        identifier_integrity::{
+            allocate_reference_in_session, load_reference_format, require_identifier_indexes,
+            ReferenceError,
+        },
+        idempotency::{commit_mongo_transaction_with_unknown_retry, TransactionCommitOutcome},
+    },
     state::AppState,
     utils::bson::{escape_regex, read_i64, read_string},
 };
@@ -167,18 +172,65 @@ pub async fn create_transaction(
             .into_response();
     };
 
-    let internal_ref_id = generate_open_api_ref_id(&db).await;
+    if !state.mongo_transactions_enabled {
+        rollback_balance(&users, user_id, price).await;
+        return api_identifier_unavailable("IDENTIFIER_TRANSACTIONS_UNAVAILABLE");
+    }
+    if require_identifier_indexes(&db).await.is_err() {
+        rollback_balance(&users, user_id, price).await;
+        return api_identifier_unavailable("IDENTIFIER_INDEX_UNAVAILABLE");
+    }
+
+    let format = load_reference_format(&db).await;
     let product_id = product
         .get_object_id("_id")
         .unwrap_or_else(|_| ObjectId::new());
+    let transaction_id = ObjectId::new();
     let now = DateTime::now();
+
+    let mut session = match client.start_session().await {
+        Ok(session) => session,
+        Err(_) => {
+            rollback_balance(&users, user_id, price).await;
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+        }
+    };
+    if session.start_transaction().await.is_err() {
+        rollback_balance(&users, user_id, price).await;
+        return api_identifier_unavailable("IDENTIFIER_TRANSACTIONS_UNAVAILABLE");
+    }
+
+    let allocated = match allocate_reference_in_session(&db, &mut session, &format).await {
+        Ok(value) => value,
+        Err(ReferenceError::SequenceExhausted) => {
+            let _ = session.abort_transaction().await;
+            rollback_balance(&users, user_id, price).await;
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "success": false,
+                    "message": "Ref ID sequence exhausted",
+                    "error": { "code": "REF_ID_SEQUENCE_EXHAUSTED" }
+                })),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            let _ = session.abort_transaction().await;
+            rollback_balance(&users, user_id, price).await;
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+        }
+    };
+    let internal_ref_id = allocated.reference_id.clone();
+
     let mut transaction_doc = doc! {
+        "_id": transaction_id,
         "user": user_id,
         "product": product_id,
         "target": &target,
         "amount": price,
         "status": "pending",
-        "vendorTrxId": &internal_ref_id,
+        "referenceId": &internal_ref_id,
         "refunded": false,
         "source": "api",
         "createdAt": now,
@@ -191,16 +243,44 @@ pub async fn create_transaction(
     if !server_id.is_empty() {
         transaction_doc.insert("serverId", server_id.clone());
     }
-    let transaction_id = match transactions.insert_one(transaction_doc).await {
-        Ok(result) => result
-            .inserted_id
-            .as_object_id()
-            .unwrap_or_else(ObjectId::new),
-        Err(_) => {
+
+    if transactions
+        .insert_one(transaction_doc)
+        .session(&mut session)
+        .await
+        .is_err()
+    {
+        let _ = session.abort_transaction().await;
+        rollback_balance(&users, user_id, price).await;
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+    }
+
+    match commit_mongo_transaction_with_unknown_retry(&mut session).await {
+        TransactionCommitOutcome::Committed => {}
+        TransactionCommitOutcome::FailedDefinitely => {
             rollback_balance(&users, user_id, price).await;
             return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
         }
-    };
+        TransactionCommitOutcome::Ambiguous => {
+            let found = transactions
+                .find_one(doc! { "_id": transaction_id, "referenceId": &internal_ref_id })
+                .await
+                .ok()
+                .flatten();
+            if found.is_none() {
+                // Do not compensate an unproven commit.
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "message": "Transaction reference commit is unknown",
+                        "error": { "code": "TRANSACTION_REFERENCE_COMMIT_UNKNOWN" }
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
 
     if let Some(validation_config) = product_validation_config(&product) {
         let validation_result = run_paid_validation(&validation_config, &target, &server_id).await;
@@ -343,13 +423,16 @@ async fn refund_failed_transaction(
     }
 }
 
-async fn generate_open_api_ref_id(_db: &mongodb::Database) -> String {
-    let suffix: String = rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(13)
-        .map(char::from)
-        .collect();
-    format!("API{suffix}")
+fn api_identifier_unavailable(code: &'static str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "success": false,
+            "message": "Identifier allocation unavailable",
+            "error": { "code": code }
+        })),
+    )
+        .into_response()
 }
 
 async fn product_purchase_issues(db: &mongodb::Database, product: &Document) -> Vec<String> {

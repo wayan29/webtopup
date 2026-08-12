@@ -53,6 +53,8 @@ pub(super) struct ManualTransactionItem {
     pub(crate) target: String,
     pub(crate) amount: i64,
     pub(crate) status: String,
+    #[serde(rename = "referenceId")]
+    pub(crate) reference_id: String,
     #[serde(rename = "vendorTrxId")]
     pub(crate) vendor_trx_id: String,
     #[serde(rename = "customerRefId")]
@@ -250,6 +252,8 @@ pub(crate) struct StuckTransactionItem {
     pub(crate) target: String,
     pub(crate) amount: i64,
     pub(crate) status: String,
+    #[serde(rename = "referenceId")]
+    pub(crate) reference_id: String,
     #[serde(rename = "vendorTrxId")]
     pub(crate) vendor_trx_id: String,
     #[serde(rename = "customerRefId")]

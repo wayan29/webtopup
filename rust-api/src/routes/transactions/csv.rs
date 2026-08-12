@@ -3,7 +3,8 @@ use super::ManualTransactionItem;
 pub(super) fn build_transaction_csv(items: &[ManualTransactionItem]) -> String {
     let mut rows = vec![vec![
         "Internal ID".to_string(),
-        "Vendor Trx ID".to_string(),
+        "Ref ID".to_string(),
+        "Ref vendor".to_string(),
         "Customer Ref ID".to_string(),
         "Member".to_string(),
         "Email".to_string(),
@@ -31,6 +32,7 @@ pub(super) fn build_transaction_csv(items: &[ManualTransactionItem]) -> String {
     for item in items {
         rows.push(vec![
             item.id.clone(),
+            item.reference_id.clone(),
             item.vendor_trx_id.clone(),
             item.customer_ref_id.clone(),
             item.user.name.clone(),

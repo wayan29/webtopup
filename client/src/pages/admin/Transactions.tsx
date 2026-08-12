@@ -46,7 +46,8 @@ interface AdminTransaction {
     target: string;
     amount: number;
     status: TransactionStatus;
-    vendorTrxId?: string;
+    referenceId?: string;
+  vendorTrxId?: string;
     customerRefId?: string;
     sn?: string;
     message?: string;
@@ -133,7 +134,8 @@ type StuckTransaction = {
     target: string;
     amount: number;
     status: string;
-    vendorTrxId?: string;
+    referenceId?: string;
+  vendorTrxId?: string;
     customerRefId?: string;
     source: string;
     createdAt: string;
@@ -1352,7 +1354,8 @@ export default function AdminTransactions() {
                                                     />
                                                 </td>
                                                 <td className="px-4 py-3 align-top text-sm ui-text">
-                                                    <div className="font-semibold ui-info-text">{trx.vendorTrxId || '-'}</div>
+                                                    <div className="font-semibold ui-info-text">{trx.referenceId || '-'}</div>
+                                                    <div className="text-[11px] ui-text-muted">Ref vendor: {trx.vendorTrxId || '-'}</div>
                                                     <div className="text-xs ui-text-muted font-mono break-all">{trx._id}</div>
                                                     {trx.customerRefId && (
                                                         <div className="text-[11px] ui-accent-text">

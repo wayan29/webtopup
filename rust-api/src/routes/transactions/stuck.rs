@@ -36,6 +36,7 @@ pub(super) fn stuck_transaction_item_from_doc(
         target: read_string(&document, "target"),
         amount: read_i64(&document, "amount"),
         status: read_string(&document, "status"),
+        reference_id: read_string(&document, "referenceId"),
         vendor_trx_id: read_string(&document, "vendorTrxId"),
         customer_ref_id: read_string(&document, "customerRefId"),
         source: read_string(&document, "source").if_empty_then(|| "web".to_string()),

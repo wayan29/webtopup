@@ -5,10 +5,11 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use chrono::{Datelike, FixedOffset, Utc};
 use futures_util::TryStreamExt;
 use mongodb::bson::{doc, Document};
-use mongodb::options::IndexOptions;
-use mongodb::{Database, IndexModel};
+use mongodb::options::{IndexOptions, ReturnDocument};
+use mongodb::{ClientSession, Database, IndexModel};
 
 pub const INDEX_TRANSACTION_REFERENCE: &str = "uniq_transactions_reference_id";
 pub const INDEX_GUEST_INVOICE: &str = "uniq_guest_invoice_number";
@@ -106,6 +107,215 @@ pub fn effective_ref_id_date_format(raw: Option<&str>) -> &'static str {
         },
         _ => "DDMMYYYY",
     }
+}
+
+pub const REFERENCE_COUNTER_SCOPE: &str = "transaction-reference";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceFormat {
+    pub prefix: String,
+    pub date_format: String,
+    pub separator: String,
+    pub sequence_digits: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllocatedReference {
+    pub reference_id: String,
+    pub sequence: i64,
+    pub date_wib: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferenceError {
+    SequenceExhausted,
+    Storage,
+}
+
+impl ReferenceError {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::SequenceExhausted => "REF_ID_SEQUENCE_EXHAUSTED",
+            Self::Storage => "REFERENCE_ALLOCATION_FAILED",
+        }
+    }
+}
+
+impl ReferenceFormat {
+    pub fn from_settings(
+        prefix: &str,
+        date_format: Option<&str>,
+        separator: &str,
+        sequence_digits: i64,
+    ) -> Self {
+        let digits = if (1..=10).contains(&sequence_digits) {
+            sequence_digits as usize
+        } else {
+            4
+        };
+        let prefix = prefix.trim().to_uppercase();
+        let separator = match separator.trim() {
+            "-" => "-".to_string(),
+            "_" => "_".to_string(),
+            _ => String::new(),
+        };
+        Self {
+            prefix: if prefix.is_empty() {
+                "REF".to_string()
+            } else {
+                prefix
+            },
+            date_format: effective_ref_id_date_format(date_format).to_string(),
+            separator,
+            sequence_digits: digits,
+        }
+    }
+}
+
+/// WIB calendar date key `YYYY-MM-DD` for Asia/Jakarta (UTC+07:00).
+pub fn wib_date_key(now_utc: chrono::DateTime<Utc>) -> String {
+    let wib = FixedOffset::east_opt(7 * 3600).expect("fixed +07 offset");
+    let local = now_utc.with_timezone(&wib);
+    format!(
+        "{:04}-{:02}-{:02}",
+        local.year(),
+        local.month(),
+        local.day()
+    )
+}
+
+pub fn format_reference_sequence(sequence: i64, digits: usize) -> Result<String, ReferenceError> {
+    if sequence < 1 {
+        return Err(ReferenceError::SequenceExhausted);
+    }
+    let max = 10i64
+        .checked_pow(digits as u32)
+        .ok_or(ReferenceError::SequenceExhausted)?;
+    if sequence >= max {
+        return Err(ReferenceError::SequenceExhausted);
+    }
+    Ok(format!("{:0width$}", sequence, width = digits))
+}
+
+pub fn format_ref_date_part(format: &str, day: u32, month: u32, year: i32) -> String {
+    let yy = year.rem_euclid(100);
+    match effective_ref_id_date_format(Some(format)) {
+        "YYYYMMDD" => format!("{year:04}{month:02}{day:02}"),
+        "MMDDYYYY" => format!("{month:02}{day:02}{year:04}"),
+        "DDMMYY" => format!("{day:02}{month:02}{yy:02}"),
+        "YYMMDD" => format!("{yy:02}{month:02}{day:02}"),
+        _ => format!("{day:02}{month:02}{year:04}"), // DDMMYYYY
+    }
+}
+
+pub fn build_reference_id(format: &ReferenceFormat, date_wib: &str, sequence: i64) -> Result<String, ReferenceError> {
+    let sequence_part = format_reference_sequence(sequence, format.sequence_digits)?;
+    let mut day = 1u32;
+    let mut month = 1u32;
+    let mut year = 1970i32;
+    if let Ok(parsed) = chrono::NaiveDate::parse_from_str(date_wib, "%Y-%m-%d") {
+        day = parsed.day();
+        month = parsed.month();
+        year = parsed.year();
+    }
+    let date_part = format_ref_date_part(&format.date_format, day, month, year);
+    Ok([format.prefix.as_str(), date_part.as_str(), sequence_part.as_str()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(&format.separator))
+}
+
+pub async fn load_reference_format(db: &Database) -> ReferenceFormat {
+    let settings = db.collection::<Document>("settings");
+    let prefix = setting_string(&settings, "refIdPrefix", "REF").await;
+    let date_format = setting_string(&settings, "refIdDateFormat", "DDMMYYYY").await;
+    let separator = setting_string(&settings, "refIdSeparator", "").await;
+    let digits = setting_i64(&settings, "refIdSequenceDigits", 4).await;
+    ReferenceFormat::from_settings(&prefix, Some(&date_format), &separator, digits)
+}
+
+async fn setting_string(
+    collection: &mongodb::Collection<Document>,
+    key: &str,
+    fallback: &str,
+) -> String {
+    collection
+        .find_one(doc! { "key": key })
+        .await
+        .ok()
+        .flatten()
+        .and_then(|document| document.get("value").cloned())
+        .and_then(|value| match value {
+            mongodb::bson::Bson::String(value) => Some(value),
+            other => Some(other.to_string()),
+        })
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+async fn setting_i64(
+    collection: &mongodb::Collection<Document>,
+    key: &str,
+    fallback: i64,
+) -> i64 {
+    collection
+        .find_one(doc! { "key": key })
+        .await
+        .ok()
+        .flatten()
+        .and_then(|document| document.get("value").cloned())
+        .map(|value| match value {
+            mongodb::bson::Bson::Int32(value) => i64::from(value),
+            mongodb::bson::Bson::Int64(value) => value,
+            mongodb::bson::Bson::Double(value) => value as i64,
+            mongodb::bson::Bson::String(value) => value.trim().parse().unwrap_or(fallback),
+            _ => fallback,
+        })
+        .filter(|value| *value > 0)
+        .unwrap_or(fallback)
+}
+
+pub async fn allocate_reference_in_session(
+    db: &Database,
+    session: &mut ClientSession,
+    format: &ReferenceFormat,
+) -> Result<AllocatedReference, ReferenceError> {
+    let date_wib = wib_date_key(Utc::now());
+    let counters = db.collection::<Document>(COLLECTION_IDENTIFIER_COUNTERS);
+    let updated = counters
+        .find_one_and_update(
+            doc! {
+                "scope": REFERENCE_COUNTER_SCOPE,
+                "dateWib": &date_wib,
+            },
+            doc! {
+                "$inc": { "sequence": 1i64 },
+                "$setOnInsert": {
+                    "scope": REFERENCE_COUNTER_SCOPE,
+                    "dateWib": &date_wib,
+                },
+            },
+        )
+        .upsert(true)
+        .return_document(ReturnDocument::After)
+        .session(&mut *session)
+        .await
+        .map_err(|_| ReferenceError::Storage)?
+        .ok_or(ReferenceError::Storage)?;
+    let sequence = match updated.get("sequence") {
+        Some(mongodb::bson::Bson::Int32(value)) => i64::from(*value),
+        Some(mongodb::bson::Bson::Int64(value)) => *value,
+        Some(mongodb::bson::Bson::Double(value)) => *value as i64,
+        _ => return Err(ReferenceError::Storage),
+    };
+    let reference_id = build_reference_id(format, &date_wib, sequence)?;
+    Ok(AllocatedReference {
+        reference_id,
+        sequence,
+        date_wib,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -734,5 +944,37 @@ mod tests {
         assert_eq!(effective_ref_id_date_format(Some("YYYYMMDD")), "YYYYMMDD");
         assert!(REF_ID_DATE_FORMATS.iter().all(|value| *value != "NONE"));
         assert!(INVOICE_DATE_FORMATS.contains(&"NONE"));
+    }
+
+    #[test]
+    fn sequence_must_fit_configured_width_without_wrap() {
+        assert_eq!(format_reference_sequence(9999, 4).unwrap(), "9999");
+        assert_eq!(
+            format_reference_sequence(10_000, 4).unwrap_err().code(),
+            "REF_ID_SEQUENCE_EXHAUSTED"
+        );
+    }
+
+    #[test]
+    fn wib_date_key_uses_utc_plus_seven_boundary() {
+        // 16:59:59Z is still previous WIB calendar day; 17:00:00Z is next WIB day.
+        let before = chrono::DateTime::parse_from_rfc3339("2026-08-12T16:59:59Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let after = chrono::DateTime::parse_from_rfc3339("2026-08-12T17:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(wib_date_key(before), "2026-08-12");
+        assert_eq!(wib_date_key(after), "2026-08-13");
+    }
+
+    #[test]
+    fn reference_format_from_settings_collapses_none_and_builds_date_bearing_id() {
+        let format = ReferenceFormat::from_settings("ref", Some("NONE"), "-", 4);
+        assert_eq!(format.date_format, "DDMMYYYY");
+        assert_eq!(format.prefix, "REF");
+        let built = build_reference_id(&format, "2026-08-12", 7).unwrap();
+        assert_eq!(built, "REF-12082026-0007");
+        assert!(!built.contains("NONE"));
     }
 }

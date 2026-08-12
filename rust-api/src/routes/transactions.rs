@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use chrono::{Datelike, Local, TimeZone};
+use chrono::Datelike;
 use futures_util::TryStreamExt;
 use mongodb::{
     bson::{doc, oid::ObjectId, Bson, DateTime, Document},
@@ -17,14 +17,21 @@ use serde_json::{Map, Value};
 use crate::{
     routes::auth::require_trusted_step_up_group,
     security::{require_member_user, require_permission, ErrorResponse},
-    services::idempotency::{
-        self, effect_marker_matches_identity, effect_slot_capacity_response,
-        find_balance_effect_by_identity, is_effect_slot_capacity_rejection,
-        mark_effect_resolved_update, prune_resolved_effect_slots_pipeline, refund_credit_filter,
-        refund_credit_pipeline, CompletedSnapshot, DomainMarkerRecovery, DomainRecovery,
-        EffectIdentity, IdempotencyBegin, IdempotencyStore, MongoIdempotencyStore,
-        REFUND_PHASE_AUDITED, REFUND_PHASE_CLAIMED, REFUND_PHASE_CREDITED,
-        ROUTE_TRANSACTION_REFUND,
+    services::{
+        identifier_integrity::{
+            allocate_reference_in_session, load_reference_format, require_identifier_indexes,
+            ReferenceError,
+        },
+        idempotency::{
+            self, commit_mongo_transaction_with_unknown_retry, effect_marker_matches_identity,
+            effect_slot_capacity_response, find_balance_effect_by_identity,
+            is_effect_slot_capacity_rejection, mark_effect_resolved_update,
+            prune_resolved_effect_slots_pipeline, refund_credit_filter, refund_credit_pipeline,
+            CompletedSnapshot, DomainMarkerRecovery, DomainRecovery, EffectIdentity,
+            IdempotencyBegin, IdempotencyStore, MongoIdempotencyStore, TransactionCommitOutcome,
+            REFUND_PHASE_AUDITED, REFUND_PHASE_CLAIMED, REFUND_PHASE_CREDITED,
+            ROUTE_TRANSACTION_REFUND,
+        },
     },
     state::AppState,
     utils::bson::{escape_regex, read_i64, read_string},
@@ -295,29 +302,66 @@ pub async fn create_transaction(
         return status_message(StatusCode::BAD_REQUEST, "Insufficient balance");
     };
 
-    let ref_id = match generate_ref_id(&db).await {
-        Ok(value) => value,
-        Err(_) => {
-            rollback_flash_sale_stock(&db, flash_sale_reservation.as_ref()).await;
-            if let Some(applied) = applied_discount.as_ref() {
-                let vouchers = db.collection::<Document>("vouchers");
-                crate::routes::vouchers::release_discount_slot(&vouchers, applied, Some(user_id)).await;
-            }
-            let _ = apply_user_balance_delta(&users, user_id, price).await;
-            return internal_error();
+    let compensate = || async {
+        rollback_flash_sale_stock(&db, flash_sale_reservation.as_ref()).await;
+        if let Some(applied) = applied_discount.as_ref() {
+            let vouchers = db.collection::<Document>("vouchers");
+            crate::routes::vouchers::release_discount_slot(&vouchers, applied, Some(user_id)).await;
         }
+        let _ = apply_user_balance_delta(&users, user_id, price).await;
     };
+
+    if !state.mongo_transactions_enabled {
+        compensate().await;
+        return identifier_transactions_unavailable();
+    }
+    if require_identifier_indexes(&db).await.is_err() {
+        compensate().await;
+        return identifier_index_unavailable();
+    }
+
+    let format = load_reference_format(&db).await;
+    let transaction_id = ObjectId::new();
     let now = DateTime::now();
     let product_id = product
         .get_object_id("_id")
         .unwrap_or_else(|_| ObjectId::new());
+
+    let mut session = match client.start_session().await {
+        Ok(session) => session,
+        Err(_) => {
+            compensate().await;
+            return internal_error();
+        }
+    };
+    if session.start_transaction().await.is_err() {
+        compensate().await;
+        return identifier_transactions_unavailable();
+    }
+
+    let allocated = match allocate_reference_in_session(&db, &mut session, &format).await {
+        Ok(value) => value,
+        Err(ReferenceError::SequenceExhausted) => {
+            let _ = session.abort_transaction().await;
+            compensate().await;
+            return ref_id_sequence_exhausted();
+        }
+        Err(_) => {
+            let _ = session.abort_transaction().await;
+            compensate().await;
+            return internal_error();
+        }
+    };
+    let ref_id = allocated.reference_id.clone();
+
     let mut transaction_doc = doc! {
+        "_id": transaction_id,
         "user": user_id,
         "product": product_id,
         "target": &target,
         "amount": price,
         "status": "pending",
-        "vendorTrxId": &ref_id,
+        "referenceId": &ref_id,
         "refunded": false,
         "source": "web",
         "createdAt": now,
@@ -332,29 +376,36 @@ pub async fn create_transaction(
         transaction_doc.insert("discountAmount", applied.discount_amount);
         transaction_doc.insert("baseAmount", base_price);
     }
-    let transaction_id = match transactions.insert_one(transaction_doc).await {
-        Ok(result) => match result.inserted_id.as_object_id() {
-            Some(id) => id,
-            None => {
-                rollback_flash_sale_stock(&db, flash_sale_reservation.as_ref()).await;
-                if let Some(applied) = applied_discount.as_ref() {
-                    let vouchers = db.collection::<Document>("vouchers");
-                    crate::routes::vouchers::release_discount_slot(&vouchers, applied, Some(user_id)).await;
-                }
-                let _ = apply_user_balance_delta(&users, user_id, price).await;
-                return internal_error();
-            }
-        },
-        Err(_) => {
-            rollback_flash_sale_stock(&db, flash_sale_reservation.as_ref()).await;
-            if let Some(applied) = applied_discount.as_ref() {
-                let vouchers = db.collection::<Document>("vouchers");
-                crate::routes::vouchers::release_discount_slot(&vouchers, applied, Some(user_id)).await;
-            }
-            let _ = apply_user_balance_delta(&users, user_id, price).await;
+
+    if transactions
+        .insert_one(transaction_doc)
+        .session(&mut session)
+        .await
+        .is_err()
+    {
+        let _ = session.abort_transaction().await;
+        compensate().await;
+        return internal_error();
+    }
+
+    match commit_mongo_transaction_with_unknown_retry(&mut session).await {
+        TransactionCommitOutcome::Committed => {}
+        TransactionCommitOutcome::FailedDefinitely => {
+            compensate().await;
             return internal_error();
         }
-    };
+        TransactionCommitOutcome::Ambiguous => {
+            let found = transactions
+                .find_one(doc! { "_id": transaction_id, "referenceId": &ref_id })
+                .await
+                .ok()
+                .flatten();
+            if found.is_none() {
+                compensate().await;
+                return transaction_reference_commit_unknown();
+            }
+        }
+    }
 
     if let Some(validation_config) = product_validation_config(&product) {
         let validation_result = run_paid_validation(&validation_config, &target, &server_id).await;
@@ -1368,6 +1419,8 @@ struct ManualTransactionItemJson {
     amount: i64,
     #[serde(default)]
     status: String,
+    #[serde(rename = "referenceId", default)]
+    reference_id: String,
     #[serde(rename = "vendorTrxId", default)]
     vendor_trx_id: String,
     #[serde(rename = "customerRefId", default)]
@@ -1441,6 +1494,7 @@ fn manual_item_from_json(value: ManualTransactionItemJson) -> ManualTransactionI
         target: value.target,
         amount: value.amount,
         status: value.status,
+        reference_id: value.reference_id,
         vendor_trx_id: value.vendor_trx_id,
         customer_ref_id: value.customer_ref_id,
         sn: value.sn,
@@ -2115,6 +2169,7 @@ fn manual_transaction_item_from_doc(mut document: Document) -> ManualTransaction
         target: read_string(&document, "target"),
         amount: read_i64(&document, "amount"),
         status: read_string(&document, "status"),
+        reference_id: read_string(&document, "referenceId"),
         vendor_trx_id: read_string(&document, "vendorTrxId"),
         customer_ref_id: read_string(&document, "customerRefId"),
         sn: read_string(&document, "sn"),
@@ -2539,89 +2594,6 @@ async fn rollback_flash_sale_stock(
         .await;
 }
 
-async fn generate_ref_id(db: &mongodb::Database) -> Result<String, ()> {
-    let settings = db.collection::<Document>("settings");
-    let prefix = setting_string(&settings, "refIdPrefix", "REF").await;
-    let date_format = setting_string(&settings, "refIdDateFormat", "DDMMYYYY").await;
-    let separator = setting_string(&settings, "refIdSeparator", "").await;
-    let digits = setting_i64(&settings, "refIdSequenceDigits", 4)
-        .await
-        .clamp(1, 10) as usize;
-    let now = Local::now();
-    let start = Local
-        .with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0)
-        .single()
-        .ok_or(())?
-        .timestamp_millis();
-    let end = Local
-        .with_ymd_and_hms(now.year(), now.month(), now.day(), 23, 59, 59)
-        .single()
-        .ok_or(())?
-        .timestamp_millis()
-        + 999;
-    let today_count = db
-        .collection::<Document>("transactions")
-        .count_documents(doc! {
-            "createdAt": {
-                "$gte": DateTime::from_millis(start),
-                "$lte": DateTime::from_millis(end),
-            }
-        })
-        .await
-        .map_err(|_| ())?;
-    let date_part = format_ref_date(&date_format, now.day(), now.month(), now.year());
-    let sequence = format!("{:0width$}", today_count + 1, width = digits);
-    Ok(vec![prefix, date_part, sequence]
-        .into_iter()
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>()
-        .join(&separator))
-}
-
-async fn setting_string(
-    collection: &mongodb::Collection<Document>,
-    key: &str,
-    fallback: &str,
-) -> String {
-    collection
-        .find_one(doc! { "key": key })
-        .await
-        .ok()
-        .flatten()
-        .and_then(|document| document.get("value").cloned())
-        .and_then(|value| match value {
-            Bson::String(value) => Some(value),
-            _ => Some(value.to_string()),
-        })
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| fallback.to_string())
-}
-
-async fn setting_i64(collection: &mongodb::Collection<Document>, key: &str, fallback: i64) -> i64 {
-    collection
-        .find_one(doc! { "key": key })
-        .await
-        .ok()
-        .flatten()
-        .and_then(|document| document.get("value").cloned())
-        .map(|value| bson_number_to_i64(&value))
-        .filter(|value| *value > 0)
-        .unwrap_or(fallback)
-}
-
-fn format_ref_date(format: &str, day: u32, month: u32, year: i32) -> String {
-    let yy = year.rem_euclid(100).to_string();
-    match format {
-        "YYYYMMDD" => format!("{year:04}{month:02}{day:02}"),
-        "MMDDYYYY" => format!("{month:02}{day:02}{year:04}"),
-        "DDMMYY" => format!("{day:02}{month:02}{yy:0>2}"),
-        "YYMMDD" => format!("{yy:0>2}{month:02}{day:02}"),
-        "NONE" => String::new(),
-        _ => format!("{day:02}{month:02}{year:04}"),
-    }
-}
-
 fn recheck_product_from_product_doc(product: &Document) -> RecheckProduct {
     let vendor = product.get_document("vendor").ok();
     let code = read_string(product, "code");
@@ -3037,6 +3009,9 @@ fn guest_transaction_json(
                 .unwrap_or(Bson::Null),
         ),
     );
+    if let Some(value) = document.get("referenceId").cloned() {
+        map.insert("referenceId".to_string(), bson_to_json(value));
+    }
     if let Some(value) = document.get("vendorTrxId").cloned() {
         map.insert("vendorTrxId".to_string(), bson_to_json(value));
     }
@@ -3112,6 +3087,62 @@ fn date_key(date: DateTime) -> String {
         .ok()
         .and_then(|value| value.get(0..10).map(ToString::to_string))
         .unwrap_or_else(|| "unknown-date".to_string())
+}
+
+fn identifier_transactions_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "message": "Alokasi Ref ID membutuhkan transaksi database",
+            "error": {
+                "code": "IDENTIFIER_TRANSACTIONS_UNAVAILABLE",
+                "message": "Alokasi Ref ID membutuhkan transaksi database"
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn identifier_index_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "message": "Index identifier belum siap",
+            "error": {
+                "code": "IDENTIFIER_INDEX_UNAVAILABLE",
+                "message": "Index identifier belum siap"
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn transaction_reference_commit_unknown() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "message": "Status alokasi Ref ID belum dapat dipastikan",
+            "error": {
+                "code": "TRANSACTION_REFERENCE_COMMIT_UNKNOWN",
+                "message": "Status alokasi Ref ID belum dapat dipastikan"
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn ref_id_sequence_exhausted() -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "message": "Sequence Ref ID harian habis",
+            "error": {
+                "code": "REF_ID_SEQUENCE_EXHAUSTED",
+                "message": "Sequence Ref ID harian habis"
+            }
+        })),
+    )
+        .into_response()
 }
 
 fn status_message(status: axum::http::StatusCode, message: &'static str) -> Response {

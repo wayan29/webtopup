@@ -151,6 +151,7 @@ pub(super) fn build_transactions_pipeline(
                 { "$limit": limit },
                 { "$project": {
                     "_id": 1, "target": 1, "amount": 1, "status": 1,
+                    "referenceId": { "$ifNull": ["$referenceId", ""] },
                     "vendorTrxId": { "$ifNull": ["$vendorTrxId", ""] },
                     "customerRefId": { "$ifNull": ["$customerRefId", ""] },
                     "sn": { "$ifNull": ["$sn", ""] },

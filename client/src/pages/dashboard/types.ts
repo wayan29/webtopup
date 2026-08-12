@@ -5,7 +5,8 @@ export type DashboardPaymentStatus = 'waiting_payment' | 'paid' | 'expired' | 'c
 export interface DashboardTransaction {
     _id: string;
     invoiceNumber?: string;
-    vendorTrxId?: string;
+    referenceId?: string;
+  vendorTrxId?: string;
     product?: {
         _id?: string;
         name?: string;
