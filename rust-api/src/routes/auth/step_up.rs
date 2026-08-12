@@ -46,6 +46,8 @@ pub const ACTION_GROUPS: &[&str] = &[
     // Staff self-service credential changes (email/password). These are account-takeover
     // paths, so they need fresh proof of possession like any other privileged action.
     "security.password",
+    // Site Config sensitive effective changes (Task 9).
+    "settings.sensitive",
 ];
 
 const TRUSTED_STEP_UP_GROUP_HEADER: &str = "x-webtopup-step-up-group";
@@ -985,6 +987,7 @@ mod tests {
                 "security.sessions_all",
                 "exports.sensitive",
                 "security.password",
+                "settings.sensitive",
             ]
         );
         assert!(!is_known_action_group("finance.unknown"));

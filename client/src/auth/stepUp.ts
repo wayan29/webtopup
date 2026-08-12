@@ -15,6 +15,8 @@ export const STEP_UP_ACTION_GROUPS = [
   'exports.sensitive',
   // Staff self-service credential changes (email/password).
   'security.password',
+  // Site Config sensitive effective changes.
+  'settings.sensitive',
 ] as const;
 
 export type StepUpActionGroup = (typeof STEP_UP_ACTION_GROUPS)[number];

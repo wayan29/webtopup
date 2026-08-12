@@ -28,6 +28,7 @@ const GROUP_LABELS: Record<StepUpActionGroup, string> = {
   'team.reset_2fa': 'reset 2FA staf',
   'security.sessions_all': 'cabut semua sesi',
   'exports.sensitive': 'ekspor data sensitif',
+  'settings.sensitive': 'mengubah konfigurasi situs sensitif',
   'security.password': 'perubahan email atau password akun',
 };
 

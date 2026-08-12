@@ -18,6 +18,7 @@ import { authRateLimit } from '../middlewares/authRateLimit';
 import { adminFinancialMutationRateLimit } from '../middlewares/adminMutationRateLimit';
 import {
     requireStepUp,
+    acceptOptionalStepUp,
     stampTrustedStepUpGroup,
     stripBrowserStepUpHeaders,
     type StepUpActionGroup,
@@ -209,6 +210,22 @@ const readIdempotencyKeyHeader = (request: FastifyRequest): string | undefined =
 };
 
 /** Fail closed at the gateway for critical financial mutations missing a bounded key. */
+
+/** Permanent Site Config bulk mutation requires a bounded Idempotency-Key. */
+export const requireSiteConfigIdempotencyKey = async (request: FastifyRequest, reply: FastifyReply) => {
+    const normalized = normalizeGatewayIdempotencyKey(readIdempotencyKeyHeader(request));
+    if (!normalized) {
+        return reply.status(400).send({
+            message: 'Header Idempotency-Key wajib untuk mutasi Site Config',
+            error: {
+                code: 'IDEMPOTENCY_KEY_REQUIRED',
+                message: 'Header Idempotency-Key wajib untuk mutasi Site Config',
+            },
+        });
+    }
+    (request.headers as Record<string, unknown>)['idempotency-key'] = normalized;
+};
+
 export const requireCriticalIdempotencyKey = async (request: FastifyRequest, reply: FastifyReply) => {
     if (!isCriticalIdempotentMutation(request) || !criticalIdempotencyEnforced()) {
         return;
@@ -1417,14 +1434,25 @@ const proxyUnlock = async (request: AuthRequest, reply: FastifyReply) => {
     app.all('/reports/dashboard', { preHandler: [authenticate, hasPermission('viewDashboard')] }, proxyRequest);
     app.all('/reports/*', { preHandler: [authenticate, hasPermission('viewReports')] }, proxyRequest);
     app.get('/settings/admin/all', { preHandler: [authenticate, hasPermission('manageSettings')] }, proxyRequest);
-    app.put('/settings/admin/update', { preHandler: [authenticate, hasPermission('manageSettings')] }, async (request, reply) => {
-        publicSettingsCacheRef.current = null;
-        return proxyRequest(request, reply);
-    });
+    app.put('/settings/admin/update', {
+        preHandler: [
+            authenticate,
+            hasPermission('manageSettings'),
+            requireSiteConfigIdempotencyKey,
+            acceptOptionalStepUp('settings.sensitive'),
+        ],
+    }, proxyRequest);
     app.get('/settings/admin/:key', { preHandler: [authenticate, hasPermission('manageSettings')] }, proxyRequest);
-    app.put('/settings/admin/:key', { preHandler: [authenticate, hasPermission('manageSettings')] }, async (request, reply) => {
-        publicSettingsCacheRef.current = null;
-        return proxyRequest(request, reply);
+    app.put('/settings/admin/:key', {
+        preHandler: [authenticate, hasPermission('manageSettings')],
+    }, async (_request, reply) => {
+        return reply.status(405).send({
+            message: 'Mutasi single-setting dinonaktifkan; gunakan bulk update ber-revisi',
+            error: {
+                code: 'SETTINGS_SINGLE_MUTATION_DISABLED',
+                message: 'Mutasi single-setting dinonaktifkan; gunakan bulk update ber-revisi',
+            },
+        });
     });
     app.get('/sliders/admin/all', { preHandler: [authenticate, hasPermission('manageSettings')] }, proxyRequest);
     app.post('/sliders/admin/create', { preHandler: [authenticate, hasPermission('manageSettings')] }, proxyRequest);

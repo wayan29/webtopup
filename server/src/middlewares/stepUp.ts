@@ -20,6 +20,8 @@ export const STEP_UP_ACTION_GROUPS = [
     'exports.sensitive',
     // Staff self-service credential changes (email/password).
     'security.password',
+    // Site Config sensitive effective changes.
+    'settings.sensitive',
 ] as const;
 
 export type StepUpActionGroup = (typeof STEP_UP_ACTION_GROUPS)[number];
@@ -139,10 +141,46 @@ export function stripBrowserStepUpHeaders(headers: Headers): void {
     headers.delete('X-Webtopup-Step-Up-Group');
 }
 
-/** Stamp only the trusted group after requireStepUp succeeded. */
+/** Stamp only the trusted group after requireStepUp / acceptOptionalStepUp succeeded. */
 export function stampTrustedStepUpGroup(headers: Headers, request: AuthRequest): void {
     const group = (request as AuthRequest & { stepUpActionGroup?: string }).stepUpActionGroup;
     if (group && isStepUpActionGroup(group)) {
         headers.set(TRUSTED_STEP_UP_GROUP_HEADER, group);
     }
+}
+
+/**
+ * Optional step-up for effective-sensitivity routes (Site Config).
+ * Missing token continues without a trusted stamp so Rust can decide AUTH_STEP_UP_REQUIRED.
+ * Invalid/expired/wrong-bound token fails closed with AUTH_STEP_UP_REQUIRED.
+ */
+export function acceptOptionalStepUp(actionGroup: StepUpActionGroup) {
+    if (!isStepUpActionGroup(actionGroup)) {
+        throw new Error(`Unknown step-up action group: ${actionGroup}`);
+    }
+    return async function optionalStepUpMiddleware(request: AuthRequest, reply: FastifyReply) {
+        const headerValue = request.headers[STEP_UP_GRANT_HEADER];
+        if (Array.isArray(headerValue) && headerValue.length !== 1) {
+            return sendStepUpRequiredError(reply, actionGroup);
+        }
+        const token = Array.isArray(headerValue) ? headerValue[0] : headerValue;
+        if (!token || typeof token !== 'string' || !token.trim()) {
+            return;
+        }
+        const user = request.user;
+        if (!user?.id || user.authMode !== 'refresh-session' || !user.sessionId) {
+            return sendStepUpRequiredError(reply, actionGroup);
+        }
+        try {
+            const claims = verifyStepUpGrant(token.trim(), {
+                sub: user.id,
+                sid: user.sessionId,
+                actionGroup,
+            });
+            (request as AuthRequest & { stepUpActionGroup?: StepUpActionGroup }).stepUpActionGroup =
+                claims.actionGroup as StepUpActionGroup;
+        } catch {
+            return sendStepUpRequiredError(reply, actionGroup);
+        }
+    };
 }

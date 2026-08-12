@@ -155,6 +155,13 @@ fn validate_cross_field_settings(next_settings: &Map<String, Value>) -> Result<(
     Ok(())
 }
 
+pub(super) fn validate_setting_json_value_for_policy(
+    key: &str,
+    value: &Value,
+) -> Result<Value, Response> {
+    validate_setting_json_value(key, value)
+}
+
 fn validate_setting_json_value(key: &str, value: &Value) -> Result<Value, Response> {
     match key {
         "brand" => ensure_text(value, "Brand", 80),

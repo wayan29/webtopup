@@ -690,7 +690,7 @@ pub fn app(state: Arc<AppState>) -> Router {
         )
         .route(
             "/v2/settings/admin/{key}",
-            get(settings::admin_detail).put(settings::admin_set),
+            get(settings::admin_detail),
         )
         .route(
             "/v2/margins",

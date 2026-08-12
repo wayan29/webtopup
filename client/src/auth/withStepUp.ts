@@ -259,12 +259,19 @@ export function createStepUpOrchestrator(deps: StepUpOrchestratorDeps) {
         throw new StepUpBindingError('Sesi berubah; verifikasi ulang dibatalkan');
       }
 
+      const hasStableIdempotencyKey = Object.entries(headersSnapshot).some(([name, value]) => {
+        if (name.toLowerCase() !== 'idempotency-key') return false;
+        if (typeof value === 'string') return value.trim().length > 0;
+        if (Array.isArray(value)) return value.some((item) => typeof item === 'string' && item.trim().length > 0);
+        return false;
+      });
       pending = {
         actionGroup,
         sid,
         headers: { ...headersSnapshot },
-        // Closed inventory: requireStepUp runs before proxy, so this 403 never reached Rust.
-        gatewayRejectedBeforeUpstream: true,
+        // Stable Idempotency-Key means the 403 may have reached Rust (Site Config effective step-up).
+        // Legacy no-key closed routes remain gateway-local.
+        gatewayRejectedBeforeUpstream: !hasStableIdempotencyKey,
         execute: attempt as () => Promise<unknown>,
       };
       setDialog({ open: true, actionGroup, error: null, busy: false });
