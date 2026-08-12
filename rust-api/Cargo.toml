@@ -13,6 +13,10 @@ path = "src/bin/ensure_product_id_integrity.rs"
 name = "ensure_staff_2fa_deadlines"
 path = "src/bin/ensure_staff_2fa_deadlines.rs"
 
+[[bin]]
+name = "site_config_identifier_readiness"
+path = "src/bin/site_config_identifier_readiness.rs"
+
 [dependencies]
 ammonia = "=4.1.2"
 base64 = "=0.22.1"

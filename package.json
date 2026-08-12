@@ -58,7 +58,8 @@
     "dev-verify:reset": "npm run dev-verify -- reset",
     "dev-verify:down": "npm run dev-verify -- down",
     "dev-verify:status": "npm run dev-verify -- status",
-    "test:dev-verify:unit": "node --import tsx --test tools/dev-verification/unit/*.test.ts client/src/lib/auditLogQuery.test.ts && node --test scripts/security/*.test.js"
+    "test:dev-verify:unit": "node --import tsx --test tools/dev-verification/unit/*.test.ts client/src/lib/auditLogQuery.test.ts && node --test scripts/security/*.test.js",
+    "site-config:identifier-readiness": "cd rust-api && cargo run --bin site_config_identifier_readiness --"
   },
   "keywords": [
     "ppob",
