@@ -52,6 +52,7 @@ pub struct CanonicalImage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImagePolicyError {
     UploadTooLarge,
+    UploadBatchLimitExceeded,
     UnsupportedImageFormat,
     InvalidImageContent,
     ImageDimensionsExceeded,
@@ -63,6 +64,7 @@ impl ImagePolicyError {
     pub fn code(self) -> &'static str {
         match self {
             Self::UploadTooLarge => "UPLOAD_TOO_LARGE",
+            Self::UploadBatchLimitExceeded => "UPLOAD_BATCH_LIMIT_EXCEEDED",
             Self::UnsupportedImageFormat => "UNSUPPORTED_IMAGE_FORMAT",
             Self::InvalidImageContent => "INVALID_IMAGE_CONTENT",
             Self::ImageDimensionsExceeded => "IMAGE_DIMENSIONS_EXCEEDED",
@@ -74,6 +76,9 @@ impl ImagePolicyError {
     pub fn message(self) -> &'static str {
         match self {
             Self::UploadTooLarge => "Ukuran file melebihi batas 5 MiB",
+            Self::UploadBatchLimitExceeded => {
+                "Batch upload melebihi batas 10 file atau 20 MiB agregat"
+            }
             Self::UnsupportedImageFormat => "Format gambar tidak didukung",
             Self::InvalidImageContent => "Konten gambar tidak valid",
             Self::ImageDimensionsExceeded => "Dimensi gambar melebihi 4096×4096",

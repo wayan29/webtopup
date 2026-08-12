@@ -1,5 +1,6 @@
 mod handlers;
 mod policy;
+mod publication;
 mod storage;
 mod types;
 mod validation;

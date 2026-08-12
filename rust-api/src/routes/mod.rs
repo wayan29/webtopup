@@ -720,12 +720,20 @@ pub fn app(state: Arc<AppState>) -> Router {
         )
         .route("/v2/teams/{id}/login-logs", get(teams::login_logs))
         .route("/v2/upload/list", get(uploads::list_files))
-        .route("/v2/upload", axum::routing::post(uploads::upload_file))
+        .route(
+            "/v2/upload",
+            axum::routing::post(uploads::upload_file)
+                .delete(uploads::delete_file)
+                // Single upload: total-request ceiling above the 5 MiB per-file handler limit.
+                .layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
         .route(
             "/v2/upload/multiple",
-            axum::routing::post(uploads::upload_multiple),
+            axum::routing::post(uploads::upload_multiple)
+                // Multiple upload: 24 MiB total-request ceiling so the 20 MiB aggregate file-byte
+                // handler limit remains authoritative after multipart framing.
+                .layer(DefaultBodyLimit::max(24 * 1024 * 1024)),
         )
-        .route("/v2/upload", axum::routing::delete(uploads::delete_file))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::security::enforce_two_factor_enrollment,

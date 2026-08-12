@@ -5,19 +5,24 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-
 use crate::{
     security::{require_any_permission, ErrorResponse},
     state::AppState,
 };
 
 use super::{
-    storage::{generate_file_name, list_uploaded_files, upload_root},
-    types::{
-        UploadDeleteQuery, UploadDeleteResponse, UploadListQuery, UploadListResponse,
-        UploadMultipleResponse, UploadResponse, UploadedFileResponse,
+    policy::{
+        validate_and_reencode_image, ImagePolicyError, MAX_UPLOAD_BATCH_BYTES,
+        MAX_UPLOAD_BATCH_FILES, MAX_UPLOAD_BYTES,
     },
-    validation::{is_allowed_mime_type, is_safe_filename, resolve_upload_folder},
+    publication::{publish_batch, stage_canonical_image, UploadStorageError},
+    storage::{list_uploaded_files, upload_root},
+    types::{
+        UploadDeleteQuery, UploadDeleteResponse, UploadErrorBody, UploadErrorEnvelope,
+        UploadListQuery, UploadListResponse, UploadMultipleResponse, UploadResponse,
+        UploadedFileResponse,
+    },
+    validation::{is_safe_filename, resolve_upload_folder},
 };
 
 pub async fn list_files(
@@ -52,49 +57,38 @@ pub async fn upload_file(
         return response;
     }
 
-    while let Ok(Some(field)) = multipart.next_field().await {
-        let Some(original_name) = field.file_name().map(ToString::to_string) else {
+    while let Ok(Some(mut field)) = multipart.next_field().await {
+        if field.file_name().is_none() {
             continue;
-        };
-        let mime_type = field
-            .content_type()
-            .map(ToString::to_string)
-            .unwrap_or_default();
-
-        if !is_allowed_mime_type(&mime_type) {
-            return status_message(
-                axum::http::StatusCode::BAD_REQUEST,
-                "Invalid file type. Only images allowed.",
-            );
         }
+
+        let bytes = match read_bounded_field(&mut field).await {
+            Ok(bytes) => bytes,
+            Err(error) => return error.into_response(),
+        };
+        let image = match validate_and_reencode_image(&bytes) {
+            Ok(image) => image,
+            Err(error) => return error.into_response(),
+        };
 
         let folder = resolve_upload_folder(query.upload_type.as_deref());
-        let filename = generate_file_name(&original_name);
-        let folder_path = upload_root().join(&folder);
-        if std::fs::create_dir_all(&folder_path).is_err() {
-            return status_message(
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to upload file",
-            );
-        }
-        let file_path = folder_path.join(&filename);
-        let Ok(bytes) = field.bytes().await else {
-            return status_message(
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to upload file",
-            );
+        let root = upload_root();
+        let staged = match stage_canonical_image(&root, &folder, image) {
+            Ok(staged) => staged,
+            Err(error) => return error.into_response(),
         };
-        if std::fs::write(&file_path, bytes).is_err() {
-            return status_message(
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to upload file",
-            );
-        }
+        let published = match publish_batch(vec![staged]) {
+            Ok(published) => published,
+            Err(error) => return error.into_response(),
+        };
+        let Some(file) = published.into_iter().next() else {
+            return UploadStorageError::Failed.into_response();
+        };
 
         return Json(UploadResponse {
             success: true,
-            url: format!("/uploads/{folder}/{filename}"),
-            filename,
+            url: file.url,
+            filename: file.filename,
         })
         .into_response();
     }
@@ -115,52 +109,62 @@ pub async fn upload_multiple(
     }
 
     let folder = resolve_upload_folder(query.upload_type.as_deref());
-    let folder_path = upload_root().join(&folder);
-    if std::fs::create_dir_all(&folder_path).is_err() {
-        return status_message(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to upload files",
+    let root = upload_root();
+    let mut staged_items = Vec::new();
+    let mut file_count = 0usize;
+    let mut aggregate_bytes = 0usize;
+
+    while let Ok(Some(mut field)) = multipart.next_field().await {
+        if field.file_name().is_none() {
+            continue;
+        }
+
+        file_count = file_count.saturating_add(1);
+        if file_count > MAX_UPLOAD_BATCH_FILES {
+            return ImagePolicyError::UploadBatchLimitExceeded.into_response();
+        }
+
+        let bytes = match read_bounded_field(&mut field).await {
+            Ok(bytes) => bytes,
+            Err(error) => return error.into_response(),
+        };
+        aggregate_bytes = aggregate_bytes.saturating_add(bytes.len());
+        if aggregate_bytes > MAX_UPLOAD_BATCH_BYTES {
+            return ImagePolicyError::UploadBatchLimitExceeded.into_response();
+        }
+
+        let image = match validate_and_reencode_image(&bytes) {
+            Ok(image) => image,
+            Err(error) => return error.into_response(),
+        };
+        match stage_canonical_image(&root, &folder, image) {
+            Ok(staged) => staged_items.push(staged),
+            Err(error) => return error.into_response(),
+        }
+    }
+
+    if staged_items.is_empty() {
+        return batch_error(
+            axum::http::StatusCode::BAD_REQUEST,
+            "NO_FILES_UPLOADED",
+            "Tidak ada file yang diunggah",
         );
     }
 
-    let mut uploaded_files = Vec::new();
-    while let Ok(Some(field)) = multipart.next_field().await {
-        let Some(original_name) = field.file_name().map(ToString::to_string) else {
-            continue;
-        };
-        let mime_type = field
-            .content_type()
-            .map(ToString::to_string)
-            .unwrap_or_default();
-        if !is_allowed_mime_type(&mime_type) {
-            continue;
-        }
-
-        let filename = generate_file_name(&original_name);
-        let file_path = folder_path.join(&filename);
-        let Ok(bytes) = field.bytes().await else {
-            return status_message(
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to upload files",
-            );
-        };
-        if std::fs::write(&file_path, bytes).is_err() {
-            return status_message(
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to upload files",
-            );
-        }
-        uploaded_files.push(UploadedFileResponse {
-            url: format!("/uploads/{folder}/{filename}"),
-            filename,
-        });
+    match publish_batch(staged_items) {
+        Ok(published) => Json(UploadMultipleResponse {
+            success: true,
+            files: published
+                .into_iter()
+                .map(|file| UploadedFileResponse {
+                    url: file.url,
+                    filename: file.filename,
+                })
+                .collect(),
+        })
+        .into_response(),
+        Err(error) => error.into_response(),
     }
-
-    Json(UploadMultipleResponse {
-        success: true,
-        files: uploaded_files,
-    })
-    .into_response()
 }
 
 pub async fn delete_file(
@@ -194,6 +198,28 @@ pub async fn delete_file(
     }
 }
 
+async fn read_bounded_field(
+    field: &mut axum::extract::multipart::Field<'_>,
+) -> Result<Vec<u8>, ImagePolicyError> {
+    let mut bytes = Vec::new();
+    loop {
+        match field.chunk().await {
+            Ok(Some(chunk)) => {
+                if bytes.len().saturating_add(chunk.len()) > MAX_UPLOAD_BYTES {
+                    return Err(ImagePolicyError::UploadTooLarge);
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(_) => return Err(ImagePolicyError::InvalidImageContent),
+        }
+    }
+    if bytes.is_empty() {
+        return Err(ImagePolicyError::UnsupportedImageFormat);
+    }
+    Ok(bytes)
+}
+
 async fn require_upload_permission(
     headers: &axum::http::HeaderMap,
     state: &AppState,
@@ -212,4 +238,14 @@ async fn require_upload_permission(
 
 fn status_message(status: axum::http::StatusCode, message: &'static str) -> Response {
     (status, Json(ErrorResponse { message })).into_response()
+}
+
+fn batch_error(status: axum::http::StatusCode, code: &'static str, message: &'static str) -> Response {
+    (
+        status,
+        Json(UploadErrorEnvelope {
+            error: UploadErrorBody { code, message },
+        }),
+    )
+        .into_response()
 }

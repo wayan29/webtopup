@@ -58,6 +58,9 @@ pub fn upload_root() -> PathBuf {
     PathBuf::from("../uploads")
 }
 
+/// Legacy client-extension filename helper retained only for non-image callers.
+/// Image uploads must use `publication::stage_canonical_image` instead.
+#[allow(dead_code)]
 pub fn generate_file_name(original_name: &str) -> String {
     let extension = std::path::Path::new(original_name)
         .extension()
