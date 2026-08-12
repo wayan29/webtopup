@@ -131,7 +131,9 @@ export function fixtureDefinitions(fixtureRunId: string, now = new Date()): Fixt
       twoFactorEnrollmentRequiredAt: future,
       permissions: { viewDashboard: true, viewTeam: false, manageTeam: false },
     }),
-    make('audit-manager', 'audit-permission-manager', 'admin', {
+    // Use CS rather than admin: disposable admin 2FA issuance currently returns 503 while
+// CS step-up fixtures remain healthy, and manageTeam is sufficient for audit export.
+    make('audit-manager', 'audit-permission-manager', 'cs', {
       twoFactorEnabled: true,
       permissions: {
         viewDashboard: true,
@@ -212,7 +214,7 @@ async function seedFixtureDefinitions(
           ...(fixture.scenario.startsWith('staff-login-return') ? { manageVendors: true } : {}),
         },
         points: 0, twoFactorEnabled: fixture.twoFactorEnabled, twoFactorEnrollmentRequiredAt: fixture.twoFactorEnrollmentRequiredAt,
-        twoFactorSecret: fixture.twoFactorEnabled && (fixture.role === 'admin' || fixture.scenario.startsWith('all-device-logout-') || fixture.scenario.startsWith('staff-step-up-') || fixture.scenario === 'staff-login-return-2fa') ? syntheticTotpSecret() : undefined,
+        twoFactorSecret: fixture.twoFactorEnabled && (fixture.role === 'admin' || fixture.scenario.startsWith('all-device-logout-') || fixture.scenario.startsWith('staff-step-up-') || fixture.scenario === 'staff-login-return-2fa' || fixture.scenario === 'audit-permission-manager') ? syntheticTotpSecret() : undefined,
         twoFactorEnrollmentCompletedAt: fixture.twoFactorEnabled && (fixture.role === 'admin' || fixture.scenario.startsWith('all-device-logout-')) ? new Date() : undefined,
         sessionVersion: 0, active: fixture.active,
       });

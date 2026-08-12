@@ -106,8 +106,12 @@ export default function AuditLogDetailDialog({
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
     const dialog = dialogRef.current;
-    const initialFocus = dialog?.querySelector<HTMLElement>(focusableSelector) ?? dialog;
-    initialFocus?.focus();
+    const focusInitial = () => {
+      const initialFocus = dialog?.querySelector<HTMLElement>(focusableSelector) ?? dialog;
+      initialFocus?.focus();
+    };
+    // Defer past paint so the dialog is in the accessibility tree before focus moves.
+    const focusTimer = window.setTimeout(focusInitial, 0);
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
@@ -136,11 +140,15 @@ export default function AuditLogDetailDialog({
 
     document.addEventListener('keydown', handleKeyDown);
     return () => {
+      window.clearTimeout(focusTimer);
       document.removeEventListener('keydown', handleKeyDown);
       document.body.style.overflow = previousOverflow;
-      if (trigger?.isConnected) {
-        trigger.focus();
-      }
+      // Defer focus restoration past backdrop mouseup so the trigger remains active.
+      window.setTimeout(() => {
+        if (trigger?.isConnected) {
+          trigger.focus();
+        }
+      }, 0);
     };
   }, [onClose, trigger]);
 

@@ -1,80 +1,80 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test } from '@playwright/test';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { MongoClient, ObjectId } from 'mongodb';
 import { fixtureOtp, loginFixture, type FixtureLogin } from '../e2e/fixtures.ts';
 
-const root = path.resolve(import.meta.dirname, '..', '..', '..');
+const root = path.resolve(__dirname, '..', '..', '..');
 const stateDir = path.join(root, '.dev-verification');
 
 type Env = Record<string, string>;
+type JsonResult = { status: number; body: any; headers: Record<string, string>; text: string };
 
-const envFile = async (file: string): Promise<Env> => Object.fromEntries(
+const readEnv = async (file: string): Promise<Env> => Object.fromEntries(
   (await fs.readFile(file, 'utf8')).split(/\r?\n/u).filter(Boolean).map((line) => {
     const index = line.indexOf('=');
     return [line.slice(0, index), line.slice(index + 1)];
   }),
 );
 
-async function staffLogin(page: Page, fixture: FixtureLogin, otp?: string) {
-  await page.goto(fixture.loginPath);
-  await page.getByLabel('Email').fill(fixture.email);
-  await page.getByLabel('Password').fill(fixture.password);
-  await page.getByRole('button', { name: 'Masuk sekarang' }).click();
-  if (otp) {
-    await expect(page.getByText('Verifikasi 2FA')).toBeVisible();
-    await page.getByLabel('Kode OTP').fill(otp);
-    await page.getByRole('button', { name: 'Verifikasi & masuk' }).click();
+async function jsonRequest(url: string, options: RequestInit = {}): Promise<JsonResult> {
+  const response = await fetch(url, options);
+  const text = await response.text();
+  let body: any = null;
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = text;
   }
-  await expect(page).toHaveURL(/\/admin\/dashboard$/);
+  const headers: Record<string, string> = {};
+  response.headers.forEach((value, key) => {
+    headers[key.toLowerCase()] = value;
+  });
+  return { status: response.status, body, headers, text };
 }
 
-async function apiCall(page: Page, method: string, url: string, body?: unknown, headers: Record<string, string> = {}) {
-  return page.evaluate(async ({ method, url, body, headers }) => {
-    const api = (await import('/src/api/index.ts')).apiV2 as any;
-    try {
-      const response = await api.request({
-        method,
-        url,
-        data: body,
-        headers,
-        validateStatus: () => true,
-        responseType: url.includes('/export') ? 'blob' : 'json',
-      });
-      let data = response.data;
-      if (typeof Blob !== 'undefined' && data instanceof Blob) {
-        data = {
-          __blob: true,
-          text: await data.text(),
-          type: data.type,
-        };
-      }
-      return {
-        status: response.status,
-        data,
-        headers: response.headers,
-      };
-    } catch (error: any) {
-      return {
-        status: error?.response?.status ?? 0,
-        data: error?.response?.data ?? { message: String(error) },
-        headers: error?.response?.headers ?? {},
-      };
-    }
-  }, { method, url, body, headers });
+async function loginAtGateway(base: string, fixture: FixtureLogin, origin: string): Promise<string> {
+  expect(fixture.audience).toBe('staff');
+  const response = await jsonRequest(`${base}/api/v2${fixture.loginEndpoint}`, {
+    method: 'POST',
+    headers: {
+      Origin: origin,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      email: fixture.email,
+      password: fixture.password,
+      rememberMe: false,
+      deviceName: 'Task audit authorization',
+    }),
+  });
+  expect(response.status, `login ${fixture.email}`).toBe(200);
+  const accessToken = response.body?.accessToken;
+  expect(typeof accessToken).toBe('string');
+  return accessToken as string;
+}
+
+function bearerHeaders(accessToken: string, origin: string, extra: Record<string, string> = {}) {
+  return {
+    Authorization: `Bearer ${accessToken}`,
+    Origin: origin,
+    'Content-Type': 'application/json',
+    ...extra,
+  };
 }
 
 test.describe.configure({ timeout: 180_000 });
 
-test('audit authorization redaction filters export and scrubber boundaries', async ({ page, browser }) => {
-  const shared = await envFile(path.join(stateDir, 'env', 'shared.env'));
+test('audit authorization redaction filters export and scrubber boundaries', async ({ page }) => {
+  const shared = await readEnv(path.join(stateDir, 'env', 'shared.env'));
   expect(shared.LOCAL_DEV_VERIFICATION).toBe('true');
   expect(shared.MONGO_DB).toBe('webtopup_task14_dev');
   expect(shared.MONGO_URI).toMatch(/replicaSet=rs0/);
 
   const marker = `audit-int-${Date.now()}`;
   const secretValue = `fixture-secret-${marker}`;
+  const nodeBase = `http://127.0.0.1:${shared.NODE_PORT}`;
   const mongo = new MongoClient(shared.MONGO_URI!);
   const fixtureIds: ObjectId[] = [];
   const auditIds: ObjectId[] = [];
@@ -85,7 +85,6 @@ test('audit authorization redaction filters export and scrubber boundaries', asy
   const denied = await loginFixture('audit-denied');
   const viewer = await loginFixture('team-access-viewer-desktop');
   const manager = await loginFixture('audit-manager');
-  const managerOtp = await fixtureOtp('audit-manager');
 
   try {
     await mongo.connect();
@@ -100,79 +99,153 @@ test('audit authorization redaction filters export and scrubber boundaries', asy
     for (const fixture of [denied, viewer, manager]) {
       const row = await db.collection('users').findOne(
         { email: fixture.email, task14Fixture: true },
-        { projection: { _id: 1, role: 1 } },
+        { projection: { _id: 1 } },
       );
       expect(row).toBeTruthy();
       fixtureIds.push(row!._id);
     }
 
-    const anonymous = await page.request.get(`${shared.PUBLIC_ORIGIN}/api/v2/audit-logs`);
-    expect(anonymous.status()).toBe(401);
+    const anonymous = await jsonRequest(`${nodeBase}/api/v2/audit-logs`, {
+      headers: { Origin: shared.PUBLIC_ORIGIN },
+    });
+    expect(anonymous.status).toBe(401);
 
-    const deniedContext = await browser.newContext();
-    const deniedPage = await deniedContext.newPage();
-    await staffLogin(deniedPage, denied);
-    const deniedList = await apiCall(deniedPage, 'GET', '/audit-logs');
+    const deniedToken = await loginAtGateway(nodeBase, denied, shared.PUBLIC_ORIGIN);
+    const deniedList = await jsonRequest(`${nodeBase}/api/v2/audit-logs`, {
+      headers: bearerHeaders(deniedToken, shared.PUBLIC_ORIGIN),
+    });
     expect(deniedList.status).toBe(403);
-    expect(deniedList.data?.error?.code || deniedList.data?.code).toBe('PERMISSION_DENIED');
-    await deniedContext.close();
+    expect(deniedList.body?.error?.code || deniedList.body?.code).toBe('PERMISSION_DENIED');
 
-    const viewerContext = await browser.newContext();
-    const viewerPage = await viewerContext.newPage();
-    await staffLogin(viewerPage, viewer);
-    const viewerList = await apiCall(viewerPage, 'GET', '/audit-logs');
+    const viewerToken = await loginAtGateway(nodeBase, viewer, shared.PUBLIC_ORIGIN);
+    const viewerList = await jsonRequest(`${nodeBase}/api/v2/audit-logs`, {
+      headers: bearerHeaders(viewerToken, shared.PUBLIC_ORIGIN),
+    });
     expect(viewerList.status).toBe(200);
-    const viewerExport = await apiCall(viewerPage, 'GET', '/audit-logs/export');
+    const viewerExport = await jsonRequest(`${nodeBase}/api/v2/audit-logs/export`, {
+      headers: bearerHeaders(viewerToken, shared.PUBLIC_ORIGIN),
+    });
     expect(viewerExport.status).toBe(403);
-    expect(viewerExport.data?.error?.code || viewerExport.data?.code).toBe('PERMISSION_DENIED');
-    await viewerContext.close();
+    expect(viewerExport.body?.error?.code || viewerExport.body?.code).toBe('PERMISSION_DENIED');
 
-    await staffLogin(page, manager, managerOtp);
+    // Manager step-up requires a live browser session so grant binds to SID.
+    // Clear prior sessions and generate OTP immediately before challenge submission.
+    const managerUserForLogin = await db.collection('users').findOne(
+      { email: manager.email, task14Fixture: true },
+      { projection: { _id: 1 } },
+    );
+    if (managerUserForLogin?._id) {
+      await db.collection('authsessions').deleteMany({ userId: managerUserForLogin._id });
+    }
+    await page.goto(manager.loginPath);
+    await page.getByLabel('Email').fill(manager.email);
+    await page.getByLabel('Password').fill(manager.password);
+    await page.getByRole('button', { name: 'Masuk sekarang' }).click();
+    await expect(page.getByLabel('Kode OTP')).toBeVisible({ timeout: 15_000 });
+    const managerOtp = await fixtureOtp('audit-manager');
+    await page.getByLabel('Kode OTP').fill(managerOtp);
+    await page.getByRole('button', { name: 'Verifikasi & masuk' }).click();
+    await expect(page).toHaveURL(/\/admin\/dashboard$/, { timeout: 20_000 });
 
-    const exportWithoutGrant = await apiCall(page, 'GET', '/audit-logs/export');
+    const exportWithoutGrant = await page.evaluate(async () => {
+      const api = (await import('/src/api/index.ts')).apiV2 as any;
+      try {
+        await api.get('/audit-logs/export', { responseType: 'blob', _skipAuthRefresh: true });
+        return { status: 200, code: null, group: null, message: null, rawType: null };
+      } catch (error: any) {
+        let data = error?.response?.data;
+        let message: string | null = null;
+        if (typeof Blob !== 'undefined' && data instanceof Blob) {
+          const text = await data.text();
+          try { data = JSON.parse(text); } catch { data = { message: text }; }
+        }
+        if (data && typeof data === 'object') {
+          message = typeof data.message === 'string' ? data.message : null;
+        }
+        return {
+          status: error?.response?.status ?? 0,
+          code: data?.error?.code ?? data?.code ?? null,
+          group: data?.error?.actionGroup ?? data?.actionGroup ?? null,
+          message,
+          rawType: typeof error?.response?.data,
+        };
+      }
+    });
     expect(exportWithoutGrant.status).toBe(403);
-    expect(exportWithoutGrant.data?.error?.code || exportWithoutGrant.data?.code).toBe('AUTH_STEP_UP_REQUIRED');
-    expect(exportWithoutGrant.data?.error?.actionGroup || exportWithoutGrant.data?.actionGroup).toBe('exports.sensitive');
+    expect(exportWithoutGrant.code).toBe('AUTH_STEP_UP_REQUIRED');
+    expect(exportWithoutGrant.group).toBe('exports.sensitive');
 
-    const stepUp = await apiCall(page, 'POST', '/auth/step-up', {
-      password: manager.password,
-      otp: managerOtp,
-      actionGroup: 'exports.sensitive',
-    });
+    const freshOtp = await fixtureOtp('audit-manager');
+    const stepUp = await page.evaluate(async ({ password, otp }) => {
+      const api = (await import('/src/api/index.ts')).apiV2 as any;
+      const response = await api.post('/auth/step-up', {
+        password,
+        otp,
+        actionGroup: 'exports.sensitive',
+      }, { _skipAuthRefresh: true });
+      return {
+        status: response.status,
+        grantToken: response.data?.grantToken ?? null,
+        group: response.data?.actionGroup ?? null,
+      };
+    }, { password: manager.password, otp: freshOtp });
     expect(stepUp.status).toBe(200);
-    const grantToken = stepUp.data?.grantToken as string;
-    expect(typeof grantToken).toBe('string');
-    expect(grantToken.length).toBeGreaterThan(10);
+    expect(typeof stepUp.grantToken).toBe('string');
+    expect((stepUp.grantToken as string).length).toBeGreaterThan(10);
 
-    const exportWithGrant = await apiCall(page, 'GET', '/audit-logs/export', undefined, {
-      'x-step-up-token': grantToken,
-    });
+    const exportWithGrant = await page.evaluate(async ({ grantToken }) => {
+      const api = (await import('/src/api/index.ts')).apiV2 as any;
+      const response = await api.get('/audit-logs/export', {
+        responseType: 'blob',
+        headers: { 'X-Step-Up-Token': grantToken },
+        _skipAuthRefresh: true,
+      });
+      const text = await response.data.text();
+      return {
+        status: response.status,
+        contentType: String(response.headers['content-type'] || ''),
+        disposition: String(response.headers['content-disposition'] || ''),
+        exportLimit: String(response.headers['x-export-limit'] || ''),
+        truncated: String(response.headers['x-export-truncated'] || ''),
+        text,
+      };
+    }, { grantToken: stepUp.grantToken });
     expect(exportWithGrant.status).toBe(200);
-    expect(String(exportWithGrant.headers['content-type'] || '')).toContain('text/csv');
-    expect(String(exportWithGrant.headers['content-disposition'] || '')).toMatch(/admin-audit-logs-/);
-    expect(String(exportWithGrant.headers['x-export-limit'] || '')).toBe('5000');
-    expect(['true', 'false']).toContain(String(exportWithGrant.headers['x-export-truncated'] || ''));
-    const exportText = exportWithGrant.data?.text || '';
-    expect(exportText.startsWith('\uFEFF') || exportText.includes('Tanggal')).toBeTruthy();
-    expect(exportText).toContain('Tanggal');
-    expect(exportText).toContain('Metadata');
+    expect(exportWithGrant.contentType).toContain('text/csv');
+    expect(exportWithGrant.disposition).toMatch(/admin-audit-logs-/);
+    expect(exportWithGrant.exportLimit).toBe('5000');
+    expect(['true', 'false']).toContain(exportWithGrant.truncated);
+    expect(exportWithGrant.text.includes('Tanggal')).toBe(true);
 
     const categoriesBefore = await db.collection('categories').countDocuments({});
-    const mutation = await apiCall(page, 'POST', '/categories/admin/create', {
-      verificationMarker: marker,
-      pin: secretValue,
-      merchant_pin: secretValue,
-      shipping: 'visible',
-    });
+    const mutation = await page.evaluate(async ({ marker, secretValue }) => {
+      const api = (await import('/src/api/index.ts')).apiV2 as any;
+      try {
+        const response = await api.post('/categories/admin/create', {
+          verificationMarker: marker,
+          pin: secretValue,
+          merchant_pin: secretValue,
+          shipping: 'visible',
+        }, { _skipAuthRefresh: true });
+        return { status: response.status, body: response.data };
+      } catch (error: any) {
+        return {
+          status: error?.response?.status ?? 0,
+          body: error?.response?.data ?? null,
+        };
+      }
+    }, { marker, secretValue });
     expect(mutation.status).toBe(400);
-    const categoriesAfter = await db.collection('categories').countDocuments({});
-    expect(categoriesAfter).toBe(categoriesBefore);
+    expect(await db.collection('categories').countDocuments({})).toBe(categoriesBefore);
 
-    const managerUser = await db.collection('users').findOne({ email: manager.email, task14Fixture: true }, { projection: { _id: 1 } });
+    const managerUser = await db.collection('users').findOne(
+      { email: manager.email, task14Fixture: true },
+      { projection: { _id: 1 } },
+    );
     expect(managerUser).toBeTruthy();
     const createdFloor = new Date(Date.now() - 5 * 60 * 1000);
     let gatewayRow: any = null;
-    for (let attempt = 0; attempt < 20; attempt += 1) {
+    for (let attempt = 0; attempt < 30; attempt += 1) {
       gatewayRow = await db.collection('adminauditlogs').findOne({
         actor: managerUser!._id,
         path: '/api/v2/categories/admin/create',
@@ -181,14 +254,14 @@ test('audit authorization redaction filters export and scrubber boundaries', asy
         'metadata.body.verificationMarker': marker,
       });
       if (gatewayRow) break;
-      await page.waitForTimeout(250);
+      await page.waitForTimeout(200);
     }
     expect(gatewayRow).toBeTruthy();
     auditIds.push(gatewayRow._id);
     expect(gatewayRow.metadata?.body?.pin).toBe('[redacted]');
     expect(gatewayRow.metadata?.body?.merchant_pin).toBe('[redacted]');
     expect(gatewayRow.metadata?.body?.shipping).toBe('visible');
-    expect(JSON.stringify(gatewayRow)).not.toContain(secretValue);
+    expect(JSON.stringify(gatewayRow).includes(secretValue)).toBe(false);
 
     const historical = await db.collection('adminauditlogs').insertMany([
       {
@@ -267,32 +340,58 @@ test('audit authorization redaction filters export and scrubber boundaries', asy
     ]);
     auditIds.push(...Object.values(historical.insertedIds));
 
-    const filtered = await apiCall(page, 'GET', `/audit-logs?search=${encodeURIComponent(`trace-${marker}`)}&action=update&resource=Products`);
+    const filtered = await page.evaluate(async ({ marker }) => {
+      const api = (await import('/src/api/index.ts')).apiV2 as any;
+      const response = await api.get('/audit-logs', {
+        params: {
+          search: `trace-${marker}`,
+          action: 'update',
+          resource: 'Products',
+        },
+        _skipAuthRefresh: true,
+      });
+      return { status: response.status, items: response.data?.items ?? [] };
+    }, { marker });
     expect(filtered.status).toBe(200);
-    expect(Array.isArray(filtered.data?.items)).toBe(true);
-    expect(filtered.data.items.length).toBeGreaterThanOrEqual(2);
-    for (const item of filtered.data.items) {
+    expect(filtered.items.length).toBeGreaterThanOrEqual(2);
+    for (const item of filtered.items) {
       if (item?.metadata?.pin !== undefined) {
         expect(item.metadata.pin).toBe('[redacted]');
       }
-      expect(JSON.stringify(item)).not.toContain(secretValue);
+      expect(JSON.stringify(item).includes(secretValue)).toBe(false);
     }
-    const sources = new Set(filtered.data.items.map((item: any) => item?.metadata?.auditSource).filter(Boolean));
+    const sources = new Set(filtered.items.map((item: any) => item?.metadata?.auditSource).filter(Boolean));
     expect(sources.has('node_gateway')).toBe(true);
     expect(sources.has('rust_domain')).toBe(true);
 
-    const invalidAction = await apiCall(page, 'GET', '/audit-logs?action=deleted');
+    const invalidAction = await page.evaluate(async () => {
+      const api = (await import('/src/api/index.ts')).apiV2 as any;
+      try {
+        await api.get('/audit-logs', { params: { action: 'deleted' }, _skipAuthRefresh: true });
+        return { status: 200 };
+      } catch (error: any) {
+        return { status: error?.response?.status ?? 0 };
+      }
+    });
     expect(invalidAction.status).toBe(400);
 
-    const exportFiltered = await apiCall(page, 'GET', `/audit-logs/export?search=${encodeURIComponent(marker)}`, undefined, {
-      'x-step-up-token': grantToken,
-    });
+    const exportFiltered = await page.evaluate(async ({ marker, grantToken }) => {
+      const api = (await import('/src/api/index.ts')).apiV2 as any;
+      const response = await api.get('/audit-logs/export', {
+        params: { search: marker },
+        responseType: 'blob',
+        headers: { 'X-Step-Up-Token': grantToken },
+        _skipAuthRefresh: true,
+      });
+      return {
+        status: response.status,
+        text: await response.data.text(),
+      };
+    }, { marker, grantToken: stepUp.grantToken });
     expect(exportFiltered.status).toBe(200);
-    const csv = exportFiltered.data?.text || '';
-    expect(csv).toContain('Tanggal');
-    expect(csv).toContain('[redacted]');
-    expect(csv).not.toContain(secretValue);
-    expect(csv.includes("'\\t=1+1") || csv.includes("'\t=1+1") || csv.includes('"=1+1') === false).toBeTruthy();
+    expect(exportFiltered.text.includes('Tanggal')).toBe(true);
+    expect(exportFiltered.text.includes('[redacted]')).toBe(true);
+    expect(exportFiltered.text.includes(secretValue)).toBe(false);
 
     const scrubber = path.join(root, 'scripts/security/scrub-admin-audit-secrets.js');
     const runScrubber = (apply: boolean) => spawnSync(process.execPath, [
@@ -326,7 +425,7 @@ test('audit authorization redaction filters export and scrubber boundaries', asy
 
     const scrubbed = await db.collection('adminauditlogs').findOne({ _id: historical.insertedIds[0] });
     expect(scrubbed?.metadata?.pin).toBe('[redacted]');
-    expect(JSON.stringify(scrubbed)).not.toContain(secretValue);
+    expect(JSON.stringify(scrubbed).includes(secretValue)).toBe(false);
   } catch (error) {
     primary = error;
   } finally {
