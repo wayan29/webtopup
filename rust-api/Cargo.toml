@@ -28,6 +28,7 @@ futures-util = "0.3"
 jsonwebtoken = "9.3"
 md5 = "0.7"
 hmac = "0.12"
+image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 mongodb = "3.4"
 rand = "0.8"
 regex = "1.11"

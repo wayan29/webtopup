@@ -53,3 +53,14 @@ pub struct UploadedFile {
     #[serde(rename = "uploadedAt")]
     pub uploaded_at: String,
 }
+
+#[derive(Serialize)]
+pub struct UploadErrorEnvelope {
+    pub error: UploadErrorBody,
+}
+
+#[derive(Serialize)]
+pub struct UploadErrorBody {
+    pub code: &'static str,
+    pub message: &'static str,
+}
