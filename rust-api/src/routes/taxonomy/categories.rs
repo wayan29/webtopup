@@ -244,11 +244,15 @@ pub async fn category_admin_create(
         Some(value) if value.is_finite() => normalize_non_negative_number(value),
         _ => max_sort_order(&categories).await + 1,
     };
+    let icon = payload.icon.unwrap_or_else(|| "📦".to_string());
+    if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&icon]) {
+        return response;
+    }
     let now = DateTime::now();
     let insert_doc = doc! {
         "name": normalized_name,
         "slug": slug,
-        "icon": payload.icon.unwrap_or_else(|| "📦".to_string()),
+        "icon": icon,
         "sortOrder": resolved_sort_order,
         "status": payload.status.unwrap_or(true),
         "createdAt": now,
@@ -345,6 +349,9 @@ pub async fn category_admin_update(
     }
 
     if let Some(icon) = payload.icon {
+        if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&icon]) {
+            return response;
+        }
         set_doc.insert("icon", icon);
     }
     if let Some(sort_order) = payload.sort_order {

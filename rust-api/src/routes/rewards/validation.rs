@@ -59,10 +59,19 @@ pub(super) fn normalize_reward_payload(
     if normalized.stock < 0 {
         return Err(validation_error("Stok hadiah tidak boleh negatif"));
     }
-    if !is_valid_http_url(&normalized.image_url) {
+    // Rewards historically required http(s). Managed internal upload paths are also accepted
+    // once the file exists on disk.
+    let is_managed = crate::services::managed_assets::parse_managed_upload_url(&normalized.image_url)
+        .is_ok();
+    if !is_managed && !is_valid_http_url(&normalized.image_url) {
         return Err(validation_error(
             "URL gambar harus diawali http:// atau https://",
         ));
+    }
+    if let Err(response) =
+        crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&normalized.image_url])
+    {
+        return Err(response);
     }
 
     Ok(normalized)

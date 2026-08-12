@@ -132,6 +132,84 @@ pub async fn managed_asset_exists(root: &Path, value: &str) -> Result<bool, Mana
         .unwrap_or(false))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedAssetReferenceError {
+    NotFound,
+}
+
+impl ManagedAssetReferenceError {
+    pub fn code(self) -> &'static str {
+        "MANAGED_ASSET_NOT_FOUND"
+    }
+
+    pub fn message(self) -> &'static str {
+        "Asset upload tidak ditemukan"
+    }
+}
+
+/// Empty values, emoji/category glyphs, bundled assets, and external HTTPS URLs pass.
+/// Only `/uploads/<folder>/<file>` is treated as a managed reference and must exist.
+pub async fn require_existing_managed_asset(
+    root: &Path,
+    value: &str,
+) -> Result<(), ManagedAssetReferenceError> {
+    require_existing_managed_asset_sync(root, value)
+}
+
+/// Synchronous variant for pure normalizers that already run on the async runtime thread.
+pub fn require_existing_managed_asset_sync(
+    root: &Path,
+    value: &str,
+) -> Result<(), ManagedAssetReferenceError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let Ok((folder, filename)) = parse_managed_upload_url(trimmed) else {
+        return Ok(());
+    };
+    let managed = match normalize_managed_asset(root, &folder, &filename) {
+        Ok(value) => value,
+        Err(_) => return Err(ManagedAssetReferenceError::NotFound),
+    };
+    if managed.filesystem_path.is_file() {
+        Ok(())
+    } else {
+        Err(ManagedAssetReferenceError::NotFound)
+    }
+}
+
+/// Axum response helper shared by writers.
+pub fn managed_asset_not_found_response() -> axum::response::Response {
+    use axum::{
+        response::IntoResponse,
+        Json,
+    };
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": {
+                "code": "MANAGED_ASSET_NOT_FOUND",
+                "message": "Asset upload tidak ditemukan"
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// Validate zero or more managed-or-external fields against the provided upload root.
+pub fn ensure_managed_fields(
+    root: &Path,
+    values: &[&str],
+) -> Result<(), axum::response::Response> {
+    for value in values {
+        if require_existing_managed_asset_sync(root, value).is_err() {
+            return Err(managed_asset_not_found_response());
+        }
+    }
+    Ok(())
+}
+
 pub async fn count_asset_references(
     db: &Database,
     url: &str,
@@ -254,5 +332,32 @@ mod tests {
     #[test]
     fn settings_image_keys_are_closed() {
         assert_eq!(SETTINGS_IMAGE_KEYS, &["favicon", "logo", "popupBannerImage"]);
+    }
+
+    #[tokio::test]
+    async fn managed_reference_requires_an_existing_canonical_file() {
+        let root = temp_root();
+        assert!(require_existing_managed_asset(&root, "").await.is_ok());
+        assert!(require_existing_managed_asset(&root, "📦").await.is_ok());
+        assert!(require_existing_managed_asset(&root, "https://cdn.invalid/x.png")
+            .await
+            .is_ok());
+        assert!(require_existing_managed_asset(&root, "/danayasa-logo.svg")
+            .await
+            .is_ok());
+        assert_eq!(
+            require_existing_managed_asset(&root, "/uploads/icons/missing.png")
+                .await
+                .unwrap_err()
+                .code(),
+            "MANAGED_ASSET_NOT_FOUND",
+        );
+
+        let existing = root.join("icons").join("present.png");
+        std::fs::write(&existing, b"x").unwrap();
+        assert!(require_existing_managed_asset(&root, "/uploads/icons/present.png")
+            .await
+            .is_ok());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

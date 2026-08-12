@@ -40,6 +40,9 @@ async fn validate_payment_method_payload_inner(
         text_value_or_current(payload.account_number, current, "accountNumber", "");
     let account_name = text_value_or_current(payload.account_name, current, "accountName", "");
     let icon = text_value_or_current(payload.icon, current, "icon", "");
+    if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&icon]) {
+        return Err(response);
+    }
     let operational_start = text_value_or_current(
         payload.operational_start,
         current,

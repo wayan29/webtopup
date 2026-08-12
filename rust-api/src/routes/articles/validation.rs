@@ -59,12 +59,19 @@ pub fn build_article_payload(
             .map(|document| read_string_default(document, "status", "draft"))
             .unwrap_or_else(|| "draft".to_string()),
     };
+    let image = text_value_or_current(payload.image, current, "image", "");
+    if let Err(response) = crate::services::managed_assets::ensure_managed_fields(
+        &crate::routes::uploads::upload_root(),
+        &[&image],
+    ) {
+        return Err(response);
+    }
     Ok(NormalizedArticlePayload {
         title,
         slug,
         excerpt,
         content,
-        image: text_value_or_current(payload.image, current, "image", ""),
+        image,
         category: {
             let category = text_value_or_current(payload.category, current, "category", "");
             if category.is_empty() {

@@ -437,6 +437,19 @@ pub async fn product_type_admin_create(
         .flatten()
         .map(|document| read_i64(&document, "typeId") + 1)
         .unwrap_or(1);
+    let icon = payload.icon.unwrap_or_default();
+    let cover = payload.cover.unwrap_or_default();
+    let popup_image = payload
+        .popup_info
+        .as_ref()
+        .and_then(|value| value.get("image"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    if let Err(response) =
+        crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&icon, &cover, popup_image])
+    {
+        return response;
+    }
     let popup_info = payload
         .popup_info
         .as_ref()
@@ -450,8 +463,8 @@ pub async fn product_type_admin_create(
         "slug": slug,
         "categoryId": category_id,
         "operatorId": operator_id,
-        "icon": payload.icon.unwrap_or_default(),
-        "cover": payload.cover.unwrap_or_default(),
+        "icon": icon,
+        "cover": cover,
         "openTime": payload.open_time.unwrap_or_else(|| "00:00".to_string()),
         "closeTime": payload.close_time.unwrap_or_else(|| "23:59".to_string()),
         "open24Hours": payload.open_24_hours.unwrap_or(true),
@@ -656,9 +669,15 @@ pub async fn product_type_admin_update(
         set_doc.insert("slug", &target_slug);
     }
     if let Some(value) = payload.icon {
+        if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&value]) {
+            return response;
+        }
         set_doc.insert("icon", value);
     }
     if let Some(value) = payload.cover {
+        if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&value]) {
+            return response;
+        }
         set_doc.insert("cover", value);
     }
     if let Some(value) = payload.open_time {
@@ -678,6 +697,15 @@ pub async fn product_type_admin_update(
     }
     apply_update_description(&mut set_doc, payload.description);
     if let Some(value) = payload.popup_info {
+        let popup_image = value
+            .get("image")
+            .and_then(|image| image.as_str())
+            .unwrap_or("");
+        if let Err(response) =
+            crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[popup_image])
+        {
+            return response;
+        }
         set_doc.insert(
             "popupInfo",
             to_bson(&value).unwrap_or(Bson::Document(Document::new())),

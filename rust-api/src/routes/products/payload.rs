@@ -186,6 +186,9 @@ pub(super) async fn build_product_payload(
     let icon = field_string(payload, "icon")
         .or_else(|| existing.map(|document| read_string(document, "icon")))
         .unwrap_or_default();
+    if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&icon]) {
+        return Err(response);
+    }
     let fallback_vendor = existing
         .and_then(|document| document.get_document("vendor").ok())
         .map(vendor_from_doc)

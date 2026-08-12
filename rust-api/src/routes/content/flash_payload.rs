@@ -50,6 +50,11 @@ pub(super) async fn sanitize_flash_sale_payload(
         validate_flash_sale_products(db, products, start_date, end_date, is_active, exclude_id)
             .await?;
 
+    let banner = text_value_or_current(payload.banner, current, "banner", "");
+    if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&banner]) {
+        return Err(response);
+    }
+
     Ok(NormalizedFlashSalePayload {
         name,
         description: text_value_or_current(payload.description, current, "description", ""),
@@ -57,7 +62,7 @@ pub(super) async fn sanitize_flash_sale_payload(
         end_date,
         products: normalized,
         is_active,
-        banner: text_value_or_current(payload.banner, current, "banner", ""),
+        banner,
     })
 }
 

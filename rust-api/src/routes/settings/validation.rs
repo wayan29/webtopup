@@ -7,6 +7,7 @@ use super::{
     responses::{status_message, string_message},
     store::load_settings,
 };
+use crate::services::managed_assets::ensure_managed_fields;
 
 pub async fn validate_update_payload(
     client: &mongodb::Client,
@@ -43,6 +44,13 @@ pub async fn validate_update_payload(
         changed_values.insert(key.clone(), normalized);
     }
     validate_cross_field_settings(&next_settings)?;
+    for key in ["favicon", "logo", "popupBannerImage"] {
+        if let Some(Value::String(path)) = next_settings.get(key) {
+            if let Err(response) = ensure_managed_fields(&crate::routes::uploads::upload_root(), &[path.as_str()]) {
+                return Err(response);
+            }
+        }
+    }
     Ok((next_settings, changed_values, previous_settings))
 }
 

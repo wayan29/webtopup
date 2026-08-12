@@ -229,10 +229,14 @@ pub async fn category_create(
         _ => max_order + 1,
     };
     let now = mongodb::bson::DateTime::now();
+    let icon = payload.icon.unwrap_or_default().trim().to_string();
+    if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&icon]) {
+        return response;
+    }
     let insert_doc = doc! {
         "name": name,
         "slug": slug,
-        "icon": payload.icon.unwrap_or_default().trim().to_string(),
+        "icon": icon,
         "status": status,
         "order": order,
         "createdAt": now,
@@ -359,10 +363,18 @@ pub async fn category_update(
         );
     }
 
+    let icon = payload
+        .icon
+        .unwrap_or_else(|| read_string(&current, "icon"))
+        .trim()
+        .to_string();
+    if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&icon]) {
+        return response;
+    }
     let mut set_doc = doc! {
         "name": name,
         "slug": slug,
-        "icon": payload.icon.unwrap_or_else(|| read_string(&current, "icon")).trim().to_string(),
+        "icon": icon,
         "status": status,
     };
     if let Some(order) = payload.order {

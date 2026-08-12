@@ -352,13 +352,20 @@ pub async fn operator_admin_create(
         .as_ref()
         .map(|value| to_bson(value).unwrap_or(Bson::Array(Vec::new())))
         .unwrap_or_else(|| Bson::Array(Vec::new()));
+    let icon = payload.icon.unwrap_or_default();
+    let instruction_image = payload.instruction_image.unwrap_or_default();
+    if let Err(response) =
+        crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&icon, &instruction_image])
+    {
+        return response;
+    }
     let insert_doc = doc! {
         "operatorId": operator_id,
         "name": normalized_name,
         "slug": slug,
         "categoryId": category_id,
-        "icon": payload.icon.unwrap_or_default(),
-        "instructionImage": payload.instruction_image.unwrap_or_default(),
+        "icon": icon,
+        "instructionImage": instruction_image,
         "checkUsername": payload.check_username.unwrap_or(false),
         "usernameLabel": payload.username_label.unwrap_or_default(),
         "validationType": payload.validation_type.unwrap_or_else(|| "none".to_string()),
@@ -527,9 +534,15 @@ pub async fn operator_admin_update(
         set_doc.insert("categoryId", target_category_id);
     }
     if let Some(value) = payload.icon {
+        if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&value]) {
+            return response;
+        }
         set_doc.insert("icon", value);
     }
     if let Some(value) = payload.instruction_image {
+        if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&value]) {
+            return response;
+        }
         set_doc.insert("instructionImage", value);
     }
     if let Some(value) = payload.check_username {

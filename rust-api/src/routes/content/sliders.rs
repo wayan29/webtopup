@@ -390,6 +390,9 @@ fn normalize_slider_payload(
             "Gambar slider harus berupa URL http/https atau path internal upload yang diawali \"/\"",
         ));
     }
+    if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&image]) {
+        return Err(response);
+    }
     let link_was_supplied = payload.link.is_some();
     let link = text_value_or_current(payload.link, current, "link", "");
     if link_was_supplied && !is_safe_slider_link(&link) {
