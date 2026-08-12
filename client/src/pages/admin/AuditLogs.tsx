@@ -1,32 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { Activity, AlertCircle, CalendarClock, Download, Eye, Filter, Monitor, Search, ShieldCheck, UserRound, X } from 'lucide-react';
+import { Activity, AlertCircle, CalendarClock, Download, Eye, Filter, Monitor, Search, ShieldCheck, UserRound } from 'lucide-react';
 import { apiV2 } from '../../api';
 import { useStepUpOrchestration } from '../../auth/useStepUpOrchestration';
 import { stepUpActionErrorMessage } from '../../auth/withStepUp';
+import AuditLogDetailDialog, { type AuditLogItem } from '../../components/admin/AuditLogDetailDialog';
 import { useAuthStore } from '../../store/useAuthStore';
 
-type AuditAction = 'create' | 'update' | 'delete' | 'execute';
-
-interface AuditLogItem {
-    _id: string;
-    actorName: string;
-    actorEmail: string;
-    actorRole: 'owner' | 'admin' | 'cs' | 'member';
-    action: AuditAction;
-    resource: string;
-    method: string;
-    path: string;
-    statusCode?: number;
-    ip?: string;
-    userAgent?: string;
-    summary: string;
-    metadata?: {
-        params?: Record<string, unknown>;
-        body?: Record<string, unknown>;
-    };
-    createdAt: string;
-}
+type AuditAction = AuditLogItem['action'];
 
 interface AuditLogsResponse {
     items: AuditLogItem[];
@@ -67,18 +48,6 @@ const formatDateTime = (value: string | null | undefined) => {
     }).format(date);
 };
 
-const stringifyMetadata = (value: unknown) => {
-    if (!value) {
-        return '-';
-    }
-
-    try {
-        return JSON.stringify(value, null, 2);
-    } catch {
-        return '-';
-    }
-};
-
 export default function AuditLogs() {
     const stepUp = useStepUpOrchestration();
     const { hasPermission, isOwner } = useAuthStore();
@@ -97,6 +66,7 @@ export default function AuditLogs() {
     const [error, setError] = useState('');
     const [exporting, setExporting] = useState(false);
     const [selectedLog, setSelectedLog] = useState<AuditLogItem | null>(null);
+    const [detailTrigger, setDetailTrigger] = useState<HTMLElement | null>(null);
     const latestRequestId = useRef(0);
 
     const applyAuditResponse = (payload: AuditLogsResponse) => {
@@ -392,7 +362,10 @@ export default function AuditLogs() {
                                     </div>
                                     <div className="flex flex-wrap items-center gap-2">
                                         <button
-                                            onClick={() => setSelectedLog(item)}
+                                            onClick={(event) => {
+                                                setSelectedLog(item);
+                                                setDetailTrigger(event.currentTarget);
+                                            }}
                                             className="ui-muted-action inline-flex items-center gap-2 rounded-xl px-3 py-2 text-xs font-black"
                                         >
                                             <Eye className="h-3.5 w-3.5" /> Detail Log
@@ -427,76 +400,14 @@ export default function AuditLogs() {
             </section>
 
             {selectedLog && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
-                    <div className="ui-panel max-h-[90vh] w-full max-w-4xl overflow-hidden rounded-[28px] border ui-border shadow-[0_35px_120px_rgba(0,0,0,0.45)]" role="dialog" aria-modal="true" aria-labelledby="audit-log-detail-title">
-                        <div className="ui-panel-muted ui-border flex items-start justify-between gap-4 border-b p-5">
-                            <div>
-                                <div className="flex flex-wrap items-center gap-2">
-                                    <span className={`inline-flex rounded-full border px-3 py-1 text-xs font-black ${actionClasses[selectedLog.action]}`}>
-                                        {actionLabels[selectedLog.action]}
-                                    </span>
-                                    <span className="ui-accent-chip rounded-full border px-3 py-1 text-xs font-black">{selectedLog.resource}</span>
-                                    {selectedLog.statusCode && (
-                                        <span className={`rounded-full border px-3 py-1 text-xs font-black ${selectedLog.statusCode >= 400 ? 'ui-danger-chip' : 'ui-success-chip'}`}>
-                                            HTTP {selectedLog.statusCode}
-                                        </span>
-                                    )}
-                                </div>
-                                <h2 id="audit-log-detail-title" className="ui-text mt-3 text-xl font-black">Detail Log Audit</h2>
-                                <p className="ui-text-muted mt-1 break-all text-sm">{selectedLog.summary}</p>
-                            </div>
-                            <button
-                                onClick={() => setSelectedLog(null)}
-                                className="ui-muted-action rounded-xl p-2"
-                                aria-label="Tutup detail audit log"
-                            >
-                                <X className="h-5 w-5" />
-                            </button>
-                        </div>
-
-                        <div className="max-h-[calc(90vh-120px)] overflow-y-auto p-5">
-                            <div className="grid gap-4 md:grid-cols-2">
-                                {[
-                                    ['Aktor', selectedLog.actorName],
-                                    ['Email', selectedLog.actorEmail],
-                                    ['Peran', selectedLog.actorRole],
-                                    ['Tanggal', formatDateTime(selectedLog.createdAt)],
-                                    ['Method', selectedLog.method],
-                                    ['Endpoint', selectedLog.path],
-                                    ['IP', selectedLog.ip || '-'],
-                                    ['User Agent', selectedLog.userAgent || '-']
-                                ].map(([label, value]) => (
-                                    <div key={label} className="ui-panel-muted rounded-2xl border ui-border p-4">
-                                        <p className="ui-text-muted text-xs font-black uppercase tracking-[0.14em]">{label}</p>
-                                        <p className="ui-text mt-2 break-all text-sm font-bold">{value}</p>
-                                    </div>
-                                ))}
-                            </div>
-
-                            <div className="mt-4 grid gap-4 lg:grid-cols-2">
-                                <div className="ui-panel-muted rounded-2xl border ui-border p-4">
-                                    <p className="ui-text-muted text-xs font-black uppercase tracking-[0.14em]">Params</p>
-                                    <pre className="ui-text-muted mt-3 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-xl ui-panel px-3 py-2 text-xs leading-5">
-                                        {stringifyMetadata(selectedLog.metadata?.params)}
-                                    </pre>
-                                </div>
-                                <div className="ui-panel-muted rounded-2xl border ui-border p-4">
-                                    <p className="ui-text-muted text-xs font-black uppercase tracking-[0.14em]">Body</p>
-                                    <pre className="ui-text-muted mt-3 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-xl ui-panel px-3 py-2 text-xs leading-5">
-                                        {stringifyMetadata(selectedLog.metadata?.body)}
-                                    </pre>
-                                </div>
-                            </div>
-
-                            <div className="ui-panel-muted mt-4 rounded-2xl border ui-border p-4">
-                                <p className="ui-text-muted text-xs font-black uppercase tracking-[0.14em]">Metadata Mentah</p>
-                                <pre className="ui-text-muted mt-3 max-h-96 overflow-auto whitespace-pre-wrap break-words rounded-xl ui-panel px-3 py-2 text-xs leading-5">
-                                    {stringifyMetadata(selectedLog.metadata)}
-                                </pre>
-                            </div>
-                        </div>
-                    </div>
-                </div>
+                <AuditLogDetailDialog
+                    item={selectedLog}
+                    trigger={detailTrigger}
+                    onClose={() => {
+                        setSelectedLog(null);
+                        setDetailTrigger(null);
+                    }}
+                />
             )}
         </div>
             {stepUp.dialog}

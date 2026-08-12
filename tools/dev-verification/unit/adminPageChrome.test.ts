@@ -211,3 +211,20 @@ test('team access dialog preserves accessible interaction semantics', () => {
     assert.match(preview, /Preview akses setelah disimpan/);
     assert.match(preview, /summarizeEffectiveTeamAccess/);
 });
+
+test('audit detail dialog preserves accessible interaction semantics', () => {
+    const page = readAdminPage('AuditLogs.tsx');
+    const dialog = fs.readFileSync(path.join(root, 'client/src/components/admin/AuditLogDetailDialog.tsx'), 'utf8');
+    assert.match(page, /AuditLogDetailDialog/);
+    assert.match(dialog, /role="dialog"/);
+    assert.match(dialog, /aria-modal="true"/);
+    assert.match(dialog, /aria-labelledby/);
+    assert.match(dialog, /aria-describedby/);
+    assert.match(dialog, /tabIndex=\{-1\}/);
+    assert.match(dialog, /Escape/);
+    assert.match(dialog, /event\.target === event\.currentTarget/);
+    assert.match(dialog, /isConnected/);
+    assert.match(dialog, /100dvh/);
+    assert.match(dialog, /aria-live="polite"/);
+    assert.match(dialog, /\[redacted\]/);
+});
