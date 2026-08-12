@@ -409,8 +409,6 @@ const forwardHeadersWithTrace = (request: AuthRequest, proxySecret: string, gate
     return headers;
 };
 
-const PUBLIC_SETTINGS_CACHE_MS = 30_000;
-
 const filterUpstreamResponseHeaders = (upstreamResponse: Response): Record<string, string> => {
     const headers: Record<string, string> = {};
     upstreamResponse.headers.forEach((value, name) => {
@@ -1076,17 +1074,7 @@ const proxyUnlock = async (request: AuthRequest, reply: FastifyReply) => {
     };
 
     const proxyPublicSettingsRequest = async (request: AuthRequest, reply: FastifyReply) => {
-        const now = Date.now();
-        const publicSettingsCache = publicSettingsCacheRef.current;
-        if (publicSettingsCache && publicSettingsCache.expiresAt > now) {
-            applyFilteredUpstreamHeadersToReply(publicSettingsCache.headers, reply);
-            reply.header('x-cache', 'HIT');
-            const cacheHitTraceId = selectResponseTraceId(request);
-            reply.header(TRACE_RESPONSE_HEADER, cacheHitTraceId);
-            persistAuthoritativeResponseCorrelation(request, cacheHitTraceId, 'gateway_header');
-            return reply.status(publicSettingsCache.status).send(publicSettingsCache.body);
-        }
-
+        // Public settings must revalidate against the authoritative revision. No response-body cache.
         const upstreamUrl = `${getApiV2UpstreamUrl()}${toUpstreamPath(request.url)}`;
         try {
             const { result: upstreamResponse, responseTraceId } = await runWithProxySpan(
@@ -1102,18 +1090,15 @@ const proxyUnlock = async (request: AuthRequest, reply: FastifyReply) => {
             );
             const headers = filterUpstreamResponseHeaders(upstreamResponse);
             applyFilteredUpstreamHeadersToReply(headers, reply);
-            const body = Buffer.from(await upstreamResponse.arrayBuffer());
-            if (upstreamResponse.ok) {
-                publicSettingsCacheRef.current = {
-                    expiresAt: now + PUBLIC_SETTINGS_CACHE_MS,
-                    status: upstreamResponse.status,
-                    headers: { ...headers, 'cache-control': 'public, max-age=30' },
-                    body,
-                };
+            // Prefer upstream no-cache/ETag; never inject a stale max-age body cache.
+            if (!headers['cache-control'] && !headers['Cache-Control']) {
+                reply.header('cache-control', 'no-cache');
             }
-            reply.header('cache-control', 'public, max-age=30');
-            reply.header('x-cache', 'MISS');
             reply.header(TRACE_RESPONSE_HEADER, responseTraceId);
+            if (upstreamResponse.status === 304) {
+                return reply.status(304).send();
+            }
+            const body = Buffer.from(await upstreamResponse.arrayBuffer());
             return reply.status(upstreamResponse.status).send(body);
         } catch (error) {
             request.log.error({ error, upstreamUrl }, 'API v2 public settings request failed');

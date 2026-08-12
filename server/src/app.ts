@@ -26,7 +26,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     await app.register(cors, {
         delegator: createCorsDelegator(configuredCorsOrigins),
         credentials: true,
-        exposedHeaders: ['x-trace-id']
+        exposedHeaders: ['x-trace-id', 'ETag', 'etag']
     });
 
     await app.register(cookie);
