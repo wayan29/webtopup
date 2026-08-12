@@ -126,6 +126,21 @@ export function fixtureDefinitions(fixtureRunId: string, now = new Date()): Fixt
       twoFactorEnrollmentRequiredAt: future,
       permissions: { viewProducts: false, manageProducts: true },
     }),
+    make('audit-denied', 'audit-permission-denied', 'cs', {
+      twoFactorEnabled: false,
+      twoFactorEnrollmentRequiredAt: future,
+      permissions: { viewDashboard: true, viewTeam: false, manageTeam: false },
+    }),
+    make('audit-manager', 'audit-permission-manager', 'admin', {
+      twoFactorEnabled: true,
+      permissions: {
+        viewDashboard: true,
+        viewTeam: true,
+        manageTeam: true,
+        viewProducts: true,
+        manageProducts: true,
+      },
+    }),
   ];
 }
 
