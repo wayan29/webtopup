@@ -18,7 +18,95 @@ pub const COLLECTION_TRANSACTIONS: &str = "transactions";
 pub const COLLECTION_GUEST_TRANSACTIONS: &str = "guesttransactions";
 pub const COLLECTION_IDENTIFIER_COUNTERS: &str = "identifiercounters";
 
+pub const MAX_INVOICE_CANDIDATES: usize = 5;
+pub const REF_ID_DATE_FORMATS: &[&str] =
+    &["DDMMYYYY", "YYYYMMDD", "MMDDYYYY", "DDMMYY", "YYMMDD"];
+pub const INVOICE_DATE_FORMATS: &[&str] =
+    &["DDMMYYYY", "YYYYMMDD", "MMDDYYYY", "DDMMYY", "YYMMDD", "NONE"];
+
 const SUCCESS_CACHE_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InvoicePolicyError {
+    InvalidLength,
+}
+
+impl InvoicePolicyError {
+    pub fn code(self) -> &'static str {
+        "INVALID_INVOICE_RANDOM_LENGTH"
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DuplicateConstraint {
+    InvoiceNumber,
+    Other,
+}
+
+/// Effective read length: weak/malformed historical values fail safe to the type minimum.
+pub fn safe_invoice_length(random_type: &str, raw: i64) -> usize {
+    let min = invoice_min_length(random_type);
+    if raw < min as i64 {
+        return min;
+    }
+    if raw > 12 {
+        return 12;
+    }
+    raw as usize
+}
+
+/// Write-time validation for explicit admin saves.
+pub fn validate_invoice_length(random_type: &str, raw: i64) -> Result<usize, InvoicePolicyError> {
+    let min = invoice_min_length(random_type) as i64;
+    if raw < min || raw > 12 {
+        return Err(InvoicePolicyError::InvalidLength);
+    }
+    Ok(raw as usize)
+}
+
+pub fn invoice_min_length(random_type: &str) -> usize {
+    if random_type == "numeric" {
+        10
+    } else {
+        8
+    }
+}
+
+pub fn retry_invoice_candidate(attempt_index: usize, constraint: DuplicateConstraint) -> bool {
+    matches!(constraint, DuplicateConstraint::InvoiceNumber) && attempt_index < MAX_INVOICE_CANDIDATES - 1
+}
+
+pub fn classify_invoice_duplicate(error: &mongodb::error::Error) -> bool {
+    let display = error.to_string();
+    let debug = format!("{error:?}");
+    classify_invoice_duplicate_messages(&display, &debug)
+}
+
+pub fn classify_invoice_duplicate_messages(display: &str, debug: &str) -> bool {
+    let haystack = format!("{display}\n{debug}");
+    if !(haystack.contains("E11000") || haystack.contains("duplicate key")) {
+        return false;
+    }
+    haystack.contains(INDEX_GUEST_INVOICE)
+        || haystack.contains("invoiceNumber_1")
+        || haystack.contains("dup key: { invoiceNumber")
+        || haystack.contains("dup key: { \"invoiceNumber\"")
+}
+
+/// Effective Ref ID date format: historical NONE/malformed/missing → DDMMYYYY.
+pub fn effective_ref_id_date_format(raw: Option<&str>) -> &'static str {
+    match raw.map(str::trim) {
+        Some(value) if REF_ID_DATE_FORMATS.contains(&value) => match value {
+            "DDMMYYYY" => "DDMMYYYY",
+            "YYYYMMDD" => "YYYYMMDD",
+            "MMDDYYYY" => "MMDDYYYY",
+            "DDMMYY" => "DDMMYY",
+            "YYMMDD" => "YYMMDD",
+            _ => "DDMMYYYY",
+        },
+        _ => "DDMMYYYY",
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct IdentifierIndexRequirement {
@@ -461,7 +549,7 @@ async fn inspect_settings_findings(
                     .and_then(|value| value.as_str().map(str::to_string))
             })
             .unwrap_or_else(|| "alphanumeric".to_string());
-        let min = if random_type == "numeric" { 10 } else { 8 };
+        let min = invoice_min_length(&random_type) as i64;
         if length.is_none_or(|value| value < min || value > 12) {
             findings.push(IdentifierDataFinding {
                 kind: "unsafe_invoice_random_length",
@@ -603,5 +691,48 @@ mod tests {
         // Pure contract: the kind string used by settings inspection remains stable.
         assert_eq!("unsafe_ref_id_date_format", "unsafe_ref_id_date_format");
         assert_eq!("unsafe_invoice_random_length", "unsafe_invoice_random_length");
+    }
+
+    #[test]
+    fn invoice_policy_uses_safe_type_specific_minimums() {
+        assert_eq!(safe_invoice_length("alphanumeric", 1), 8);
+        assert_eq!(safe_invoice_length("alphanumeric", 12), 12);
+        assert_eq!(safe_invoice_length("numeric", 1), 10);
+        assert!(validate_invoice_length("numeric", 9).is_err());
+        assert!(validate_invoice_length("alphanumeric", 7).is_err());
+        assert_eq!(validate_invoice_length("alphanumeric", 8).unwrap(), 8);
+        assert_eq!(validate_invoice_length("numeric", 10).unwrap(), 10);
+    }
+
+    #[test]
+    fn invoice_retry_is_bounded_and_constraint_specific() {
+        assert_eq!(MAX_INVOICE_CANDIDATES, 5);
+        assert!(retry_invoice_candidate(0, DuplicateConstraint::InvoiceNumber));
+        assert!(retry_invoice_candidate(3, DuplicateConstraint::InvoiceNumber));
+        assert!(!retry_invoice_candidate(4, DuplicateConstraint::InvoiceNumber));
+        assert!(!retry_invoice_candidate(0, DuplicateConstraint::Other));
+    }
+
+    #[test]
+    fn invoice_duplicate_classifier_requires_exact_invoice_index() {
+        assert!(classify_invoice_duplicate_messages(
+            "E11000 duplicate key error index: uniq_guest_invoice_number",
+            ""
+        ));
+        assert!(!classify_invoice_duplicate_messages(
+            "E11000 duplicate key error index: uniq_products_code",
+            ""
+        ));
+        assert!(!classify_invoice_duplicate_messages("network timeout", ""));
+    }
+
+    #[test]
+    fn ref_id_date_format_none_reads_as_ddmmyyyy_invoice_keeps_none() {
+        assert_eq!(effective_ref_id_date_format(Some("NONE")), "DDMMYYYY");
+        assert_eq!(effective_ref_id_date_format(Some("")), "DDMMYYYY");
+        assert_eq!(effective_ref_id_date_format(None), "DDMMYYYY");
+        assert_eq!(effective_ref_id_date_format(Some("YYYYMMDD")), "YYYYMMDD");
+        assert!(REF_ID_DATE_FORMATS.iter().all(|value| *value != "NONE"));
+        assert!(INVOICE_DATE_FORMATS.contains(&"NONE"));
     }
 }

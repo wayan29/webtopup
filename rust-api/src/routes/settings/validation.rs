@@ -135,6 +135,23 @@ fn validate_cross_field_settings(next_settings: &Map<String, Value>) -> Result<(
             "Gambar popup banner wajib diisi saat popup aktif",
         ));
     }
+    let invoice_type = next_settings
+        .get("invoiceRandomType")
+        .and_then(Value::as_str)
+        .unwrap_or("alphanumeric");
+    let invoice_length = next_settings
+        .get("invoiceRandomLength")
+        .and_then(Value::as_i64)
+        .unwrap_or(8);
+    if crate::services::identifier_integrity::validate_invoice_length(invoice_type, invoice_length)
+        .is_err()
+    {
+        let min = crate::services::identifier_integrity::invoice_min_length(invoice_type);
+        return Err(string_message(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("Panjang random invoice harus di antara {min} sampai 12"),
+        ));
+    }
     Ok(())
 }
 
@@ -176,9 +193,7 @@ fn validate_setting_json_value(key: &str, value: &Value) -> Result<Value, Respon
         "refIdDateFormat" => ensure_enum(
             value,
             "Format tanggal Ref ID",
-            &[
-                "DDMMYYYY", "YYYYMMDD", "MMDDYYYY", "DDMMYY", "YYMMDD", "NONE",
-            ],
+            crate::services::identifier_integrity::REF_ID_DATE_FORMATS,
         ),
         "refIdSeparator" => ensure_enum(value, "Separator Ref ID", &["", "-", "_"]),
         "refIdSequenceDigits" => ensure_integer(value, "Digit sequence Ref ID", 1, 10),
@@ -186,11 +201,10 @@ fn validate_setting_json_value(key: &str, value: &Value) -> Result<Value, Respon
         "invoiceDateFormat" => ensure_enum(
             value,
             "Format tanggal invoice",
-            &[
-                "DDMMYYYY", "YYYYMMDD", "MMDDYYYY", "DDMMYY", "YYMMDD", "NONE",
-            ],
+            crate::services::identifier_integrity::INVOICE_DATE_FORMATS,
         ),
         "invoiceSeparator" => ensure_enum(value, "Separator invoice", &["", "-", "_"]),
+        // Final type-specific min is enforced in cross-field validation.
         "invoiceRandomLength" => ensure_integer(value, "Panjang random invoice", 1, 12),
         "invoiceRandomType" => {
             ensure_enum(value, "Tipe random invoice", &["alphanumeric", "numeric"])

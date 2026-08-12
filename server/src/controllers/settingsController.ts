@@ -20,7 +20,15 @@ class SettingsControllerError extends Error {
     }
 }
 
-const allowedDateFormats = new Set([
+const refIdDateFormats = new Set([
+    'DDMMYYYY',
+    'YYYYMMDD',
+    'MMDDYYYY',
+    'DDMMYY',
+    'YYMMDD'
+]);
+
+const invoiceDateFormats = new Set([
     'DDMMYYYY',
     'YYYYMMDD',
     'MMDDYYYY',
@@ -232,7 +240,7 @@ const validateSettingValue = (
         case 'refIdPrefix':
             return ensurePrefix(value, 'Prefix Ref ID');
         case 'refIdDateFormat':
-            return ensureEnum(value, 'Format tanggal Ref ID', allowedDateFormats);
+            return ensureEnum(value, 'Format tanggal Ref ID', refIdDateFormats);
         case 'refIdSeparator':
             return ensureEnum(value, 'Separator Ref ID', allowedSeparators);
         case 'refIdSequenceDigits':
@@ -240,7 +248,7 @@ const validateSettingValue = (
         case 'invoicePrefix':
             return ensurePrefix(value, 'Prefix invoice');
         case 'invoiceDateFormat':
-            return ensureEnum(value, 'Format tanggal invoice', allowedDateFormats);
+            return ensureEnum(value, 'Format tanggal invoice', invoiceDateFormats);
         case 'invoiceSeparator':
             return ensureEnum(value, 'Separator invoice', allowedSeparators);
         case 'invoiceRandomLength':

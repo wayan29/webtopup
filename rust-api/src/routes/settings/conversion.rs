@@ -36,13 +36,26 @@ pub fn normalize_setting_value(key: &str, value: &Bson) -> Value {
         | "popupBannerEnabled" => Value::Bool(matches!(value, Bson::Boolean(true))),
         "minDeposit" | "maxDeposit" | "depositFee" => json!(clamp_i64(value, 0, 100_000_000)),
         "refIdSequenceDigits" => json!(clamp_i64(value, 1, 10)),
-        "invoiceRandomLength" => json!(clamp_i64(value, 1, 12)),
+        "invoiceRandomLength" => {
+            let random_type = "alphanumeric"; // cross-field clamp applied later when type known
+            let min = crate::services::identifier_integrity::invoice_min_length(random_type) as i64;
+            // Temporary lower bound 1 is avoided: readers fail-safe via safe_invoice_length.
+            json!(crate::services::identifier_integrity::safe_invoice_length(
+                random_type,
+                clamp_i64(value, 1, 12)
+            ) as i64)
+        }
         "depositFeeType" => enum_string(value, &["fixed", "percent"], "fixed"),
-        "refIdDateFormat" | "invoiceDateFormat" => enum_string(
+        "refIdDateFormat" => {
+            let text = text_value(value, default_text(key)).trim().to_string();
+            Value::String(
+                crate::services::identifier_integrity::effective_ref_id_date_format(Some(&text))
+                    .to_string(),
+            )
+        }
+        "invoiceDateFormat" => enum_string(
             value,
-            &[
-                "DDMMYYYY", "YYYYMMDD", "MMDDYYYY", "DDMMYY", "YYMMDD", "NONE",
-            ],
+            crate::services::identifier_integrity::INVOICE_DATE_FORMATS,
             default_text(key),
         ),
         "refIdSeparator" | "invoiceSeparator" => enum_string(value, &["", "-", "_"], ""),
@@ -74,6 +87,28 @@ pub fn normalize_cross_field_settings(settings: &mut serde_json::Map<String, Val
         settings.insert(
             "depositFee".to_string(),
             json!(std::cmp::min(deposit_fee, 100)),
+        );
+    }
+    let random_type = settings
+        .get("invoiceRandomType")
+        .and_then(Value::as_str)
+        .unwrap_or("alphanumeric");
+    let raw_length = settings
+        .get("invoiceRandomLength")
+        .and_then(Value::as_i64)
+        .unwrap_or(8);
+    settings.insert(
+        "invoiceRandomLength".to_string(),
+        json!(crate::services::identifier_integrity::safe_invoice_length(random_type, raw_length)
+            as i64),
+    );
+    if let Some(Value::String(raw)) = settings.get("refIdDateFormat").cloned() {
+        settings.insert(
+            "refIdDateFormat".to_string(),
+            Value::String(
+                crate::services::identifier_integrity::effective_ref_id_date_format(Some(&raw))
+                    .to_string(),
+            ),
         );
     }
 }

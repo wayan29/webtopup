@@ -15,10 +15,16 @@ use rand::Rng;
 use crate::{
     routes::auth,
     security::ErrorResponse,
-    services::idempotency::{
-        self as idempotency_service, commit_mongo_transaction_with_unknown_retry,
-        CompletedSnapshot, DomainMarkerRecovery, DomainRecovery, IdempotencyBegin,
-        IdempotencyStore, MongoIdempotencyStore, TransactionCommitOutcome, ROUTE_GUEST_CHECKOUT,
+    services::{
+        identifier_integrity::{
+            classify_invoice_duplicate, require_identifier_indexes, retry_invoice_candidate,
+            DuplicateConstraint, MAX_INVOICE_CANDIDATES,
+        },
+        idempotency::{
+            self as idempotency_service, commit_mongo_transaction_with_unknown_retry,
+            CompletedSnapshot, DomainMarkerRecovery, DomainRecovery, IdempotencyBegin,
+            IdempotencyStore, MongoIdempotencyStore, TransactionCommitOutcome, ROUTE_GUEST_CHECKOUT,
+        },
     },
     state::AppState,
     utils::bson::{read_i64, read_string},
@@ -337,6 +343,11 @@ enum GuestExecutionError {
     Ambiguous(Response),
 }
 
+enum GuestDomainError {
+    InvoiceDuplicate,
+    PreEffect(Response),
+}
+
 async fn execute_guest_checkout_transaction(
     client: &mongodb::Client,
     db: &mongodb::Database,
@@ -346,43 +357,69 @@ async fn execute_guest_checkout_transaction(
     stored_key: &str,
     request_digest: &str,
 ) -> Result<(ObjectId, serde_json::Value), GuestExecutionError> {
-    let mut session = client.start_session().await.map_err(|error| {
-        eprintln!("Failed to start guest checkout Mongo session: {error}");
-        GuestExecutionError::PreEffect(internal_error())
-    })?;
-    session.start_transaction().await.map_err(|error| {
-        eprintln!("Failed to start guest checkout Mongo transaction: {error}");
-        GuestExecutionError::PreEffect(guest_atomicity_unavailable())
-    })?;
+    if require_identifier_indexes(db).await.is_err() {
+        return Err(GuestExecutionError::PreEffect(identifier_index_unavailable()));
+    }
 
-    let domain_result = build_and_insert_guest_transaction(
-        db,
-        &mut session,
-        normalized,
-        member_id,
-        prepared,
-        stored_key,
-        request_digest,
-    )
-    .await;
-    let result = match domain_result {
-        Ok(result) => result,
-        Err(response) => {
-            if session.abort_transaction().await.is_ok() {
-                return Err(GuestExecutionError::PreEffect(response));
+    for attempt in 0..MAX_INVOICE_CANDIDATES {
+        let mut session = client.start_session().await.map_err(|error| {
+            eprintln!("Failed to start guest checkout Mongo session: {error}");
+            GuestExecutionError::PreEffect(internal_error())
+        })?;
+        session.start_transaction().await.map_err(|error| {
+            eprintln!("Failed to start guest checkout Mongo transaction: {error}");
+            GuestExecutionError::PreEffect(guest_atomicity_unavailable())
+        })?;
+
+        let domain_result = build_and_insert_guest_transaction(
+            db,
+            &mut session,
+            normalized,
+            member_id,
+            prepared,
+            stored_key,
+            request_digest,
+        )
+        .await;
+
+        match domain_result {
+            Ok(result) => {
+                return match commit_mongo_transaction_with_unknown_retry(&mut session).await {
+                    TransactionCommitOutcome::Committed => Ok(result),
+                    TransactionCommitOutcome::Ambiguous
+                    | TransactionCommitOutcome::FailedDefinitely => {
+                        eprintln!(
+                            "Guest checkout commit was not positively acknowledged; retaining started"
+                        );
+                        Err(GuestExecutionError::Ambiguous(guest_ambiguous_response()))
+                    }
+                };
             }
-            eprintln!("Guest checkout transaction abort failed; retaining started for recovery");
-            return Err(GuestExecutionError::Ambiguous(guest_ambiguous_response()));
-        }
-    };
-
-    match commit_mongo_transaction_with_unknown_retry(&mut session).await {
-        TransactionCommitOutcome::Committed => Ok(result),
-        TransactionCommitOutcome::Ambiguous | TransactionCommitOutcome::FailedDefinitely => {
-            eprintln!("Guest checkout commit was not positively acknowledged; retaining started");
-            Err(GuestExecutionError::Ambiguous(guest_ambiguous_response()))
+            Err(GuestDomainError::InvoiceDuplicate) => {
+                if session.abort_transaction().await.is_err() {
+                    eprintln!(
+                        "Guest checkout abort after invoice collision failed; retaining started"
+                    );
+                    return Err(GuestExecutionError::Ambiguous(guest_ambiguous_response()));
+                }
+                if !retry_invoice_candidate(attempt, DuplicateConstraint::InvoiceNumber) {
+                    break;
+                }
+                continue;
+            }
+            Err(GuestDomainError::PreEffect(response)) => {
+                if session.abort_transaction().await.is_ok() {
+                    return Err(GuestExecutionError::PreEffect(response));
+                }
+                eprintln!(
+                    "Guest checkout transaction abort failed; retaining started for recovery"
+                );
+                return Err(GuestExecutionError::Ambiguous(guest_ambiguous_response()));
+            }
         }
     }
+
+    Err(GuestExecutionError::PreEffect(invoice_identifier_exhausted()))
 }
 
 async fn build_and_insert_guest_transaction(
@@ -393,7 +430,38 @@ async fn build_and_insert_guest_transaction(
     prepared: &PreparedGuestCheckout,
     stored_key: &str,
     request_digest: &str,
-) -> Result<(ObjectId, serde_json::Value), Response> {
+) -> Result<(ObjectId, serde_json::Value), GuestDomainError> {
+    // First durable domain write is the invoice reservation so collisions abort before
+    // flash-sale / voucher side effects.
+    let invoice_number = generate_invoice_number(db)
+        .await
+        .map_err(|_| GuestDomainError::PreEffect(internal_error()))?;
+    let transaction_id = ObjectId::new();
+    let now = DateTime::now();
+    let skeleton = doc! {
+        "_id": transaction_id,
+        "invoiceNumber": &invoice_number,
+        "creationState": "invoice_reserved",
+        "idempotencyRoute": ROUTE_GUEST_CHECKOUT,
+        "idempotencyKey": stored_key,
+        "idempotencyRequestDigest": request_digest,
+        "createdAt": now,
+        "updatedAt": now,
+        "__v": 0,
+    };
+    if let Err(error) = db
+        .collection::<Document>("guesttransactions")
+        .insert_one(skeleton)
+        .session(&mut *session)
+        .await
+    {
+        if classify_invoice_duplicate(&error) {
+            return Err(GuestDomainError::InvoiceDuplicate);
+        }
+        eprintln!("Failed guest invoice reservation insert: {error}");
+        return Err(GuestDomainError::PreEffect(internal_error()));
+    }
+
     let preview_flash_price = if normalized.use_flash_sale {
         preview_flash_sale_price_in_session(
             db,
@@ -404,7 +472,7 @@ async fn build_and_insert_guest_transaction(
         .await
         .map_err(|error| {
             eprintln!("Failed guest flash-sale preview in transaction: {error}");
-            internal_error()
+            GuestDomainError::PreEffect(internal_error())
         })?
     } else {
         None
@@ -431,7 +499,7 @@ async fn build_and_insert_guest_transaction(
                 price = applied.final_price;
                 applied_discount = Some(applied);
             }
-            Err(response) => return Err(response),
+            Err(response) => return Err(GuestDomainError::PreEffect(response)),
         }
     }
     let admin_fee = read_i64(&prepared.payment_method, "adminFee")
@@ -446,36 +514,31 @@ async fn build_and_insert_guest_transaction(
             let vouchers = db.collection::<Document>("vouchers");
             crate::routes::vouchers::release_discount_slot(&vouchers, applied, member_id).await;
         }
-        return Err(status_message_owned(
+        return Err(GuestDomainError::PreEffect(status_message_owned(
             StatusCode::BAD_REQUEST,
             format!("Minimum amount is Rp {}", format_rupiah(min_amount)),
-        ));
+        )));
     }
     if total_amount > max_amount {
         if let Some(applied) = applied_discount.as_ref() {
             let vouchers = db.collection::<Document>("vouchers");
             crate::routes::vouchers::release_discount_slot(&vouchers, applied, member_id).await;
         }
-        return Err(status_message_owned(
+        return Err(GuestDomainError::PreEffect(status_message_owned(
             StatusCode::BAD_REQUEST,
             format!("Maximum amount is Rp {}", format_rupiah(max_amount)),
-        ));
+        )));
     }
 
-    let invoice_number = generate_invoice_number(db)
-        .await
-        .map_err(|_| internal_error())?;
-    let now = DateTime::now();
     let expired_at = DateTime::from_millis(now.timestamp_millis() + 24 * 60 * 60 * 1000);
-    let transaction_id = ObjectId::new();
     let product_id = prepared
         .product
         .get_object_id("_id")
-        .map_err(|_| internal_error())?;
+        .map_err(|_| GuestDomainError::PreEffect(internal_error()))?;
     let payment_method_id = prepared
         .payment_method
         .get_object_id("_id")
-        .map_err(|_| internal_error())?;
+        .map_err(|_| GuestDomainError::PreEffect(internal_error()))?;
     let response = guest_response_from_frozen_documents(
         transaction_id,
         &invoice_number,
@@ -492,13 +555,14 @@ async fn build_and_insert_guest_transaction(
         now,
         expired_at,
     );
-    let body = serde_json::to_value(&response).map_err(|_| internal_error())?;
+    let body = serde_json::to_value(&response)
+        .map_err(|_| GuestDomainError::PreEffect(internal_error()))?;
     let encoded_body = execute_after_bounded_response(&body, || {}).map_err(|error| {
         eprintln!("Guest checkout frozen response exceeds replay bound: {error:?}");
-        error.into_response()
+        GuestDomainError::PreEffect(error.into_response())
     })?;
 
-    // The bounded snapshot is now proven before the first stock/document mutation.
+    // Snapshot is proven after invoice reservation and before stock mutations.
     let flash_sale_reservation = if normalized.use_flash_sale && preview_flash_price.is_some() {
         reserve_flash_sale_stock_in_session(
             db,
@@ -509,7 +573,7 @@ async fn build_and_insert_guest_transaction(
         .await
         .map_err(|error| {
             eprintln!("Failed guest flash-sale reservation in transaction: {error}");
-            internal_error()
+            GuestDomainError::PreEffect(internal_error())
         })?
     } else {
         None
@@ -522,13 +586,14 @@ async fn build_and_insert_guest_transaction(
                 let vouchers = db.collection::<Document>("vouchers");
                 crate::routes::vouchers::release_discount_slot(&vouchers, applied, member_id).await;
             }
-            return Err(internal_error());
+            return Err(GuestDomainError::PreEffect(internal_error()));
         }
     }
 
     let mut document = doc! {
         "_id": transaction_id,
         "invoiceNumber": &invoice_number,
+        "creationState": "complete",
         "product": product_id,
         "target": &normalized.target,
         "whatsapp": &normalized.whatsapp,
@@ -566,13 +631,14 @@ async fn build_and_insert_guest_transaction(
         document.insert("discountAmount", applied.discount_amount);
         document.insert("baseAmount", prepared.base_price);
     }
+    // Replace the invoice reservation skeleton with the complete frozen document.
     db.collection::<Document>("guesttransactions")
-        .insert_one(document)
+        .replace_one(doc! { "_id": transaction_id }, document)
         .session(&mut *session)
         .await
         .map_err(|error| {
-            eprintln!("Failed guest transaction insert in Mongo transaction: {error}");
-            internal_error()
+            eprintln!("Failed guest transaction finalize in Mongo transaction: {error}");
+            GuestDomainError::PreEffect(internal_error())
         })?;
     Ok((transaction_id, body))
 }
@@ -720,6 +786,34 @@ fn guest_atomicity_unavailable() -> Response {
             "error": {
                 "code": "GUEST_CHECKOUT_ATOMICITY_UNAVAILABLE",
                 "message": "Guest checkout membutuhkan transaksi database"
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn identifier_index_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "message": "Index identifier belum siap",
+            "error": {
+                "code": "IDENTIFIER_INDEX_UNAVAILABLE",
+                "message": "Index identifier belum siap"
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn invoice_identifier_exhausted() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "message": "Nomor invoice sementara tidak tersedia",
+            "error": {
+                "code": "INVOICE_IDENTIFIER_EXHAUSTED",
+                "message": "Nomor invoice sementara tidak tersedia"
             }
         })),
     )

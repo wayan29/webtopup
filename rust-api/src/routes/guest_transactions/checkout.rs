@@ -273,10 +273,10 @@ pub(super) async fn generate_invoice_number(db: &mongodb::Database) -> Result<St
     let prefix = setting_string(&settings, "invoicePrefix", "INV").await;
     let date_format = setting_string(&settings, "invoiceDateFormat", "YYYYMMDD").await;
     let separator = setting_string(&settings, "invoiceSeparator", "").await;
-    let random_length = setting_i64(&settings, "invoiceRandomLength", 6)
-        .await
-        .clamp(1, 12) as usize;
     let random_type = setting_string(&settings, "invoiceRandomType", "alphanumeric").await;
+    let raw_length = setting_i64(&settings, "invoiceRandomLength", 8).await;
+    let random_length =
+        crate::services::identifier_integrity::safe_invoice_length(&random_type, raw_length);
     let now = Local::now();
     let date_part = format_date_part(&date_format, now.day(), now.month(), now.year());
     let random = if random_type == "numeric" {

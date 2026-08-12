@@ -101,7 +101,7 @@ const defaultForm: SettingsForm = {
     invoicePrefix: 'INV',
     invoiceDateFormat: 'YYYYMMDD',
     invoiceSeparator: '',
-    invoiceRandomLength: 6,
+    invoiceRandomLength: 8,
     invoiceRandomType: 'alphanumeric',
     invoiceSample: '',
 };
@@ -751,7 +751,6 @@ export default function SiteConfig() {
                             <option value="MMDDYYYY">MMDDYYYY (01292026)</option>
                             <option value="DDMMYY">DDMMYY (290126)</option>
                             <option value="YYMMDD">YYMMDD (260129)</option>
-                            <option value="NONE">Tanpa Tanggal</option>
                         </select>
                     </div>
                     <div>
@@ -837,18 +836,40 @@ export default function SiteConfig() {
                             type="number"
                             className={inputClass}
                             value={form.invoiceRandomLength}
-                            onChange={(e) => setForm({ ...form, invoiceRandomLength: Math.max(1, Math.min(12, parseInt(e.target.value) || 6)) })}
-                            min={1}
+                            onChange={(e) => {
+                                const invoiceRandomMin = form.invoiceRandomType === 'numeric' ? 10 : 8;
+                                setForm({
+                                    ...form,
+                                    invoiceRandomLength: Math.max(
+                                        invoiceRandomMin,
+                                        Math.min(12, parseInt(e.target.value) || invoiceRandomMin)
+                                    ),
+                                });
+                            }}
+                            min={form.invoiceRandomType === 'numeric' ? 10 : 8}
                             max={12}
                         />
-                        <p className="text-xs ui-text-muted mt-1">Jumlah karakter random (1-12)</p>
+                        <p className="text-xs ui-text-muted mt-1">
+                            Jumlah karakter random ({form.invoiceRandomType === 'numeric' ? '10' : '8'}-12)
+                        </p>
                     </div>
                     <div>
                         <label className={labelClass}>Tipe Random</label>
                         <select
                             className={inputClass}
                             value={form.invoiceRandomType}
-                            onChange={(e) => setForm({ ...form, invoiceRandomType: e.target.value })}
+                            onChange={(e) => {
+                                const nextType = e.target.value;
+                                const invoiceRandomMin = nextType === 'numeric' ? 10 : 8;
+                                setForm({
+                                    ...form,
+                                    invoiceRandomType: nextType,
+                                    invoiceRandomLength: Math.max(
+                                        invoiceRandomMin,
+                                        Math.min(12, form.invoiceRandomLength || invoiceRandomMin)
+                                    ),
+                                });
+                            }}
                         >
                             <option value="alphanumeric">Huruf & Angka (A-Z, 0-9)</option>
                             <option value="numeric">Angka saja (0-9)</option>

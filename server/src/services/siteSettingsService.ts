@@ -39,7 +39,7 @@ export const defaultSiteSettings = {
     invoicePrefix: 'INV',
     invoiceDateFormat: 'YYYYMMDD',
     invoiceSeparator: '',
-    invoiceRandomLength: 6,
+    invoiceRandomLength: 8,
     invoiceRandomType: 'alphanumeric'
 };
 
@@ -75,7 +75,15 @@ export const publicSiteSettingKeys: SiteSettingKey[] = [
     'popupBannerDescription'
 ];
 
-const allowedDateFormats = new Set([
+const refIdDateFormats = new Set([
+    'DDMMYYYY',
+    'YYYYMMDD',
+    'MMDDYYYY',
+    'DDMMYY',
+    'YYMMDD'
+]);
+
+const invoiceDateFormats = new Set([
     'DDMMYYYY',
     'YYYYMMDD',
     'MMDDYYYY',
@@ -164,9 +172,12 @@ const normalizeSiteSettingValue = (
             return normalizeInteger(value, fallback as number, 1, 12);
         case 'depositFeeType':
             return normalizeEnum(value, fallback as 'fixed' | 'percent', new Set(['fixed', 'percent']));
-        case 'refIdDateFormat':
+        case 'refIdDateFormat': {
+            const normalized = normalizeEnum(value, fallback as string, refIdDateFormats);
+            return normalized === 'NONE' ? 'DDMMYYYY' : normalized;
+        }
         case 'invoiceDateFormat':
-            return normalizeEnum(value, fallback as string, allowedDateFormats);
+            return normalizeEnum(value, fallback as string, invoiceDateFormats);
         case 'refIdSeparator':
         case 'invoiceSeparator':
             return normalizeEnum(value, fallback as string, allowedSeparators);
@@ -197,6 +208,19 @@ const normalizeSiteSettingsRecord = (source: Partial<Record<SiteSettingKey, unkn
 
     if (normalized.depositFeeType === 'percent') {
         normalized.depositFee = Math.min(normalized.depositFee, 100);
+    }
+
+    const invoiceMin = normalized.invoiceRandomType === 'numeric' ? 10 : 8;
+    if (normalized.invoiceRandomLength < invoiceMin) {
+        normalized.invoiceRandomLength = invoiceMin;
+    }
+    if (normalized.invoiceRandomLength > 12) {
+        normalized.invoiceRandomLength = 12;
+    }
+
+    // Historical NONE/malformed Ref ID date formats fail closed to the safe default.
+    if (!refIdDateFormats.has(normalized.refIdDateFormat)) {
+        normalized.refIdDateFormat = 'DDMMYYYY';
     }
 
     return normalized;

@@ -55,7 +55,7 @@ pub fn default_site_settings() -> Map<String, Value> {
         ("invoicePrefix".to_string(), json!("INV")),
         ("invoiceDateFormat".to_string(), json!("YYYYMMDD")),
         ("invoiceSeparator".to_string(), json!("")),
-        ("invoiceRandomLength".to_string(), json!(6)),
+        ("invoiceRandomLength".to_string(), json!(8)),
         ("invoiceRandomType".to_string(), json!("alphanumeric")),
     ])
 }
