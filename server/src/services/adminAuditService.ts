@@ -6,14 +6,21 @@ import { getAuthoritativeAuditCorrelation } from '../utils/correlation';
 
 type AuditAction = 'create' | 'update' | 'delete' | 'execute';
 
+export const ADMIN_AUDIT_REDACTION = '[redacted]';
+
 const WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
-const SENSITIVE_KEYS = new Set([
+const EXACT_SENSITIVE_AUDIT_KEYS = new Set([
     'password',
     'currentpassword',
     'newpassword',
     'confirmpassword',
+    'pin',
+    'merchantpin',
+    'transactionpin',
+    'securitypin',
     'apikey',
     'secret',
+    'vendorsecret',
     'twofactorsecret',
     'twofactorpendingsecret',
     'otp',
@@ -22,16 +29,14 @@ const SENSITIVE_KEYS = new Set([
     'authorization',
     'cookie',
     'csrftoken',
-    'x-csrf-token',
+    'xcsrftoken',
+    'accesstoken',
     'refreshtoken',
     'recoverytoken',
-    'refresh_token',
-    'recovery_token',
     'ciphertext',
     'nonce',
     'digest',
     'sessiontokenhashsecret',
-    'vendorsecret',
 ]);
 
 const ACTION_BY_METHOD: Record<string, AuditAction> = {
@@ -73,10 +78,13 @@ const RESOURCE_LABELS: Record<string, string> = {
 };
 
 const MAX_AUDIT_DEPTH = 8;
-const normalizeKey = (key: string) => key.replace(/[^a-z0-9]/gi, '').toLowerCase();
-const isSensitiveKey = (key: string) => {
-    const normalized = normalizeKey(key);
-    return SENSITIVE_KEYS.has(normalized)
+
+export const normalizeAuditMetadataKey = (key: string) =>
+    key.replace(/[^a-z0-9]/gi, '').toLowerCase();
+
+export const isSensitiveAuditMetadataKey = (key: string) => {
+    const normalized = normalizeAuditMetadataKey(key);
+    return EXACT_SENSITIVE_AUDIT_KEYS.has(normalized)
         || /(token|password|secret|apikey|authorization|cookie|ciphertext|otp|csrf|nonce|digest)/i.test(normalized);
 };
 
@@ -85,7 +93,9 @@ const sanitizeValue = (value: unknown, depth = 0): unknown => {
     if (Array.isArray(value)) return value.slice(0, 50).map(entry => sanitizeValue(entry, depth + 1));
     if (value && typeof value === 'object') {
         return Object.entries(value as Record<string, unknown>).slice(0, 100).reduce((acc, [key, entry]) => {
-            acc[key] = isSensitiveKey(key) ? '[redacted]' : sanitizeValue(entry, depth + 1);
+            acc[key] = isSensitiveAuditMetadataKey(key)
+                ? ADMIN_AUDIT_REDACTION
+                : sanitizeValue(entry, depth + 1);
             return acc;
         }, {} as Record<string, unknown>);
     }
@@ -132,7 +142,26 @@ const shouldAuditRequest = (request: AuthRequest) => {
         && (isAuditableV1 || isAuditableV2);
 };
 
-export const recordAdminAuditLog = async (request: AuthRequest, statusCode: number) => {
+export type AdminAuditWriterDependencies = {
+    findActor(id: string): Promise<{ _id: unknown; name?: string; email: string; role: string } | null>;
+    createAuditLog(document: Record<string, unknown>): Promise<unknown>;
+};
+
+const defaultAdminAuditWriterDependencies: AdminAuditWriterDependencies = {
+    findActor: async (id) => User.findById(id).select('name email role').lean() as Promise<{
+        _id: unknown;
+        name?: string;
+        email: string;
+        role: string;
+    } | null>,
+    createAuditLog: async (document) => AdminAuditLog.create(document),
+};
+
+export const recordAdminAuditLog = async (
+    request: AuthRequest,
+    statusCode: number,
+    dependencies: AdminAuditWriterDependencies = defaultAdminAuditWriterDependencies,
+) => {
     if (!shouldAuditRequest(request)) {
         return;
     }
@@ -140,7 +169,7 @@ export const recordAdminAuditLog = async (request: AuthRequest, statusCode: numb
     const correlation = getAuthoritativeAuditCorrelation(request);
 
     try {
-        const actor = await User.findById(request.user!.id).select('name email role').lean();
+        const actor = await dependencies.findActor(request.user!.id);
         if (!actor) {
             return;
         }
@@ -156,7 +185,7 @@ export const recordAdminAuditLog = async (request: AuthRequest, statusCode: numb
             ? sanitizeValue(request.body)
             : undefined;
 
-        await AdminAuditLog.create({
+        await dependencies.createAuditLog({
             actor: actor._id,
             actorName: actor.name || actor.email,
             actorEmail: actor.email,

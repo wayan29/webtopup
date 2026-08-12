@@ -79,6 +79,17 @@ test('admin audit keeps credential bodies out of the log for both login channels
             || source.includes(`'${loginPath}'`);
         assert.equal(excluded, true, `audit must exclude ${loginPath}`);
     }
+    assert.equal(
+        source.includes("'/api/v2/auth/register'") || source.includes('"/api/v2/auth/register"'),
+        true,
+        'audit must exclude registration credential bodies',
+    );
+    assert.match(source, /['"]pin['"]/, 'audit sensitive-key policy must include exact pin');
+    assert.doesNotMatch(
+        source,
+        /\/pin\/i|\(pin\)/,
+        'audit must not use a broad pin substring fallback that redacts shipping/mapping',
+    );
 });
 
 /**
