@@ -28,6 +28,7 @@ The following product and security decisions are fixed for this design:
 - Apply the hardened upload pipeline to `icons`, `covers`, `popups`, and `instructions` without changing their permission mappings.
 - Reject deletion of a managed upload that is still referenced, using `409 ASSET_IN_USE`.
 - Generate transaction Ref IDs from an atomic counter scoped to each WIB calendar date. Changing the display format does not reset the counter.
+- Ref ID date format must include a WIB date. New writes reject `refIdDateFormat = NONE`; a historical malformed or `NONE` value reads effectively as the safe default `DDMMYYYY` without rewriting storage. A later explicit effective change to an allowed date-bearing format may normalize storage; otherwise readiness continues to report the raw unsafe value. Invoice date format may still be `NONE`.
 - Separate the immutable internal transaction Ref ID from `vendorTrxId`; `vendorTrxId` remains the provider's identifier.
 - Require invoice random length 8–12 for alphanumeric identifiers and 10–12 for numeric identifiers.
 - Retry only invoice duplicate-key collisions, with at most five candidates.
@@ -145,7 +146,9 @@ All four folders use one Rust policy:
 ```text
 folders: icons, covers, popups, instructions
 input formats: JPEG, PNG, WebP
-input bytes: <= 5,242,880
+input bytes per file: <= 5,242,880
+multiple-upload files: <= 10
+multiple-upload aggregate input: <= 20,971,520
 width: <= 4096
 height: <= 4096
 pixels: <= 16,777,216
@@ -185,6 +188,11 @@ Single and multiple uploads call the same validation and encoding primitive. The
 
 For a multiple upload:
 
+- at most 10 file fields and 20,971,520 aggregate input bytes are accepted;
+- the Rust total-request parser ceiling is 25,165,824 bytes (24 MiB), scoped only to the multiple-upload route so valid 20 MiB file content plus bounded multipart framing can reach the handler;
+- the single-upload route retains an 8 MiB total-request ceiling;
+- Node's existing 5 MiB multipart `fileSize` remains a per-file boundary, while Rust independently enforces the exact aggregate file-byte bound;
+- exceeding either handler batch bound returns `UPLOAD_BATCH_LIMIT_EXCEEDED` before publication;
 - all files are staged and validated before publication;
 - one invalid file fails the entire batch;
 - no successful response may contain only a subset of the requested files;
@@ -199,6 +207,7 @@ The minimum error codes are:
 
 ```text
 UPLOAD_TOO_LARGE
+UPLOAD_BATCH_LIMIT_EXCEEDED
 UNSUPPORTED_IMAGE_FORMAT
 INVALID_IMAGE_CONTENT
 IMAGE_DIMENSIONS_EXCEEDED
@@ -231,11 +240,11 @@ Before deleting, a registry of known reference locations counts exact URL matche
 | `paymentmethods` | `icon` |
 | `paymentcategories` | `icon` |
 | `sliders` | `image` |
-| `flashsales` | `banner` and embedded managed icon snapshots where applicable |
+| `flashsales` | `banner` |
 | `articles` | `image` |
 | `rewards` | `imageUrl` |
 
-The implementation task must finish the registry by searching all active Mongo write and read mappings for managed upload fields. This is a bounded source inventory, not permission to add unrelated resources.
+The reviewed source inventory confirms that flash-sale product icons are populated from the authoritative `products.icon` field at read time rather than stored as managed paths in `flashsales.products`, so `products.icon` and `flashsales.banner` are the applicable references. The implementation task must repeat a bounded search of active Mongo write/read mappings and add a test for every registry entry; this is not permission to add unrelated resources.
 
 A referenced file returns:
 
@@ -296,7 +305,7 @@ Required index:
 
 The calendar date is computed in WIB (`Asia/Jakarta`, UTC+07:00). Day changes are not derived from server-local timezone.
 
-For each new balance transaction:
+For each new balance transaction, including browser/member and signed OpenAPI creation:
 
 1. load the effective Ref ID format;
 2. allocate the next sequence with atomic `$inc` inside a MongoDB transaction;
@@ -305,7 +314,21 @@ For each new balance transaction:
 5. insert the transaction carrying the immutable `referenceId` in the same transaction as the counter increment;
 6. commit before any vendor call uses the reference.
 
-Changing prefix, date format, separator, or digit width never creates a new counter for the same WIB date.
+Both active insert paths—`routes/transactions.rs::create_transaction` and `routes/open_api/create.rs::create_transaction`—must use this shared primitive. OpenAPI's caller-supplied `customerRefId` remains a separate per-user idempotency/reference field and does not replace the internal `referenceId`.
+
+Changing prefix, allowed date format, separator, or digit width never creates a new counter for the same WIB date.
+
+Ref ID date format must be one of:
+
+```text
+DDMMYYYY
+YYYYMMDD
+MMDDYYYY
+DDMMYY
+YYMMDD
+```
+
+`NONE` is not a valid Ref ID write because a daily counter without a date-bearing identifier can repeat across WIB days. A stored historical `NONE`, missing, malformed, null, or wrong-type `refIdDateFormat` is interpreted as `DDMMYYYY` on every effective read and transaction-format load. This read-time safety normalization does not rewrite MongoDB, and an unrelated changed-only save does not repair it. Only a later explicit effective change that submits an allowed date-bearing format different from the current effective value persists through the normal revisioned transaction; otherwise the readiness finding remains and any direct historical repair stays separately approval-gated. `invoiceDateFormat` remains a separate contract and may still be `NONE` because invoice uniqueness is protected by its random component, exact unique index, and bounded duplicate retry.
 
 If the sequence exceeds the configured width, return:
 
@@ -370,6 +393,7 @@ Add a standalone read-only-by-default tool that reports:
 - duplicate, missing, or malformed guest `invoiceNumber` values;
 - the existence and exact definitions of the counter and identifier indexes;
 - unsafe invoice configuration values;
+- historical unsafe Ref ID format values, including `NONE`, reported as a production-readiness blocker even though runtime reads fail safe to `DDMMYYYY`;
 - whether the database is ready for index creation and route activation.
 
 The default invocation is dry-run and does not create indexes or mutate documents. It prints bounded counts and redacted example document IDs only when needed; it does not dump targets, phone numbers, provider payloads, or full transaction documents.
@@ -469,6 +493,8 @@ Rules:
 - unknown and reserved keys fail closed;
 - client-supplied actor, role, revision metadata, audit metadata, trust headers, and idempotency state are rejected or stripped at the proper boundary;
 - each value is normalized and validated using the Rust setting contract;
+- `refIdDateFormat = NONE` is rejected while `invoiceDateFormat = NONE` remains allowed;
+- a historical unsafe Ref ID date format contributes the effective safe value `DDMMYYYY` to the full snapshot without a read-time write;
 - the effective full snapshot passes all cross-field invariants;
 - keys whose normalized value equals the current value are removed from the effective mutation;
 - no effective change returns success without increasing revision or writing a new settings audit row;
@@ -492,7 +518,7 @@ Success:
 
 The `data` property contains the complete normalized admin snapshot returned by the original successful mutation, excluding reserved metadata except the separate `revision` property.
 
-Replay returns the frozen original response:
+Replay returns the frozen original status, revision, settings data, and error semantics; only the explicit transport indicator changes from `replayed: false` to `replayed: true`:
 
 ```json
 {
@@ -506,7 +532,7 @@ Replay returns the frozen original response:
 }
 ```
 
-The server does not substitute a later settings snapshot into an earlier replay.
+The server does not substitute a later settings snapshot into an earlier replay. The claim freezes a bounded response template containing status, revision, data/error envelope, and every field except the derived `replayed` flag. First delivery serializes that template with `replayed: false`; completed replay serializes the same template with `replayed: true`.
 
 ### 3.4 Single-setting endpoints
 
@@ -592,6 +618,8 @@ updatedAt
 
 The key is 8–128 safe ASCII characters using the existing reviewed `[A-Za-z0-9._-]` contract. Duplicate HTTP header lines fail closed. Node and Rust both validate the key.
 
+Before the Rust listener becomes ready, startup verifies or creates two foundational indexes using the same fail-before-listener pattern as existing auth/idempotency readiness: a semantic unique `{ key: 1 }` index on `settings` (an existing Mongoose default name such as `key_1` is accepted) and the exact new unique `uniq_site_config_idempotency_key` index on `siteconfigidempotencyclaims.idempotencyKey`. Neither index has a TTL. If a non-unique/conflicting definition or existing duplicate data prevents the invariant, Rust does not accept traffic. This startup contract is distinct from transaction/invoice identifier indexes, whose production creation remains gated by the separate readiness process.
+
 The canonical digest is SHA-256 over canonical JSON containing:
 
 ```json
@@ -613,7 +641,7 @@ Binding and replay rules:
 - transaction-started or commit-unknown claims are never reclaimed merely because time elapsed;
 - completed claims remain permanently and have no TTL.
 
-Permission, active status, body validation, a bounded current-snapshot load, and effective step-up classification happen before a new claim is inserted. The pre-claim phase validates that `expectedRevision` is well formed but does not issue the authoritative revision verdict. The authoritative comparison happens inside the transaction after the fenced claim exists, so a version-conflict response can be frozen and replayed deterministically. `AUTH_STEP_UP_REQUIRED` does not consume the idempotency key, so the same save intent can continue after verification.
+Permission, active status, body validation, a bounded current-snapshot load, and effective step-up classification happen before a new claim is inserted. The pre-claim phase validates that `expectedRevision` is well formed but does not issue the authoritative revision verdict. If the bounded snapshot already differs from `expectedRevision`, the request proceeds to a fenced claim and transactional conflict freeze without demanding step-up because no settings change can execute. If the snapshot matches and effective sensitive changes could execute, missing step-up returns `AUTH_STEP_UP_REQUIRED` before claim creation. The authoritative comparison happens inside the transaction after the fenced claim exists, so races and version-conflict responses can be frozen and replayed deterministically. `AUTH_STEP_UP_REQUIRED` does not consume the idempotency key, so the same save intent can continue after verification.
 
 Before opening the MongoDB transaction, the service durably marks the fenced claim with `transactionStartedAt` and its claim token. A definitive transaction abort may transition the same fenced claim to an explicit retryable state. An ambiguous outcome cannot be marked retryable.
 
@@ -625,7 +653,9 @@ If `MONGO_TRANSACTIONS_ENABLED` is false or transaction capability is unavailabl
 503 SETTINGS_TRANSACTIONS_UNAVAILABLE
 ```
 
-No setting, revision, audit event, or idempotency claim is changed in that case.
+Before claim acquisition, each PUT proves current capability with a read-only MongoDB transaction that performs a session-aware bounded revision-metadata read and aborts. Only the reviewed MongoDB transaction-not-supported/illegal-operation classifier maps to transaction unavailability; arbitrary network or database errors retain their own fail-closed availability semantics. A flag-disabled or exact capability-probe failure returns the transaction availability error before claim insertion. Because capability can change after the probe, claim acquisition retains an exact undo record: a new claim can be deleted, while a reclaimed stale pre-transaction claim can be restored byte-for-byte, each only under the exact new claim token/binding. If the real mutation transaction fails definitively before any in-transaction write is attempted, the service aborts it and applies that exact undo; failure to prove or complete the undo is not reported as ordinary unavailability and instead remains conservatively fenced/unknown. Once any transaction write is attempted, the claim is never undone under this capability rule.
+
+No setting, revision, audit event, or idempotency claim is changed for a proven disabled/unavailable pre-effect result.
 
 A successful mutation transaction includes:
 
@@ -764,11 +794,13 @@ Minimum codes and status classes:
 |---|---|---|
 | 400 | `IDEMPOTENCY_KEY_REQUIRED` | Missing, duplicate, or malformed Site Config key |
 | 400 | `UNSUPPORTED_IMAGE_FORMAT` | Image is not JPEG, PNG, or WebP |
-| 400 | `UPLOAD_TOO_LARGE` | Input exceeds 5 MiB |
+| 400 | `UPLOAD_TOO_LARGE` | One input file exceeds 5 MiB |
+| 400 | `UPLOAD_BATCH_LIMIT_EXCEEDED` | Multiple upload exceeds 10 files or 20 MiB aggregate |
 | 400 | `INVALID_IMAGE_CONTENT` | Content cannot be fully decoded |
 | 400 | `IMAGE_DIMENSIONS_EXCEEDED` | Width or height exceeds 4096 |
 | 400 | `IMAGE_PIXEL_LIMIT_EXCEEDED` | Decoded pixel count exceeds 16,777,216 |
 | 400 | `ENCODED_IMAGE_TOO_LARGE` | Re-encoded output exceeds 5 MiB |
+| 400 | `MANAGED_ASSET_NOT_FOUND` | A submitted managed upload URL does not exist |
 | 403 | `PERMISSION_DENIED` | Effective `manageSettings` or upload permission is absent |
 | 403 | `AUTH_STEP_UP_REQUIRED` | Effective sensitive settings change lacks trusted `settings.sensitive` proof |
 | 409 | `SETTINGS_VERSION_CONFLICT` | Expected revision is stale |
@@ -913,6 +945,7 @@ Tests must cover:
 - temporary-file cleanup and all-or-nothing batch cleanup;
 - reference classification, bounded disclosure, and `ASSET_IN_USE`;
 - daily WIB counter identity and date boundaries;
+- Ref ID `NONE`/malformed/missing read-time fallback to `DDMMYYYY`, write-time `NONE` rejection, and invoice `NONE` acceptance;
 - format changes do not reset a counter;
 - sequence exhaustion;
 - immutable `referenceId` not overwritten by vendor updates;
@@ -925,7 +958,8 @@ Tests must cover:
 - effective no-op does not require step-up or increment revision;
 - sensitive effective changes require trusted `settings.sensitive` proof;
 - settings, revision, audit, and completed claim commit atomically;
-- disabled transactions return `SETTINGS_TRANSACTIONS_UNAVAILABLE` without a claim or write;
+- flag-disabled and read-only-probe transaction unavailability return `SETTINGS_TRANSACTIONS_UNAVAILABLE` without a claim or write;
+- definitive real-transaction failure before its first write exactly removes a new claim or restores a reclaimed pre-transaction claim, while failed/unproven undo remains conservatively fenced rather than falsely returning ordinary unavailability;
 - identical completed request replay;
 - operator/revision/digest conflicts;
 - stale pre-transaction claim fencing;
@@ -962,11 +996,12 @@ The required integration scenarios are:
 15. valid JPEG, PNG, and WebP are re-encoded and published with canonical extensions;
 16. an invalid multiple-upload batch leaves no batch files;
 17. referenced asset deletion returns `ASSET_IN_USE`; unreferenced synthetic asset deletion succeeds;
-18. parallel transaction creation yields unique ordered `referenceId` values;
-19. sequence exhaustion fails closed;
-20. forced invoice collision retries only the candidate and preserves one guest transaction;
-21. readiness checker dry-run changes no documents or indexes;
-22. disposable apply creates only exact reviewed indexes.
+18. historical stored Ref ID `NONE` reads and allocates effectively as `DDMMYYYY`, while a new Ref ID `NONE` save is rejected and invoice `NONE` remains accepted;
+19. parallel transaction creation yields unique ordered `referenceId` values;
+20. sequence exhaustion fails closed;
+21. forced invoice collision retries only the candidate and preserves one guest transaction;
+22. readiness checker dry-run reports stored unsafe Ref ID format and changes no documents or indexes;
+23. disposable apply creates only exact reviewed indexes after unsafe fixture data is restored.
 
 Synthetic financial flows must be isolated, reversible through database reset, and must not invoke real providers. Provider mode remains `mock`.
 
@@ -981,6 +1016,7 @@ Browser coverage proves:
 - a stale revision preserves the draft and shows current server values;
 - conflict actions do not silently merge or overwrite;
 - commit-unknown copy is explicitly uncertain;
+- Ref ID date-format controls do not offer `NONE`, while invoice date-format controls still do;
 - invoice length UI enforces the selected type minimum;
 - invalid image content produces visible UI feedback;
 - public settings revalidation observes the new revision;
@@ -1036,9 +1072,10 @@ These items require later specifications after the foundation is verified.
 The foundation is complete only when all of the following are true:
 
 - newly published uploads can only be decoded and re-encoded JPEG, PNG, or WebP within all fixed limits;
-- failed uploads and failed batches leave no partial public files;
+- failed uploads and failed bounded batches leave no partial public files;
 - referenced managed assets cannot be deleted;
-- every new balance transaction has a unique immutable `referenceId` allocated from the WIB daily counter;
+- every new browser/member or signed OpenAPI balance transaction has a unique immutable date-bearing `referenceId` allocated from the WIB daily counter;
+- Ref ID `NONE` is rejected on write, historical unsafe format reads fail safe to `DDMMYYYY`, and invoice date format may still be `NONE`;
 - reference allocation fails closed when transactions are unavailable and never compensates an unproven commit outcome;
 - provider identifiers can no longer overwrite the local reference;
 - every new guest invoice satisfies the minimum entropy policy and duplicate collisions are bounded;
