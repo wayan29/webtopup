@@ -323,7 +323,7 @@ transactions.referenceId unique
 
 A database whose historical records prevent the reviewed index from being created is not production-ready for activation. This design deliberately does not invent historical identifiers or weaken the index to hide missing legacy data. The readiness report becomes the release gate, and any production reconciliation requires separate approval.
 
-The counter increment and transaction insert form the identifier transaction boundary. Existing balance, voucher, and flash-sale behavior outside that boundary is not broadly redesigned by this Site Config scope. If commit outcome is ambiguous, resolution reads the preallocated transaction `_id` and `referenceId`; compensating rollback must not run unless absence is proven. A still-unprovable result returns a conservative commit-unknown error rather than risking a duplicate transaction or incorrect balance restoration.
+The counter increment and transaction insert form the identifier transaction boundary. If MongoDB transactions are disabled or unavailable, the protected creation path returns `503 IDENTIFIER_TRANSACTIONS_UNAVAILABLE`; it does not fall back to count-based or non-transactional allocation. Existing balance, voucher, and flash-sale behavior outside that boundary is not broadly redesigned by this Site Config scope. If commit outcome is ambiguous, resolution reads the preallocated transaction `_id` and `referenceId`; compensating rollback must not run unless absence is proven. A still-unprovable result returns `503 TRANSACTION_REFERENCE_COMMIT_UNKNOWN` rather than risking a duplicate transaction or incorrect balance restoration.
 
 ### 2.3 Safe guest invoice policy
 
@@ -613,7 +613,7 @@ Binding and replay rules:
 - transaction-started or commit-unknown claims are never reclaimed merely because time elapsed;
 - completed claims remain permanently and have no TTL.
 
-Permission, active status, body validation, revision precheck, and effective step-up classification happen before a new claim is inserted. `AUTH_STEP_UP_REQUIRED` does not consume the idempotency key, so the same save intent can continue after verification.
+Permission, active status, body validation, a bounded current-snapshot load, and effective step-up classification happen before a new claim is inserted. The pre-claim phase validates that `expectedRevision` is well formed but does not issue the authoritative revision verdict. The authoritative comparison happens inside the transaction after the fenced claim exists, so a version-conflict response can be frozen and replayed deterministically. `AUTH_STEP_UP_REQUIRED` does not consume the idempotency key, so the same save intent can continue after verification.
 
 Before opening the MongoDB transaction, the service durably marks the fenced claim with `transactionStartedAt` and its claim token. A definitive transaction abort may transition the same fenced claim to an explicit retryable state. An ambiguous outcome cannot be marked retryable.
 
@@ -779,6 +779,8 @@ Minimum codes and status classes:
 | 500 | `UPLOAD_STORAGE_FAILED` | Staging, flush, encode publication, or deletion failed |
 | 503 | `SETTINGS_TRANSACTIONS_UNAVAILABLE` | Site Config mutation transaction capability is disabled |
 | 503 | `SETTINGS_COMMIT_UNKNOWN` | Site Config commit outcome cannot be proven |
+| 503 | `IDENTIFIER_TRANSACTIONS_UNAVAILABLE` | Atomic transaction-reference allocation cannot run |
+| 503 | `TRANSACTION_REFERENCE_COMMIT_UNKNOWN` | Counter/transaction commit outcome cannot be proven |
 | 503 | `INVOICE_IDENTIFIER_EXHAUSTED` | Five invoice candidates collided |
 | 503 | `IDENTIFIER_INDEX_UNAVAILABLE` | A required identifier index is absent or drifted |
 
@@ -1037,6 +1039,7 @@ The foundation is complete only when all of the following are true:
 - failed uploads and failed batches leave no partial public files;
 - referenced managed assets cannot be deleted;
 - every new balance transaction has a unique immutable `referenceId` allocated from the WIB daily counter;
+- reference allocation fails closed when transactions are unavailable and never compensates an unproven commit outcome;
 - provider identifiers can no longer overwrite the local reference;
 - every new guest invoice satisfies the minimum entropy policy and duplicate collisions are bounded;
 - identifier creation fails closed without exact required indexes;
