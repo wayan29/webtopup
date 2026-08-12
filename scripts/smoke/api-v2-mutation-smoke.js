@@ -1780,7 +1780,8 @@ async function main() {
     ok('audit logs invalid start date boundary', invalidAuditStartDate.response.status);
 
     const invalidAuditExportEndDate = await authedJson(token, 'GET', '/api/v2/audit-logs/export?endDate=bad-date');
-    assertStatus('audit logs export invalid end date boundary', invalidAuditExportEndDate.response, invalidAuditExportEndDate.body, 400);
+    // Without exports.sensitive step-up, the gateway must reject before Rust date validation.
+    assertStepUpRequired('audit logs export invalid end date boundary', invalidAuditExportEndDate.response, invalidAuditExportEndDate.body);
     ok('audit logs export invalid end date boundary', invalidAuditExportEndDate.response.status);
 
     const unauthTwoFactorSetup = await jsonRequest('POST', '/api/v2/auth/2fa/setup', {});

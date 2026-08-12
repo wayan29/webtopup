@@ -92,6 +92,17 @@ test('admin audit keeps credential bodies out of the log for both login channels
     );
 });
 
+test('legacy node audit routes stay unregistered and active export keeps manageTeam step-up', () => {
+    const app = readRepo('server/src/app.ts');
+    const proxy = readRepo('server/src/routes/apiV2ProxyRoutes.ts');
+    assert.doesNotMatch(app, /adminAuditRoutes/);
+    assert.doesNotMatch(app, /from '\.\/routes\/adminAuditRoutes'/);
+    assert.match(
+        proxy,
+        /app\.get\('\/audit-logs\/export', \{ preHandler: \[authenticate, hasPermission\('manageTeam'\), requireStepUp\('exports\.sensitive'\)\] \}/,
+    );
+});
+
 /**
  * Files that must still name the removed endpoint carry this marker, so a closure assertion
  * stays legal while an actual login call site does not.
