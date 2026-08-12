@@ -40,8 +40,14 @@ pub async fn audit_logs(
         return unavailable();
     };
 
-    let page = parse_positive_i64(query.page.as_deref(), 1, 10_000);
-    let limit = parse_positive_i64(query.limit.as_deref(), 25, 100);
+    let page = match parse_positive_i64(query.page.as_deref(), 1, 10_000) {
+        Ok(page) => page,
+        Err(response) => return response,
+    };
+    let limit = match parse_positive_i64(query.limit.as_deref(), 25, 100) {
+        Ok(limit) => limit,
+        Err(response) => return response,
+    };
     let filter = match build_audit_filter(&query) {
         Ok(filter) => filter,
         Err(response) => return response,
