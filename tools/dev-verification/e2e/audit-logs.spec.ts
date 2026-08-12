@@ -2,7 +2,7 @@ import { expect, test } from '@playwright/test';
 import { MongoClient, ObjectId } from 'mongodb';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { loginFixture } from './fixtures.ts';
+import { fixtureOtp, loginFixture } from './fixtures.ts';
 
 const root = path.resolve(__dirname, '..', '..', '..');
 
@@ -143,4 +143,43 @@ test('audit detail dialog is keyboard-accessible on desktop and mobile', async (
   }
 
   if (primary) throw primary;
+});
+
+
+test('export is gated by manageTeam step-up for audit manager', async ({ page }, testInfo) => {
+  const manager = await loginFixture('audit-manager');
+  const otp = await fixtureOtp('audit-manager');
+  await page.goto(manager.loginPath);
+  await page.getByLabel('Email').fill(manager.email);
+  await page.getByLabel('Password').fill(manager.password);
+  await page.getByRole('button', { name: 'Masuk sekarang' }).click();
+  await expect(page.getByText('Verifikasi 2FA')).toBeVisible();
+  await page.getByLabel('Kode OTP').fill(otp);
+  await page.getByRole('button', { name: 'Verifikasi & masuk' }).click();
+  await expect(page).toHaveURL(/\/admin\/dashboard$/);
+
+  await page.goto('/admin/audit-logs');
+  const exportButton = page.getByRole('button', { name: 'Export CSV' });
+  await expect(exportButton).toBeEnabled();
+
+  const gate: Array<{ status: number; code: string | null; group: string | null }> = [];
+  page.on('response', async (response) => {
+    if (!response.url().includes('/api/v2/audit-logs/export')) return;
+    let payload: any = {};
+    try { payload = await response.json(); } catch { /* blob or empty */ }
+    gate.push({
+      status: response.status(),
+      code: payload?.error?.code ?? payload?.code ?? null,
+      group: payload?.error?.actionGroup ?? payload?.actionGroup ?? null,
+    });
+  });
+
+  await exportButton.click();
+  await expect.poll(() => gate.length).toBeGreaterThan(0);
+  expect(gate[0]).toEqual({ status: 403, code: 'AUTH_STEP_UP_REQUIRED', group: 'exports.sensitive' });
+  const dialog = page.getByRole('dialog', { name: 'Verifikasi ulang diperlukan' });
+  await expect(dialog).toBeVisible();
+  await expect(dialog).toContainText(/ekspor data sensitif|export/i);
+  await dialog.getByRole('button', { name: /Batal|Cancel/i }).click();
+  await expect(dialog).toHaveCount(0);
 });
