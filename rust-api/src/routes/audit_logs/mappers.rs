@@ -2,7 +2,7 @@ use mongodb::bson::Document;
 
 use crate::utils::bson::{optional_i64, optional_string, read_string};
 
-use super::sanitize::sanitize_audit_document;
+use crate::services::audit_sanitize::sanitize_audit_document;
 use super::types::AuditLogItem;
 
 pub fn audit_log_item_from_doc(mut document: Document) -> AuditLogItem {

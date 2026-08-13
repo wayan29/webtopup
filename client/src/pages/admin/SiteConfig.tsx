@@ -1,6 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, Info, Save, Loader2, RefreshCcw } from 'lucide-react';
 import { apiV2 } from '../../api';
+import { useStepUpOrchestration } from '../../auth/useStepUpOrchestration';
+import {
+    createChangedPayload,
+    createSiteConfigIntent,
+    parseAdminSettingsResponse,
+    parseVersionConflict,
+    siteConfigErrorMessage,
+    type SiteConfigIntent,
+} from '../../lib/siteConfigMutation';
 import ImagePickerField from '../../components/admin/ImagePickerField';
 
 type TabKey = 'web' | 'contact' | 'system' | 'other' | 'banner' | 'refid';
@@ -110,6 +119,10 @@ export default function SiteConfig() {
     const [activeTab, setActiveTab] = useState<TabKey>('web');
     const [form, setForm] = useState<SettingsForm>(defaultForm);
     const [lastSavedForm, setLastSavedForm] = useState<SettingsForm>(defaultForm);
+    const [revision, setRevision] = useState(0);
+    const [pendingIntent, setPendingIntent] = useState<SiteConfigIntent | null>(null);
+    const [conflict, setConflict] = useState<{ currentRevision: number; currentSettings: SettingsForm } | null>(null);
+    const stepUp = useStepUpOrchestration();
     const latestRequestId = useRef(0);
     const [loading, setLoading] = useState(true);
     const [saving, setSaving] = useState(false);
@@ -134,9 +147,11 @@ export default function SiteConfig() {
             setMessage(null);
             const res = await apiV2.get('/settings/admin/all');
             if (requestId !== latestRequestId.current) return;
-            const nextForm = { ...defaultForm, ...res.data };
+            const parsed = parseAdminSettingsResponse(res.data);
+            const nextForm = { ...defaultForm, ...(parsed.form as Partial<SettingsForm>) } as SettingsForm;
             setForm(nextForm);
             setLastSavedForm(nextForm);
+            setRevision(parsed.revision);
         } catch (error: any) {
             if (requestId !== latestRequestId.current) return;
             console.error('Failed to load settings', error);
@@ -214,16 +229,6 @@ export default function SiteConfig() {
         return null;
     };
 
-    const getChangedPayload = () => {
-        const payload: Partial<SettingsForm> = {};
-        (Object.keys(form) as Array<keyof SettingsForm>).forEach((key) => {
-            if (key === 'refIdSample' || key === 'invoiceSample') return;
-            if (form[key] !== lastSavedForm[key]) {
-                (payload as any)[key] = form[key];
-            }
-        });
-        return payload;
-    };
 
     const getSensitiveChangeMessage = () => {
         const warnings: string[] = [];
@@ -248,36 +253,90 @@ export default function SiteConfig() {
                 setMessage({ type: 'error', text: validationError });
                 return;
             }
-
             const sensitiveChangeMessage = getSensitiveChangeMessage();
             if (!skipConfirm && sensitiveChangeMessage) {
                 setPendingConfirmMessage(sensitiveChangeMessage);
                 return;
             }
-
-            const payload = getChangedPayload();
-            if (Object.keys(payload).length === 0) {
+            const changes = createChangedPayload(
+                form as unknown as Record<string, unknown>,
+                lastSavedForm as unknown as Record<string, unknown>,
+            );
+            if (Object.keys(changes).length === 0) {
                 setMessage({ type: 'success', text: 'Tidak ada perubahan pengaturan.' });
                 return;
             }
-
             setSaving(true);
             setMessage(null);
             setPendingConfirmMessage(null);
-            const res = await apiV2.put('/settings/admin/update', payload);
-            const nextForm = { ...defaultForm, ...(res.data?.data || form) };
+            setConflict(null);
+            const intent = pendingIntent && pendingIntent.expectedRevision === revision
+                ? pendingIntent
+                : createSiteConfigIntent(revision, changes);
+            setPendingIntent(intent);
+            const res = await stepUp.run(
+                'settings.sensitive',
+                (config) => apiV2.put('/settings/admin/update', {
+                    expectedRevision: intent.expectedRevision,
+                    changes: intent.changes,
+                }, {
+                    ...config,
+                    headers: {
+                        ...(config?.headers || {}),
+                        'Idempotency-Key': intent.key,
+                    },
+                }),
+            );
+            const body = (res as { data?: any })?.data ?? res;
+            const nextRevision = typeof body?.revision === 'number' ? body.revision : revision;
+            const nextForm = { ...defaultForm, ...(body?.data || form) } as SettingsForm;
+            delete (nextForm as { revision?: unknown }).revision;
             setForm(nextForm);
             setLastSavedForm(nextForm);
-            setMessage({ type: 'success', text: 'Pengaturan situs berhasil disimpan.' });
-        } catch (error: any) {
-            console.error('Failed to save settings', error);
+            setRevision(nextRevision);
+            setPendingIntent(null);
             setMessage({
-                type: 'error',
-                text: error.response?.data?.message || 'Gagal menyimpan pengaturan.'
+                type: 'success',
+                text: body?.replayed
+                    ? 'Penyimpanan berhasil dilanjutkan (replay).'
+                    : 'Pengaturan situs berhasil disimpan.',
             });
+        } catch (error: unknown) {
+            console.error('Failed to save settings', error);
+            const versionConflict = parseVersionConflict(error);
+            if (versionConflict) {
+                setConflict({
+                    currentRevision: versionConflict.currentRevision,
+                    currentSettings: {
+                        ...defaultForm,
+                        ...(versionConflict.currentSettings as Partial<SettingsForm>),
+                    } as SettingsForm,
+                });
+                setPendingIntent(null);
+            }
+            setMessage({ type: 'error', text: siteConfigErrorMessage(error) });
         } finally {
             setSaving(false);
         }
+    };
+
+    const loadLatestServerVersion = () => {
+        if (!conflict) return;
+        setForm(conflict.currentSettings);
+        setLastSavedForm(conflict.currentSettings);
+        setRevision(conflict.currentRevision);
+        setConflict(null);
+        setPendingIntent(null);
+        setMessage({ type: 'success', text: 'Draft diganti dengan versi terbaru dari server.' });
+    };
+
+    const keepDraftAfterConflict = () => {
+        if (!conflict) return;
+        setRevision(conflict.currentRevision);
+        setLastSavedForm(conflict.currentSettings);
+        setConflict(null);
+        setPendingIntent(null);
+        setMessage({ type: 'success', text: 'Draft dipertahankan. Simpan ulang akan memakai revisi terbaru.' });
     };
 
     const invoicePreviewSeed = useMemo(() => Math.random().toString(36).slice(2, 14).toUpperCase(), [form.invoiceRandomLength, form.invoiceRandomType]);
@@ -902,7 +961,16 @@ export default function SiteConfig() {
 
     return (
         <div className="space-y-5">
-            {message && (
+            {conflict && (
+                        <div className="rounded-lg border ui-border p-4 space-y-3" role="alert">
+                            <p className="text-sm font-semibold">Konflik revisi: server di r{conflict.currentRevision}</p>
+                            <div className="flex flex-wrap gap-2">
+                                <button type="button" onClick={loadLatestServerVersion} className="ui-primary-action rounded-lg px-3 py-2 text-sm font-semibold">Muat versi terbaru</button>
+                                <button type="button" onClick={keepDraftAfterConflict} className="ui-panel rounded-lg border ui-border px-3 py-2 text-sm font-semibold">Tinjau ulang draft</button>
+                            </div>
+                        </div>
+                    )}
+                    {message && (
                 <div className={`rounded-xl border px-4 py-3 text-sm ${
                     message.type === 'success'
                         ? 'ui-success-chip'

@@ -1,3 +1,4 @@
+pub mod audit_sanitize;
 pub mod correlation;
 pub mod identifier_integrity;
 pub mod idempotency;

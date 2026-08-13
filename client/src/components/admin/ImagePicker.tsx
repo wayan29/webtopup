@@ -32,6 +32,7 @@ export default function ImagePicker({
     const [uploading, setUploading] = useState(false);
     const [deleting, setDeleting] = useState<string | null>(null);
     const [selectedUrl, setSelectedUrl] = useState<string | null>(currentValue || null);
+    const [pickerError, setPickerError] = useState<string | null>(null);
     const [activeTab, setActiveTab] = useState<'icons' | 'covers' | 'popups' | 'instructions'>(type);
 
     useEffect(() => {
@@ -47,6 +48,7 @@ export default function ImagePicker({
 
     const fetchFiles = async () => {
         setLoading(true);
+        setPickerError(null);
         try {
             const res = await apiV2
                 .get(`/upload/list?type=${activeTab}`);
@@ -55,6 +57,7 @@ export default function ImagePicker({
             }
         } catch (error) {
             console.error('Failed to fetch files:', error);
+            setPickerError('Gagal memuat daftar gambar.');
         } finally {
             setLoading(false);
         }
@@ -65,6 +68,7 @@ export default function ImagePicker({
         if (!file) return;
 
         setUploading(true);
+        setPickerError(null);
         try {
             const formData = new FormData();
             formData.append('file', file);
@@ -80,6 +84,7 @@ export default function ImagePicker({
             }
         } catch (error) {
             console.error('Upload failed:', error);
+            setPickerError('Gagal mengunggah. Gunakan JPEG, PNG, atau WebP · maks. 5 MiB · maks. 4096×4096');
         } finally {
             setUploading(false);
         }
@@ -131,6 +136,11 @@ export default function ImagePicker({
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 backdrop-blur-sm">
             <div className="ui-panel rounded-xl w-full max-w-4xl max-h-[85vh] overflow-hidden shadow-2xl border ui-border flex flex-col">
                 {/* Header */}
+                {(pickerError || true) && (
+                    <div className="px-4 pt-3">
+                        {pickerError ? <div role="alert" className="text-sm text-red-600">{pickerError}</div> : <p className="text-xs ui-text-muted">JPEG, PNG, atau WebP · maks. 5 MiB · maks. 4096×4096</p>}
+                    </div>
+                )}
                 <div className="flex items-center justify-between px-6 py-4 border-b ui-border ui-card-gradient">
                     <div className="flex items-center gap-3">
                         <FolderOpen className="w-5 h-5 ui-accent-text" />
@@ -249,6 +259,11 @@ export default function ImagePicker({
                 </div>
 
                 {/* Footer */}
+                {(pickerError || true) && (
+                    <div className="px-4 pt-3">
+                        {pickerError ? <div role="alert" className="text-sm text-red-600">{pickerError}</div> : <p className="text-xs ui-text-muted">JPEG, PNG, atau WebP · maks. 5 MiB · maks. 4096×4096</p>}
+                    </div>
+                )}
                 <div className="flex items-center justify-between px-6 py-4 border-t ui-border ui-panel-muted">
                     <div className="text-sm ui-text-muted">
                         {selectedUrl ? (

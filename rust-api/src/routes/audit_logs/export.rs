@@ -7,7 +7,7 @@ use mongodb::bson::{Bson, DateTime, Document};
 
 use crate::utils::bson::{optional_i64, read_string};
 
-use super::sanitize::{sanitize_audit_document, AUDIT_REDACTION};
+use crate::services::audit_sanitize::{sanitize_audit_document, AUDIT_REDACTION};
 
 pub fn csv_response(items: &[Document], truncated: bool) -> Response {
     let csv = build_audit_csv(items);
