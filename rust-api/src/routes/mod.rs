@@ -330,6 +330,7 @@ pub fn app(state: Arc<AppState>) -> Router {
             "/v2/sliders/admin/{id}",
             axum::routing::put(content::slider_update).delete(content::slider_delete),
         )
+        .route("/v2/sliders/admin/archived", get(content::sliders_admin_archived))
         .route("/v2/sliders/admin/all", get(content::sliders_admin_all))
         .route(
             "/v2/digiflazz-seller/orders/process-callback-retries/scheduler/config",

@@ -84,7 +84,8 @@ const checks = [
   { name: 'admin settings', path: '/api/v2/settings/admin/all', shape: 'object' },
   { name: 'margins', path: '/api/v2/margins', shape: 'object' },
   { name: 'sliders public', path: '/api/v2/sliders', shape: 'array' },
-  { name: 'sliders admin', path: '/api/v2/sliders/admin/all', shape: 'array' },
+  { name: 'sliders admin', path: '/api/v2/sliders/admin/all', shape: 'object' },
+  { name: 'sliders admin archived', path: '/api/v2/sliders/admin/archived', shape: 'object' },
   { name: 'flash sales active', path: '/api/v2/flash-sales/active', shape: 'array' },
   { name: 'flash sales admin', path: '/api/v2/flash-sales/admin/all', shape: 'array' },
   { name: 'leaderboard public', path: '/api/v2/leaderboard', shape: 'object' },
@@ -417,6 +418,42 @@ async function runCheck(check, token) {
   return { response, body };
 }
 
+async function runSliderFreshnessChecks(failures) {
+  const name = 'sliders public etag and 304';
+  try {
+    const first = await request('/api/v2/sliders');
+    if (first.response.status !== 200 || !Array.isArray(first.body)) {
+      throw new Error(`expected public slider HTTP 200 array, got ${first.response.status}: ${JSON.stringify(first.body)}`);
+    }
+    const etag = first.response.headers.get('etag');
+    const cacheControl = first.response.headers.get('cache-control') || '';
+    if (!etag || !/^\"sliders-\\d+\"$/.test(etag)) {
+      throw new Error(`expected strong slider ETag, got ${etag || 'missing'}`);
+    }
+    if (!cacheControl.toLowerCase().includes('no-cache')) {
+      throw new Error(`expected Cache-Control no-cache, got ${cacheControl || 'missing'}`);
+    }
+
+    const second = await request('/api/v2/sliders', {
+      headers: { 'If-None-Match': `\"old\", ${etag}` },
+    });
+    if (second.response.status !== 304 || second.body !== null) {
+      throw new Error(`expected HTTP 304 with no body, got ${second.response.status}: ${JSON.stringify(second.body)}`);
+    }
+    if (second.response.headers.get('etag') !== etag) {
+      throw new Error('304 response did not preserve the public ETag');
+    }
+    if (!(second.response.headers.get('cache-control') || '').toLowerCase().includes('no-cache')) {
+      throw new Error('304 response did not preserve Cache-Control no-cache');
+    }
+    ok(name, second.response.status);
+  } catch (error) {
+    reporter.record('failed', name, { message: error.message });
+    failures.push({ check: { name }, error });
+    console.error(`fail ${name}: ${error.message}`);
+  }
+}
+
 async function runDynamicDetailChecks(token, failures) {
   const result = { passed: 0, skipped: 0 };
   const detailChecks = [
@@ -671,6 +708,7 @@ async function main() {
     console.error(`fail member owned reads: ${error.message}`);
   }
 
+  await runSliderFreshnessChecks(failures);
   const dynamicResult = await runDynamicDetailChecks(token, failures);
   const sortingResult = await runDynamicSortingChecks(token, failures);
   const openApiResult = await runDynamicOpenApiChecks(token, failures);

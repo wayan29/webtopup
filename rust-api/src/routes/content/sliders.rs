@@ -2,6 +2,7 @@ use std::{collections::HashSet, sync::Arc};
 
 use axum::{
     extract::{Path, State},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -21,10 +22,29 @@ use crate::{
 };
 
 use super::{
-    date_string, document_to_json, i64_value, internal_error, not_found, status_message,
-    text_value, text_value_or_current, unavailable, MessageResponse, NormalizedSliderPayload,
-    SliderItem, SliderPayload, SliderResponse, SliderSortOrderPayload,
+    date_string, document_to_json, i64_value, internal_error, load_archived_snapshot,
+    load_current_snapshot, load_public_snapshot, matches_slider_etag, not_found, slider_etag,
+    status_message, text_value, text_value_or_current, unavailable, MessageResponse,
+    NormalizedSliderPayload, SliderItem, SliderPayload, SliderResponse, SliderSortOrderPayload,
+    SliderSnapshotError,
 };
+
+fn slider_snapshot_error_response(error: SliderSnapshotError) -> Response {
+    match error {
+        SliderSnapshotError::Unstable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "message": "Snapshot slider tidak stabil",
+                "error": {
+                    "code": error.code(),
+                    "message": "Snapshot slider tidak stabil"
+                }
+            })),
+        )
+            .into_response(),
+        SliderSnapshotError::Unavailable => internal_error(),
+    }
+}
 
 pub async fn sliders_admin_all(
     headers: axum::http::HeaderMap,
@@ -36,52 +56,59 @@ pub async fn sliders_admin_all(
     let Some(client) = &state.mongo_client else {
         return unavailable();
     };
-    let docs = match client
-        .database(&state.mongo_db)
-        .collection::<Document>("sliders")
-        .find(doc! {})
-        .sort(doc! { "sortOrder": 1, "createdAt": 1 })
-        .await
-    {
-        Ok(cursor) => match cursor.try_collect::<Vec<_>>().await {
-            Ok(docs) => docs,
-            Err(error) => {
-                eprintln!("Failed to collect admin sliders: {error}");
-                return internal_error();
-            }
-        },
-        Err(error) => {
-            eprintln!("Failed to query admin sliders: {error}");
-            return internal_error();
-        }
-    };
-    Json(docs.into_iter().map(slider_from_doc).collect::<Vec<_>>()).into_response()
+    match load_current_snapshot(client, &state.mongo_db).await {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => slider_snapshot_error_response(error),
+    }
 }
 
-pub async fn sliders_public(State(state): State<Arc<AppState>>) -> Response {
+pub async fn sliders_admin_archived(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    if let Err(response) = require_permission(&headers, &state, "manageSettings").await {
+        return response;
+    }
     let Some(client) = &state.mongo_client else {
         return unavailable();
     };
-    let docs = match client
-        .database(&state.mongo_db)
-        .collection::<Document>("sliders")
-        .find(doc! { "status": true })
-        .sort(doc! { "sortOrder": 1, "createdAt": 1 })
-        .await
-    {
-        Ok(cursor) => match cursor.try_collect::<Vec<_>>().await {
-            Ok(docs) => docs,
-            Err(error) => {
-                eprintln!("Failed to collect public sliders: {error}");
-                return internal_error();
-            }
-        },
-        Err(error) => {
-            eprintln!("Failed to query public sliders: {error}");
-            return internal_error();
-        }
+    match load_archived_snapshot(client, &state.mongo_db).await {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => slider_snapshot_error_response(error),
+    }
+}
+
+pub async fn sliders_public(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    let Some(client) = &state.mongo_client else {
+        return unavailable();
     };
-    Json(docs.into_iter().map(slider_from_doc).collect::<Vec<_>>()).into_response()
+    let (revision, sliders) = match load_public_snapshot(client, &state.mongo_db).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return slider_snapshot_error_response(error),
+    };
+    let etag = slider_etag(revision);
+    if matches_slider_etag(headers.get(header::IF_NONE_MATCH), revision) {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::CACHE_CONTROL, "no-cache"),
+                (header::ETAG, etag.as_str()),
+            ],
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        [
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::ETAG, etag.as_str()),
+        ],
+        Json(sliders),
+    )
+        .into_response()
 }
 
 pub async fn slider_create(
