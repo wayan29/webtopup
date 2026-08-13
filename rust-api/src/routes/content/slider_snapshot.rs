@@ -171,12 +171,43 @@ pub fn matches_slider_etag(value: Option<&HeaderValue>, revision: i64) -> bool {
     let Some(raw) = value.and_then(|value| value.to_str().ok()) else {
         return false;
     };
-    let members = raw.split(',').map(str::trim).collect::<Vec<_>>();
+    let Some(members) = split_entity_tag_list(raw) else {
+        return false;
+    };
     if members.is_empty() || members.iter().any(|member| !valid_entity_tag(member)) {
         return false;
     }
     let expected = slider_etag(revision);
     members.iter().any(|member| *member == expected)
+}
+
+fn split_entity_tag_list(raw: &str) -> Option<Vec<&str>> {
+    let bytes = raw.as_bytes();
+    let mut members = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if in_quotes {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_quotes = false;
+            }
+        } else if byte == b'"' {
+            in_quotes = true;
+        } else if byte == b',' {
+            members.push(raw[start..index].trim());
+            start = index + 1;
+        }
+    }
+    if in_quotes || escaped {
+        return None;
+    }
+    members.push(raw[start..].trim());
+    Some(members)
 }
 
 fn valid_entity_tag(value: &str) -> bool {
@@ -341,7 +372,7 @@ mod tests {
 
     #[test]
     fn exact_strong_slider_etag_list_matching() {
-        let current = HeaderValue::from_static("\"old\", \"sliders-14\"");
+        let current = HeaderValue::from_static("\"other,tag\", \"sliders-14\"");
         assert!(matches_slider_etag(Some(&current), 14));
         for raw in [
             "W/\"sliders-14\"",
