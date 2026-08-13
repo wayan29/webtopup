@@ -143,6 +143,28 @@ export function fixtureDefinitions(fixtureRunId: string, now = new Date()): Fixt
         manageProducts: true,
       },
     }),
+    make('site-config-denied', 'site-config-permission-denied', 'cs', {
+      twoFactorEnabled: false,
+      twoFactorEnrollmentRequiredAt: future,
+      permissions: { viewDashboard: true, manageSettings: false, viewProducts: true },
+    }),
+    make('site-config-manager', 'site-config-permission-manager', 'cs', {
+      twoFactorEnabled: true,
+      permissions: {
+        viewDashboard: true,
+        manageSettings: true,
+        manageProducts: true,
+        viewProducts: true,
+      },
+    }),
+    make('site-config-inactive', 'site-config-permission-inactive', 'cs', {
+      active: false,
+      twoFactorEnabled: true,
+      permissions: { viewDashboard: true, manageSettings: true },
+    }),
+    make('identifier-member', 'identifier-integrity-member', 'member', {
+      twoFactorEnabled: false,
+    }),
   ];
 }
 
@@ -207,14 +229,14 @@ async function seedFixtureDefinitions(
     for (const fixture of definitions) {
       const user = new User({
         email: fixture.email, password: passwords[fixture.role], name: `Task 14 ${fixture.alias}`,
-        role: fixture.role, level: 'basic', balance: fixture.scenario === 'finance-idempotency' ? 100_000 : 0,
+        role: fixture.role, level: 'basic', balance: fixture.scenario === 'finance-idempotency' || fixture.scenario === 'identifier-integrity-member' ? 100_000 : 0,
         permissions: {
           ...(fixture.permissions ?? {}),
           ...(fixture.scenario === 'finance-idempotency' ? { manageUsers: true, processManualTransaction: true } : {}),
           ...(fixture.scenario.startsWith('staff-login-return') ? { manageVendors: true } : {}),
         },
         points: 0, twoFactorEnabled: fixture.twoFactorEnabled, twoFactorEnrollmentRequiredAt: fixture.twoFactorEnrollmentRequiredAt,
-        twoFactorSecret: fixture.twoFactorEnabled && (fixture.role === 'admin' || fixture.scenario.startsWith('all-device-logout-') || fixture.scenario.startsWith('staff-step-up-') || fixture.scenario === 'staff-login-return-2fa' || fixture.scenario === 'audit-permission-manager') ? syntheticTotpSecret() : undefined,
+        twoFactorSecret: fixture.twoFactorEnabled && (fixture.role === 'admin' || fixture.scenario.startsWith('all-device-logout-') || fixture.scenario.startsWith('staff-step-up-') || fixture.scenario === 'staff-login-return-2fa' || fixture.scenario === 'audit-permission-manager' || fixture.scenario === 'site-config-permission-manager' || fixture.scenario === 'site-config-permission-inactive') ? syntheticTotpSecret() : undefined,
         twoFactorEnrollmentCompletedAt: fixture.twoFactorEnabled && (fixture.role === 'admin' || fixture.scenario.startsWith('all-device-logout-')) ? new Date() : undefined,
         sessionVersion: 0, active: fixture.active,
       });
