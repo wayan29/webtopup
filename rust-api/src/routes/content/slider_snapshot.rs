@@ -186,24 +186,15 @@ fn split_entity_tag_list(raw: &str) -> Option<Vec<&str>> {
     let mut members = Vec::new();
     let mut start = 0;
     let mut in_quotes = false;
-    let mut escaped = false;
     for (index, byte) in bytes.iter().copied().enumerate() {
-        if in_quotes {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                in_quotes = false;
-            }
-        } else if byte == b'"' {
-            in_quotes = true;
-        } else if byte == b',' {
+        if byte == b'"' {
+            in_quotes = !in_quotes;
+        } else if !in_quotes && byte == b',' {
             members.push(raw[start..index].trim());
             start = index + 1;
         }
     }
-    if in_quotes || escaped {
+    if in_quotes {
         return None;
     }
     members.push(raw[start..].trim());
@@ -374,6 +365,8 @@ mod tests {
     fn exact_strong_slider_etag_list_matching() {
         let current = HeaderValue::from_static("\"other,tag\", \"sliders-14\"");
         assert!(matches_slider_etag(Some(&current), 14));
+        let literal_backslash = HeaderValue::from_static(r#""ends-with\", "sliders-14""#);
+        assert!(matches_slider_etag(Some(&literal_backslash), 14));
         for raw in [
             "W/\"sliders-14\"",
             "*",
