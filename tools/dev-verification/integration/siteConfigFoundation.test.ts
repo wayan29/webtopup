@@ -73,8 +73,15 @@ test('site config foundation enforces permission, revision, step-up, idempotency
     browser = await chromium.launch({
       executablePath: process.env.DEV_VERIFICATION_CHROME_EXECUTABLE || undefined,
       headless: true,
+      args: [
+        '--host-resolver-rules=MAP webtopup.local.test 127.0.0.1',
+        '--ignore-certificate-errors',
+      ],
     });
-    const context = await browser.newContext({ ignoreHTTPSErrors: true });
+    const context = await browser.newContext({
+      ignoreHTTPSErrors: true,
+      baseURL: shared.PUBLIC_ORIGIN,
+    });
     const page = await context.newPage();
     const managerUser = await db.collection('users').findOne(
       { email: manager.email, task14Fixture: true },
