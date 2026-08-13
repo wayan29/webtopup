@@ -99,6 +99,11 @@ pub fn normalize_slider_image(raw: &str) -> Result<String, SliderPolicyError> {
 }
 
 pub fn normalize_slider_link(raw: &str) -> Result<String, SliderPolicyError> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('/') {
+        return normalize_internal_link(trimmed);
+    }
+
     let normalized = trim_nfc(raw);
     if normalized.as_bytes().len() > MAX_SLIDER_LINK_BYTES
         || normalized.chars().any(|character| character == '\0' || character.is_control())
@@ -107,9 +112,6 @@ pub fn normalize_slider_link(raw: &str) -> Result<String, SliderPolicyError> {
     }
     if normalized.is_empty() {
         return Ok(normalized);
-    }
-    if normalized.starts_with('/') {
-        return validate_internal_link(&normalized).then_some(normalized).ok_or(SliderPolicyError::InvalidLink);
     }
 
     let parsed = Url::parse(&normalized).map_err(|_| SliderPolicyError::InvalidLink)?;
@@ -264,33 +266,63 @@ fn is_canonical_cover_path(value: &str) -> bool {
     })
 }
 
-fn validate_internal_link(value: &str) -> bool {
-    if !value.starts_with('/')
-        || value.starts_with("//")
-        || value.contains('\\')
-        || (value.contains('%') && !valid_percent_escapes(value))
+fn normalize_internal_link(raw: &str) -> Result<String, SliderPolicyError> {
+    let (without_fragment, fragment) = match raw.split_once('#') {
+        Some((before, after)) => (before, Some(after)),
+        None => (raw, None),
+    };
+    let (path, query) = match without_fragment.split_once('?') {
+        Some((before, after)) => (before, Some(after)),
+        None => (without_fragment, None),
+    };
+    let normalized_path = path.nfc().collect::<String>();
+    if !validate_internal_link(&normalized_path, query, fragment) {
+        return Err(SliderPolicyError::InvalidLink);
+    }
+
+    let mut normalized = normalized_path;
+    if let Some(query) = query {
+        normalized.push('?');
+        normalized.push_str(query);
+    }
+    if let Some(fragment) = fragment {
+        normalized.push('#');
+        normalized.push_str(fragment);
+    }
+    if normalized.as_bytes().len() > MAX_SLIDER_LINK_BYTES {
+        return Err(SliderPolicyError::InvalidLink);
+    }
+    Ok(normalized)
+}
+
+fn validate_internal_link(path: &str, query: Option<&str>, fragment: Option<&str>) -> bool {
+    if !path.starts_with('/') || path.starts_with("//") || path.contains('\\') {
+        return false;
+    }
+    if path.chars().any(|character| character == '\0' || character.is_control())
+        || query.is_some_and(query_has_unsafe_bytes)
+        || fragment.is_some_and(fragment_has_unsafe_bytes)
     {
         return false;
     }
-    let (without_fragment, fragment) = value.split_once('#').unwrap_or((value, ""));
-    let (path, query) = without_fragment.split_once('?').unwrap_or((without_fragment, ""));
-    if fragment_has_unsafe_bytes(fragment) || fragment.contains('/') {
-        return false;
-    }
-    if query_has_unsafe_bytes(query) {
-        return false;
-    }
-    let segments = path.split('/');
-    if segments.clone().any(|segment| segment == "." || segment == "..") {
-        return false;
-    }
-    if value.to_ascii_lowercase().contains("%2f")
-        || value.to_ascii_lowercase().contains("%5c")
-        || value.to_ascii_lowercase().contains("%2e")
+    if !valid_percent_escapes(path)
+        || query.is_some_and(|value| !valid_percent_escapes(value))
+        || fragment.is_some_and(|value| !valid_percent_escapes(value))
     {
         return false;
     }
-    true
+    if fragment.is_some_and(|value| value.contains('/')) {
+        return false;
+    }
+    if path.split('/').any(|segment| segment == "." || segment == "..") {
+        return false;
+    }
+    ![Some(path), query, fragment].into_iter().flatten().any(|value| {
+        let lowercase = value.to_ascii_lowercase();
+        lowercase.contains("%2f")
+            || lowercase.contains("%5c")
+            || lowercase.contains("%2e")
+    })
 }
 
 fn valid_percent_escapes(value: &str) -> bool {
@@ -397,6 +429,18 @@ mod tests {
         ] {
             assert_eq!(normalize_slider_link(bad).unwrap_err().code(), "SLIDER_LINK_INVALID");
         }
+    }
+
+    #[test]
+    fn internal_links_nfc_normalize_path_but_preserve_query_and_fragment_bytes() {
+        let decomposed = format!("e{}", char::from_u32(0x301).unwrap());
+        let raw = format!(
+            "  /caf{decomposed}?label={decomposed}&label=%20#section-{decomposed}%20  "
+        );
+        let expected = format!(
+            "/café?label={decomposed}&label=%20#section-{decomposed}%20"
+        );
+        assert_eq!(normalize_slider_link(&raw).unwrap(), expected);
     }
 
     #[test]

@@ -34,7 +34,8 @@ pub use sliders::{
 pub use slider_policy::{
     canonical_slider_claim_digest, canonical_slider_claim_input, effective_requires_step_up,
     normalize_create, normalize_slider_image, normalize_slider_link, normalize_slider_name,
-    normalize_update, trim_nfc, SliderAction, SliderPolicyError, MAX_CURRENT_SLIDERS,
+    normalize_update, public_slider_from_document, trim_nfc, SliderAction, SliderPolicyError,
+    MAX_CURRENT_SLIDERS,
     MAX_PUBLIC_SLIDERS, MAX_SLIDER_JSON_BYTES, SLIDER_MUTATION_CONTRACT,
 };
 pub use slider_types::{
