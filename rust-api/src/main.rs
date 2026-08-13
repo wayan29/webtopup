@@ -68,6 +68,13 @@ async fn main() -> anyhow::Result<()> {
         routes::vouchers::ensure_giveaway_indexes(&db)
             .await
             .context("giveaway idempotency indexes failed before listener readiness")?;
+        routes::settings::ensure_site_config_foundation_indexes(&db)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "site config foundation indexes failed before listener readiness: {error:?}"
+                )
+            })?;
     }
     // Build the login timing material before the listener accepts traffic, so the first rejected
     // login does not pay an extra bcrypt hash and stand out from every later attempt.

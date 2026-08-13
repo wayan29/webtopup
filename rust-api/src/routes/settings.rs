@@ -1,11 +1,14 @@
 mod conversion;
 mod defaults;
+mod idempotency;
 mod policy;
 mod responses;
 mod snapshot;
 mod store;
 mod types;
 mod validation;
+
+pub use idempotency::ensure_site_config_foundation_indexes;
 
 use std::sync::Arc;
 

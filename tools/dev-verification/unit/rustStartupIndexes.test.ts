@@ -34,3 +34,17 @@ test('identifier readiness binary is registered and disposable-only', async () =
   assert.match(service, /require_identifier_indexes/u);
   assert.match(service, /SUCCESS_CACHE_TTL/u);
 });
+
+test('Rust startup gates listener readiness on site config foundation indexes', async () => {
+  const source = await fs.readFile(path.join(root, 'rust-api/src/main.rs'), 'utf8');
+  assert.match(source, /routes::settings::ensure_site_config_foundation_indexes\(&db\)/u);
+  const ensureAt = source.indexOf('routes::settings::ensure_site_config_foundation_indexes(&db)');
+  const listenAt = source.indexOf('let listener = tokio::net::TcpListener::bind(addr)');
+  assert.ok(listenAt > ensureAt, 'listener must bind only after site config foundation indexes succeed');
+  const claim = await fs.readFile(path.join(root, 'rust-api/src/routes/settings/idempotency.rs'), 'utf8');
+  assert.match(claim, /uniq_site_config_idempotency_key/u);
+  assert.match(claim, /siteconfigidempotencyclaims/u);
+  assert.doesNotMatch(claim, /cleanupAt/u);
+  assert.match(claim, /expire_after\.is_none\(\)|options\.expire_after/u);
+  assert.doesNotMatch(claim, /expire_after\(Some|\.expire_after\(Duration/u);
+});
