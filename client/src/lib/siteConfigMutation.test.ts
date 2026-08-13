@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   classifySettingsConflict,
   createSiteConfigIntent,
+  createSiteConfigSaveRequest,
   invoiceRandomMin,
   parseAdminSettingsResponse,
   rebaseAfterConflict,
@@ -21,7 +22,22 @@ const fixtureSettings = {
 test('revision metadata never becomes an editable setting', () => {
   const parsed = parseAdminSettingsResponse({ ...fixtureSettings, revision: 14 });
   assert.equal(parsed.revision, 14);
+  assert.equal(parsed.versioned, true);
   assert.equal('revision' in parsed.form, false);
+});
+
+test('legacy admin settings without revision still load as an unversioned snapshot', () => {
+  const parsed = parseAdminSettingsResponse({ ...fixtureSettings });
+  assert.equal(parsed.revision, 0);
+  assert.equal(parsed.versioned, false);
+  assert.equal(parsed.form.brand, 'Danayasa');
+  assert.equal('revision' in parsed.form, false);
+});
+
+test('invalid present revision still fails closed', () => {
+  assert.throws(() => parseAdminSettingsResponse({ ...fixtureSettings, revision: '14' }), /Revisi pengaturan tidak valid/);
+  assert.throws(() => parseAdminSettingsResponse({ ...fixtureSettings, revision: 1.5 }), /Revisi pengaturan tidak valid/);
+  assert.throws(() => parseAdminSettingsResponse({ ...fixtureSettings, revision: -1 }), /Revisi pengaturan tidak valid/);
 });
 
 test('one intent key survives step-up and replay but conflict creates a new intent', () => {
@@ -60,4 +76,20 @@ test('three-way conflict classification', () => {
 test('invoice random minimum depends on type', () => {
   assert.equal(invoiceRandomMin('alphanumeric'), 8);
   assert.equal(invoiceRandomMin('numeric'), 10);
+});
+
+test('versioned saves keep the revision envelope while legacy saves send flat changes', () => {
+  const intent = createSiteConfigIntent(14, { brand: 'Danayasa' }, {
+    randomUUID: () => '33333333-3333-3333-3333-333333333333',
+  });
+  const versioned = createSiteConfigSaveRequest(true, intent);
+  assert.deepEqual(versioned.body, {
+    expectedRevision: 14,
+    changes: { brand: 'Danayasa' },
+  });
+  assert.equal(versioned.headers['Idempotency-Key'], intent.key);
+  const legacy = createSiteConfigSaveRequest(false, intent);
+  assert.deepEqual(legacy.body, { brand: 'Danayasa' });
+  assert.equal('expectedRevision' in legacy.body, false);
+  assert.equal('changes' in legacy.body, false);
 });

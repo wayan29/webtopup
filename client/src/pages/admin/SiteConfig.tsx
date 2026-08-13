@@ -5,6 +5,7 @@ import { useStepUpOrchestration } from '../../auth/useStepUpOrchestration';
 import {
     createChangedPayload,
     createSiteConfigIntent,
+    createSiteConfigSaveRequest,
     parseAdminSettingsResponse,
     parseVersionConflict,
     siteConfigErrorMessage,
@@ -120,6 +121,7 @@ export default function SiteConfig() {
     const [form, setForm] = useState<SettingsForm>(defaultForm);
     const [lastSavedForm, setLastSavedForm] = useState<SettingsForm>(defaultForm);
     const [revision, setRevision] = useState(0);
+    const [versioned, setVersioned] = useState(false);
     const [pendingIntent, setPendingIntent] = useState<SiteConfigIntent | null>(null);
     const [conflict, setConflict] = useState<{ currentRevision: number; currentSettings: SettingsForm } | null>(null);
     const stepUp = useStepUpOrchestration();
@@ -152,6 +154,7 @@ export default function SiteConfig() {
             setForm(nextForm);
             setLastSavedForm(nextForm);
             setRevision(parsed.revision);
+            setVersioned(parsed.versioned);
         } catch (error: any) {
             if (requestId !== latestRequestId.current) return;
             console.error('Failed to load settings', error);
@@ -274,16 +277,14 @@ export default function SiteConfig() {
                 ? pendingIntent
                 : createSiteConfigIntent(revision, changes);
             setPendingIntent(intent);
+            const request = createSiteConfigSaveRequest(versioned, intent);
             const res = await stepUp.run(
                 'settings.sensitive',
-                (config) => apiV2.put('/settings/admin/update', {
-                    expectedRevision: intent.expectedRevision,
-                    changes: intent.changes,
-                }, {
+                (config) => apiV2.put('/settings/admin/update', request.body, {
                     ...config,
                     headers: {
                         ...(config?.headers || {}),
-                        'Idempotency-Key': intent.key,
+                        ...request.headers,
                     },
                 }),
             );

@@ -11,18 +11,39 @@ export type ConflictKind = 'server-only' | 'draft-only' | 'conflict';
 export function parseAdminSettingsResponse(input: unknown): {
   form: SettingsFormLike;
   revision: number;
+  versioned: boolean;
 } {
   if (!input || typeof input !== 'object' || Array.isArray(input)) {
     throw new Error('Respons pengaturan tidak valid');
   }
   const record = input as Record<string, unknown>;
   const revisionRaw = record.revision;
+  const form: SettingsFormLike = { ...record };
+  delete form.revision;
+  if (revisionRaw === undefined) {
+    return { form, revision: 0, versioned: false };
+  }
   if (typeof revisionRaw !== 'number' || !Number.isInteger(revisionRaw) || revisionRaw < 0) {
     throw new Error('Revisi pengaturan tidak valid');
   }
-  const form: SettingsFormLike = { ...record };
-  delete form.revision;
-  return { form, revision: revisionRaw };
+  return { form, revision: revisionRaw, versioned: true };
+}
+
+export function createSiteConfigSaveRequest(
+  versioned: boolean,
+  intent: SiteConfigIntent,
+): { body: Record<string, unknown>; headers: Record<string, string> } {
+  const headers = { 'Idempotency-Key': intent.key };
+  if (versioned) {
+    return {
+      body: {
+        expectedRevision: intent.expectedRevision,
+        changes: intent.changes,
+      },
+      headers,
+    };
+  }
+  return { body: { ...intent.changes }, headers };
 }
 
 export function createChangedPayload(
