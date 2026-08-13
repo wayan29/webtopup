@@ -14,6 +14,8 @@ mod flash_admin;
 mod flash_mappers;
 mod flash_payload;
 mod flash_public;
+mod slider_policy;
+mod slider_types;
 mod sliders;
 mod types;
 mod utils;
@@ -28,6 +30,16 @@ pub use flash_public::{flash_sale_price, flash_sales_active};
 pub use sliders::{
     slider_create, slider_delete, slider_update, sliders_admin_all, sliders_public,
     sliders_update_sort_order,
+};
+pub use slider_policy::{
+    canonical_slider_claim_digest, canonical_slider_claim_input, effective_requires_step_up,
+    normalize_create, normalize_slider_image, normalize_slider_link, normalize_slider_name,
+    normalize_update, trim_nfc, SliderAction, SliderPolicyError, MAX_CURRENT_SLIDERS,
+    MAX_PUBLIC_SLIDERS, MAX_SLIDER_JSON_BYTES, SLIDER_MUTATION_CONTRACT,
+};
+pub use slider_types::{
+    NormalizedSliderChanges, PublicSliderItem, SliderCreateFields, SliderCreateRequest,
+    SliderSnapshotItem, SliderUpdateChanges, SliderUpdateRequest,
 };
 use types::*;
 use utils::*;

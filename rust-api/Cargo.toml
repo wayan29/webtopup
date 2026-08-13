@@ -27,6 +27,7 @@ axum = { version = "0.8", features = ["multipart"] }
 bcrypt = "0.16"
 chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
 url = "2.5.4"
+unicode-normalization = "=0.1.24"
 dotenvy = "0.15"
 futures-util = "0.3"
 jsonwebtoken = "9.3"
