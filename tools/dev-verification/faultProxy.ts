@@ -17,7 +17,8 @@ export async function startFaultProxy(options: FaultProxyOptions): Promise<http.
   const barrierQueue: Array<{ activationId: string; request: IncomingMessage; response: ServerResponse; timeout: ReturnType<typeof setTimeout> }> = [];
   const faultTimers = new Set<ReturnType<typeof setTimeout>>();
   let barrierReleasing = false;
-  const lossScenario = (request: IncomingMessage): 'refresh_response_loss_after_commit' | 'finance_balance_response_loss_after_commit' | 'finance_refund_response_loss_after_commit' | null => {
+  const lossScenario = (request: IncomingMessage): 'refresh_response_loss_after_commit' | 'finance_balance_response_loss_after_commit' | 'finance_refund_response_loss_after_commit' | 'site_config_response_loss_after_commit' | null => {
+    if (request.method === 'PUT' && (request.url ?? '').split('?')[0] === '/v2/settings/admin/update') return 'site_config_response_loss_after_commit';
     if (request.method !== 'POST') return null;
     if (request.url === '/v2/auth/refresh') return 'refresh_response_loss_after_commit';
     if (/^\/v2\/users\/[a-f0-9]{24}\/balance$/u.test(request.url ?? '')) return 'finance_balance_response_loss_after_commit';
@@ -92,7 +93,7 @@ export async function startFaultProxy(options: FaultProxyOptions): Promise<http.
     const refreshTarget = request.method === 'POST' && request.url === '/v2/auth/refresh';
     const lossTarget = lossScenario(request) !== null;
     const active = lossTarget ? await activeFault(options.stateDir) : null;
-    if (refreshTarget && active && !['refresh_response_loss_after_commit', 'finance_balance_response_loss_after_commit', 'finance_refund_response_loss_after_commit', 'refresh_two_request_barrier'].includes(active.scenario)) {
+    if (refreshTarget && active && !['refresh_response_loss_after_commit', 'finance_balance_response_loss_after_commit', 'finance_refund_response_loss_after_commit', 'site_config_response_loss_after_commit', 'refresh_two_request_barrier'].includes(active.scenario)) {
       let activationId: string | null = null;
       try { activationId = await consumeFault(options.stateDir, active.scenario, active.activationId); } catch { /* bounded failure below */ }
       if (!activationId) { response.writeHead(503, { 'content-length': '0' }); response.end(); return; }

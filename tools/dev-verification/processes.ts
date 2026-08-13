@@ -114,6 +114,60 @@ async function assertDevicePolicyDatabase(config: VerificationConfig): Promise<v
   } finally { await client.close(); }
 }
 
+export function identifierReadinessApplyPlan(input: {
+  root: string;
+  stateDir: string;
+  databaseName: string;
+  mongoUri: string;
+  executable: string;
+}): { command: string; args: string[]; cwd: string; envKeys: ['MONGO_URI', 'MONGO_DB'] } {
+  if (input.databaseName !== REQUIRED_DB) throw new Error(`database must be ${REQUIRED_DB}`);
+  const expected = path.join(input.root, 'rust-api', 'target', 'debug', 'site_config_identifier_readiness');
+  if (path.resolve(input.executable) !== path.resolve(expected)) throw new Error('expected target binary');
+  return {
+    command: expected,
+    args: ['--apply'],
+    cwd: path.join(input.root, 'rust-api'),
+    envKeys: ['MONGO_URI', 'MONGO_DB'],
+  };
+}
+
+export async function prepareDisposableIdentifierIndexes(config: VerificationConfig): Promise<void> {
+  const { assertMarkedVerificationDatabaseReady } = await import('./databaseWorkflow.ts');
+  await assertMarkedVerificationDatabaseReady(config);
+  const executable = path.join(config.root, 'rust-api', 'target', 'debug', 'site_config_identifier_readiness');
+  const plan = identifierReadinessApplyPlan({
+    root: config.root,
+    stateDir: config.stateDir,
+    databaseName: config.databaseName,
+    mongoUri: config.mongoUri,
+    executable,
+  });
+  await fs.access(plan.command);
+  const shared = await readEnvFile(path.join(config.stateDir, 'env', 'shared.env'));
+  if (shared.MONGO_DB !== REQUIRED_DB) throw new Error(`database must be ${REQUIRED_DB}`);
+  const child = spawn(plan.command, plan.args, {
+    cwd: plan.cwd,
+    env: {
+      PATH: process.env.PATH ?? '',
+      HOME: process.env.HOME ?? '',
+      MONGO_URI: shared.MONGO_URI,
+      MONGO_DB: shared.MONGO_DB,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const stderr: Buffer[] = [];
+  child.stderr?.on('data', (chunk) => { stderr.push(Buffer.from(chunk)); });
+  const code = await new Promise<number | null>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', (status) => resolve(status));
+  });
+  if (code !== 0) {
+    const detail = Buffer.concat(stderr).toString('utf8').replaceAll(shared.MONGO_URI ?? '', '[redacted]').slice(0, 400);
+    throw new Error(`identifier index apply failed (${code ?? 'null'}): ${detail}`);
+  }
+}
+
 export function hostProcessCommands(root: string, ports: VerificationPorts): Record<'rust' | 'node' | 'vite', HostCommand> {
   return {
     rust: { command: path.join(root, 'rust-api', 'target', 'debug', 'webtopup-rust-api'), args: [], cwd: path.join(root, 'rust-api') },
@@ -200,6 +254,7 @@ export async function startHostProcesses(config: VerificationConfig, profile: Pr
   try { await fs.access(manifestPath); throw new Error('host processes already have an ownership manifest; run down or inspect status'); } catch (error) {
     if (error instanceof Error && error.message.includes('ownership manifest')) throw error;
   }
+  await prepareDisposableIdentifierIndexes(config);
   const commands = hostProcessCommands(config.root, config.ports);
   for (const item of Object.values(commands)) await fs.access(item.command);
   const faultCommand: HostCommand = { command: process.execPath, args: ['--import', 'tsx', path.join(config.root, 'tools', 'dev-verification', 'faultProxy.ts')], cwd: config.root };
@@ -223,7 +278,7 @@ export async function startHostProcesses(config: VerificationConfig, profile: Pr
       API_V2_HOST: '127.0.0.1',
       API_V2_PORT: String(config.ports.rust),
       API_V2_ALLOWED_ORIGIN: config.publicOrigin,
-      ...(profile === 'session-finance-fault' ? {
+      ...((profile === 'session-finance-fault' || profile === 'session-cs-fault') ? {
         LOCAL_DESTRUCTIVE_CAPABILITY: nodeSecrets.LOCAL_DESTRUCTIVE_CAPABILITY,
         DEV_VERIFICATION_STATE_DIR: config.stateDir,
       } : {}),

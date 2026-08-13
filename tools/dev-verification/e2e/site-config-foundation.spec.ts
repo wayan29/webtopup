@@ -1,5 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 import { MongoClient } from 'mongodb';
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fixtureOtp, loginFixture } from './fixtures.ts';
@@ -13,13 +14,14 @@ const envFile = async (file: string): Promise<Record<string, string>> => Object.
   }),
 );
 
-async function staffLogin(page: Page, fixture: Awaited<ReturnType<typeof loginFixture>>, otp: string) {
+async function staffLogin(page: Page, fixture: Awaited<ReturnType<typeof loginFixture>>) {
   await page.goto(fixture.loginPath);
   await expect(page.getByLabel('Email')).toBeVisible();
   await page.getByLabel('Email').fill(fixture.email);
   await page.getByLabel('Password').fill(fixture.password);
   await page.getByRole('button', { name: 'Masuk sekarang' }).click();
   await expect(page.getByLabel('Kode OTP')).toBeVisible({ timeout: 20_000 });
+  const otp = await fixtureOtp('site-config-manager');
   await page.getByLabel('Kode OTP').fill(otp);
   await page.getByRole('button', { name: 'Verifikasi & masuk' }).click();
   await expect(page).toHaveURL(/\/admin\/dashboard$/, { timeout: 20_000 });
@@ -37,6 +39,9 @@ test('site config foundation save flow is versioned and step-up aware', async ({
   let primary: unknown = null;
   let originalBrand = '';
   let originalRevision = 0;
+  let originalMaintenance = false;
+  let originalRegistration = true;
+  let originalGuestCheckout = true;
 
   try {
     await mongo.connect();
@@ -53,15 +58,11 @@ test('site config foundation save flow is versioned and step-up aware', async ({
     expect(user).toBeTruthy();
     await db.collection('authsessions').deleteMany({ userId: user!._id });
 
-    const otp = await fixtureOtp('site-config-manager');
-    await staffLogin(page, fixture, otp);
+    await staffLogin(page, fixture);
     await page.goto('/admin/site-config');
     await expect(page.getByText('Brand', { exact: false }).first()).toBeVisible({ timeout: 30_000 });
-
-    // No editable revision control.
     await expect(page.locator('input[name="revision"], input[id="revision"]')).toHaveCount(0);
 
-    // Capture original brand via API in-page.
     const initial = await page.evaluate(async () => {
       const api = (await import('/src/api/index.ts')).apiV2 as any;
       const response = await api.get('/settings/admin/all', { _skipAuthRefresh: true });
@@ -69,63 +70,91 @@ test('site config foundation save flow is versioned and step-up aware', async ({
     });
     originalBrand = String(initial.brand || '');
     originalRevision = Number(initial.revision || 0);
+    originalMaintenance = Boolean(initial.maintenanceMode);
+    originalRegistration = initial.registrationEnabled !== false;
+    originalGuestCheckout = initial.guestCheckoutEnabled !== false;
     expect(Number.isInteger(originalRevision)).toBeTruthy();
 
-    // Non-sensitive save: one PUT, no step-up dialog.
-    const brandInput = page.locator('input').filter({ has: page.locator('xpath=ancestor::div[label[contains(., "Brand")]]') }).first()
-      .or(page.getByLabel('Brand'));
-    // Fallback: find by nearby label text.
     const brandField = page.locator('label:has-text("Brand")').locator('..').locator('input').first();
     await expect(brandField).toBeVisible({ timeout: 15_000 });
-    const nextBrand = `${originalBrand} ${testInfo.project.name}`.slice(0, 80);
+    const nextBrand = `Danayasa ${testInfo.project.name} ${Date.now().toString().slice(-6)}`.slice(0, 80);
     await brandField.fill(nextBrand);
 
     const putStatuses: number[] = [];
-    page.on('response', async (response) => {
+    const putKeys = new Set<string>();
+    page.on('response', (response) => {
       if (response.request().method() === 'PUT' && response.url().includes('/settings/admin/update')) {
         putStatuses.push(response.status());
       }
     });
+    page.on('request', (request) => {
+      if (request.method() === 'PUT' && request.url().includes('/settings/admin/update')) {
+        putKeys.add(String(request.headers()['idempotency-key'] || ''));
+      }
+    });
+    await page.getByRole('button', { name: 'Simpan' }).click();
+    await expect.poll(() => putStatuses.length, { timeout: 20_000 }).toBe(1);
+    expect(putStatuses[0]).toBe(200);
+    await expect(page.getByText(/berhasil disimpan/i).first()).toBeVisible({ timeout: 20_000 });
+    await expect(page.getByRole('heading', { name: 'Verifikasi ulang diperlukan' })).toHaveCount(0);
+    expect([...putKeys].filter(Boolean)).toHaveLength(1);
 
-    await page.getByRole('button', { name: /Simpan|Save/i }).first().click();
-    await expect.poll(() => putStatuses.length, { timeout: 20_000 }).toBeGreaterThan(0);
-    await expect(page.getByText(/berhasil disimpan|Tidak ada perubahan/i).first()).toBeVisible({ timeout: 20_000 });
-    expect(putStatuses.every((status) => status === 200 || status === 403)).toBeTruthy();
+    const afterSave = await page.evaluate(async () => {
+      const api = (await import('/src/api/index.ts')).apiV2 as any;
+      return (await api.get('/settings/admin/all', { _skipAuthRefresh: true })).data;
+    });
+    expect(Number(afterSave.revision)).toBe(originalRevision + 1);
+    expect(String(afterSave.brand)).toBe(nextBrand);
 
-    // Sensitive path: enable maintenance and expect step-up dialog or AUTH_STEP_UP_REQUIRED flow.
-    await page.getByRole('button', { name: /Sistem|System/i }).first().click().catch(() => undefined);
-    const maintenanceToggle = page.getByText(/Mode maintenance|maintenance/i).first();
-    if (await maintenanceToggle.isVisible().catch(() => false)) {
-      // Best-effort: open system tab already.
-    }
+    await page.getByRole('button', { name: 'Pengaturan Sistem' }).click();
+    await expect(page.locator('#guestCheckoutEnabled')).toBeVisible({ timeout: 10_000 });
+    await page.locator('#guestCheckoutEnabled').uncheck({ force: true });
+    await page.getByRole('button', { name: 'Simpan' }).click();
+    await expect(page.getByRole('heading', { name: 'Konfirmasi perubahan sensitif' })).toBeVisible({ timeout: 10_000 });
+    await page.getByRole('button', { name: 'Simpan perubahan' }).click();
+    await expect(page.getByRole('heading', { name: 'Verifikasi ulang diperlukan' })).toBeVisible({ timeout: 20_000 });
+    const stepOtp = await fixtureOtp('site-config-manager');
+    await page.getByLabel('Password', { exact: true }).fill(fixture.password);
+    await page.getByLabel('Kode OTP').fill(stepOtp);
+    await page.getByRole('button', { name: 'Lanjutkan' }).click();
+    await expect(page.getByText(/berhasil disimpan/i).first()).toBeVisible({ timeout: 20_000 });
 
-    // Ref ID tab should not offer NONE for Ref ID date format.
-    await page.getByRole('button', { name: /Ref ID/i }).first().click().catch(() => undefined);
-    const refIdSelect = page.locator('label:has-text("Format Tanggal")').locator('..').locator('select').first();
-    if (await refIdSelect.isVisible().catch(() => false)) {
-      const options = await refIdSelect.locator('option').allTextContents();
-      // First date format select in Ref ID section should not include Tanpa Tanggal.
-      // Invoice section later may still include it.
-      expect(options.join(' ')).not.toMatch(/Tanpa Tanggal/i);
-    }
+    await page.getByRole('button', { name: 'Ref ID & Invoice' }).click();
+    await expect(page.getByText('Format Ref ID', { exact: false }).first()).toBeVisible({ timeout: 10_000 });
+    const refIdSelect = page.locator('h3:has-text("Format Ref ID")').locator('xpath=ancestor::div[contains(@class,"rounded-lg")]').locator('label:has-text("Format Tanggal")').locator('..').locator('select').first();
+    await expect(refIdSelect).toBeVisible({ timeout: 10_000 });
+    await expect(refIdSelect.locator('option', { hasText: 'Tanpa Tanggal' })).toHaveCount(0);
+    const invoiceSelect = page.locator('h3:has-text("Format Invoice")').locator('xpath=ancestor::div[contains(@class,"rounded-lg")]').locator('label:has-text("Format Tanggal")').locator('..').locator('select').first();
+    await expect(invoiceSelect.locator('option', { hasText: 'Tanpa Tanggal' })).toHaveCount(1);
+    await expect(page.locator('label:has-text("Panjang Random")').locator('..').locator('input')).toHaveAttribute('min', /8|10/);
+
+    await page.getByRole('button', { name: 'Web Config' }).click();
+    await page.getByRole('button', { name: /Pilih Gambar|Ganti Gambar/ }).first().click();
+    await expect(page.getByText(/JPEG, PNG, atau WebP/i).first()).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Tinjau ulang draft' })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Muat versi terbaru' })).toHaveCount(0);
   } catch (error) {
     primary = error;
   } finally {
-    // Restore brand if changed.
     try {
-      await page.evaluate(async ({ brand }) => {
+      await page.evaluate(async ({ brand, registrationEnabled, maintenanceMode, guestCheckoutEnabled }) => {
         const api = (await import('/src/api/index.ts')).apiV2 as any;
         const current = (await api.get('/settings/admin/all', { _skipAuthRefresh: true })).data;
         await api.put('/settings/admin/update', {
           expectedRevision: current.revision,
-          changes: { brand },
+          changes: { brand, registrationEnabled, maintenanceMode, guestCheckoutEnabled },
         }, {
           headers: { 'Idempotency-Key': `sitecfg_pw_${crypto.randomUUID().replace(/-/g, '').slice(0, 20)}` },
           _skipAuthRefresh: true,
         });
-      }, { brand: originalBrand || 'Danayasa' });
+      }, {
+        brand: originalBrand || 'Danayasa',
+        registrationEnabled: originalRegistration,
+        maintenanceMode: originalMaintenance,
+        guestCheckoutEnabled: originalGuestCheckout,
+      });
     } catch {
-      // ignore
+      // ignore restore failures
     }
     await mongo.close().catch(() => undefined);
   }

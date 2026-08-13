@@ -20,7 +20,7 @@ use crate::{
     services::{
         identifier_integrity::{
             allocate_reference_in_session, load_reference_format, require_identifier_indexes,
-            ReferenceError,
+            MAX_REFERENCE_ALLOCATION_ATTEMPTS, ReferenceError,
         },
         idempotency::{
             self, commit_mongo_transaction_with_unknown_retry, effect_marker_matches_identity,
@@ -321,90 +321,114 @@ pub async fn create_transaction(
     }
 
     let format = load_reference_format(&db).await;
-    let transaction_id = ObjectId::new();
     let now = DateTime::now();
     let product_id = product
         .get_object_id("_id")
         .unwrap_or_else(|_| ObjectId::new());
-
-    let mut session = match client.start_session().await {
-        Ok(session) => session,
-        Err(_) => {
-            compensate().await;
-            return internal_error();
-        }
-    };
-    if session.start_transaction().await.is_err() {
-        compensate().await;
-        return identifier_transactions_unavailable();
-    }
-
-    let allocated = match allocate_reference_in_session(&db, &mut session, &format).await {
-        Ok(value) => value,
-        Err(ReferenceError::SequenceExhausted) => {
-            let _ = session.abort_transaction().await;
-            compensate().await;
-            return ref_id_sequence_exhausted();
-        }
-        Err(_) => {
-            let _ = session.abort_transaction().await;
-            compensate().await;
-            return internal_error();
-        }
-    };
-    let ref_id = allocated.reference_id.clone();
-
-    let mut transaction_doc = doc! {
-        "_id": transaction_id,
-        "user": user_id,
-        "product": product_id,
-        "target": &target,
-        "amount": price,
-        "status": "pending",
-        "referenceId": &ref_id,
-        "refunded": false,
-        "source": "web",
-        "createdAt": now,
-        "updatedAt": now,
-        "__v": 0,
-    };
-    if !server_id.is_empty() {
-        transaction_doc.insert("serverId", server_id.clone());
-    }
-    if let Some(applied) = applied_discount.as_ref() {
-        transaction_doc.insert("discountVoucherCode", &applied.code);
-        transaction_doc.insert("discountAmount", applied.discount_amount);
-        transaction_doc.insert("baseAmount", base_price);
-    }
-
-    if transactions
-        .insert_one(transaction_doc)
-        .session(&mut session)
-        .await
-        .is_err()
-    {
-        let _ = session.abort_transaction().await;
-        compensate().await;
-        return internal_error();
-    }
-
-    match commit_mongo_transaction_with_unknown_retry(&mut session).await {
-        TransactionCommitOutcome::Committed => {}
-        TransactionCommitOutcome::FailedDefinitely => {
-            compensate().await;
-            return internal_error();
-        }
-        TransactionCommitOutcome::Ambiguous => {
-            let found = transactions
-                .find_one(doc! { "_id": transaction_id, "referenceId": &ref_id })
-                .await
-                .ok()
-                .flatten();
-            if found.is_none() {
+    let mut transaction_id = ObjectId::new();
+    let mut ref_id = String::new();
+    let mut allocated_ok = false;
+    for attempt in 0..MAX_REFERENCE_ALLOCATION_ATTEMPTS {
+        transaction_id = ObjectId::new();
+        let mut session = match client.start_session().await {
+            Ok(session) => session,
+            Err(_) => {
                 compensate().await;
-                return transaction_reference_commit_unknown();
+                return internal_error();
+            }
+        };
+        if session.start_transaction().await.is_err() {
+            compensate().await;
+            return identifier_transactions_unavailable();
+        }
+
+        let allocated = match allocate_reference_in_session(&db, &mut session, &format).await {
+            Ok(value) => value,
+            Err(ReferenceError::SequenceExhausted) => {
+                let _ = session.abort_transaction().await;
+                compensate().await;
+                return ref_id_sequence_exhausted();
+            }
+            Err(ReferenceError::TransientConflict) if attempt + 1 < MAX_REFERENCE_ALLOCATION_ATTEMPTS => {
+                let _ = session.abort_transaction().await;
+                continue;
+            }
+            Err(_) => {
+                let _ = session.abort_transaction().await;
+                compensate().await;
+                return internal_error();
+            }
+        };
+        ref_id = allocated.reference_id.clone();
+
+        let mut transaction_doc = doc! {
+            "_id": transaction_id,
+            "user": user_id,
+            "product": product_id,
+            "target": &target,
+            "amount": price,
+            "status": "pending",
+            "referenceId": &ref_id,
+            "refunded": false,
+            "source": "web",
+            "createdAt": now,
+            "updatedAt": now,
+            "__v": 0,
+        };
+        if !server_id.is_empty() {
+            transaction_doc.insert("serverId", server_id.clone());
+        }
+        if let Some(applied) = applied_discount.as_ref() {
+            transaction_doc.insert("discountVoucherCode", &applied.code);
+            transaction_doc.insert("discountAmount", applied.discount_amount);
+            transaction_doc.insert("baseAmount", base_price);
+        }
+
+        if let Err(error) = transactions
+            .insert_one(transaction_doc)
+            .session(&mut session)
+            .await
+        {
+            let _ = session.abort_transaction().await;
+            if crate::services::identifier_integrity::is_transient_identifier_write_conflict(&error)
+                && attempt + 1 < MAX_REFERENCE_ALLOCATION_ATTEMPTS
+            {
+                continue;
+            }
+            compensate().await;
+            return internal_error();
+        }
+
+        match commit_mongo_transaction_with_unknown_retry(&mut session).await {
+            TransactionCommitOutcome::Committed => {
+                allocated_ok = true;
+                break;
+            }
+            TransactionCommitOutcome::FailedDefinitely if attempt + 1 < MAX_REFERENCE_ALLOCATION_ATTEMPTS => {
+                continue;
+            }
+            TransactionCommitOutcome::FailedDefinitely => {
+                compensate().await;
+                return internal_error();
+            }
+            TransactionCommitOutcome::Ambiguous => {
+                let found = transactions
+                    .find_one(doc! { "_id": transaction_id, "referenceId": &ref_id })
+                    .await
+                    .ok()
+                    .flatten();
+                if found.is_none() {
+                    compensate().await;
+                    return transaction_reference_commit_unknown();
+                }
+                allocated_ok = true;
+                break;
             }
         }
+    }
+    if !allocated_ok {
+        compensate().await;
+        return internal_error();
     }
 
     if let Some(validation_config) = product_validation_config(&product) {

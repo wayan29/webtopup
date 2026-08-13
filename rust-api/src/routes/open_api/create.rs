@@ -18,7 +18,8 @@ use crate::{
     security::require_proxy_context,
     services::{
         identifier_integrity::{
-            allocate_reference_in_session, load_reference_format, require_identifier_indexes,
+            allocate_reference_in_session, is_transient_identifier_write_conflict,
+            load_reference_format, require_identifier_indexes, MAX_REFERENCE_ALLOCATION_ATTEMPTS,
             ReferenceError,
         },
         idempotency::{commit_mongo_transaction_with_unknown_retry, TransactionCommitOutcome},
@@ -185,101 +186,124 @@ pub async fn create_transaction(
     let product_id = product
         .get_object_id("_id")
         .unwrap_or_else(|_| ObjectId::new());
-    let transaction_id = ObjectId::new();
     let now = DateTime::now();
-
-    let mut session = match client.start_session().await {
-        Ok(session) => session,
-        Err(_) => {
+    let mut transaction_id = ObjectId::new();
+    let mut internal_ref_id = String::new();
+    let mut allocated_ok = false;
+    for attempt in 0..MAX_REFERENCE_ALLOCATION_ATTEMPTS {
+        transaction_id = ObjectId::new();
+        let mut session = match client.start_session().await {
+            Ok(session) => session,
+            Err(_) => {
+                rollback_balance(&users, user_id, price).await;
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+            }
+        };
+        if session.start_transaction().await.is_err() {
             rollback_balance(&users, user_id, price).await;
-            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+            return api_identifier_unavailable("IDENTIFIER_TRANSACTIONS_UNAVAILABLE");
         }
-    };
-    if session.start_transaction().await.is_err() {
-        rollback_balance(&users, user_id, price).await;
-        return api_identifier_unavailable("IDENTIFIER_TRANSACTIONS_UNAVAILABLE");
-    }
 
-    let allocated = match allocate_reference_in_session(&db, &mut session, &format).await {
-        Ok(value) => value,
-        Err(ReferenceError::SequenceExhausted) => {
-            let _ = session.abort_transaction().await;
-            rollback_balance(&users, user_id, price).await;
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "success": false,
-                    "message": "Ref ID sequence exhausted",
-                    "error": { "code": "REF_ID_SEQUENCE_EXHAUSTED" }
-                })),
-            )
-                .into_response();
-        }
-        Err(_) => {
-            let _ = session.abort_transaction().await;
-            rollback_balance(&users, user_id, price).await;
-            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
-        }
-    };
-    let internal_ref_id = allocated.reference_id.clone();
-
-    let mut transaction_doc = doc! {
-        "_id": transaction_id,
-        "user": user_id,
-        "product": product_id,
-        "target": &target,
-        "amount": price,
-        "status": "pending",
-        "referenceId": &internal_ref_id,
-        "refunded": false,
-        "source": "api",
-        "createdAt": now,
-        "updatedAt": now,
-        "__v": 0_i64,
-    };
-    if let Some(ref_id) = customer_ref_id.as_deref() {
-        transaction_doc.insert("customerRefId", ref_id);
-    }
-    if !server_id.is_empty() {
-        transaction_doc.insert("serverId", server_id.clone());
-    }
-
-    if transactions
-        .insert_one(transaction_doc)
-        .session(&mut session)
-        .await
-        .is_err()
-    {
-        let _ = session.abort_transaction().await;
-        rollback_balance(&users, user_id, price).await;
-        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
-    }
-
-    match commit_mongo_transaction_with_unknown_retry(&mut session).await {
-        TransactionCommitOutcome::Committed => {}
-        TransactionCommitOutcome::FailedDefinitely => {
-            rollback_balance(&users, user_id, price).await;
-            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
-        }
-        TransactionCommitOutcome::Ambiguous => {
-            let found = transactions
-                .find_one(doc! { "_id": transaction_id, "referenceId": &internal_ref_id })
-                .await
-                .ok()
-                .flatten();
-            if found.is_none() {
-                // Do not compensate an unproven commit.
+        let allocated = match allocate_reference_in_session(&db, &mut session, &format).await {
+            Ok(value) => value,
+            Err(ReferenceError::SequenceExhausted) => {
+                let _ = session.abort_transaction().await;
+                rollback_balance(&users, user_id, price).await;
                 return (
-                    StatusCode::SERVICE_UNAVAILABLE,
+                    StatusCode::CONFLICT,
                     Json(serde_json::json!({
                         "success": false,
-                        "message": "Transaction reference commit is unknown",
-                        "error": { "code": "TRANSACTION_REFERENCE_COMMIT_UNKNOWN" }
+                        "message": "Ref ID sequence exhausted",
+                        "error": { "code": "REF_ID_SEQUENCE_EXHAUSTED" }
                     })),
                 )
                     .into_response();
             }
+            Err(ReferenceError::TransientConflict) if attempt + 1 < MAX_REFERENCE_ALLOCATION_ATTEMPTS => {
+                let _ = session.abort_transaction().await;
+                continue;
+            }
+            Err(_) => {
+                let _ = session.abort_transaction().await;
+                rollback_balance(&users, user_id, price).await;
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+            }
+        };
+        internal_ref_id = allocated.reference_id.clone();
+
+        let mut transaction_doc = doc! {
+            "_id": transaction_id,
+            "user": user_id,
+            "product": product_id,
+            "target": &target,
+            "amount": price,
+            "status": "pending",
+            "referenceId": &internal_ref_id,
+            "refunded": false,
+            "source": "api",
+            "createdAt": now,
+            "updatedAt": now,
+            "__v": 0_i64,
+        };
+        if let Some(ref_id) = customer_ref_id.as_deref() {
+            transaction_doc.insert("customerRefId", ref_id);
         }
+        if !server_id.is_empty() {
+            transaction_doc.insert("serverId", server_id.clone());
+        }
+
+        if let Err(error) = transactions
+            .insert_one(transaction_doc)
+            .session(&mut session)
+            .await
+        {
+            let _ = session.abort_transaction().await;
+            if is_transient_identifier_write_conflict(&error)
+                && attempt + 1 < MAX_REFERENCE_ALLOCATION_ATTEMPTS
+            {
+                continue;
+            }
+            rollback_balance(&users, user_id, price).await;
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+        }
+
+        match commit_mongo_transaction_with_unknown_retry(&mut session).await {
+            TransactionCommitOutcome::Committed => {
+                allocated_ok = true;
+                break;
+            }
+            TransactionCommitOutcome::FailedDefinitely if attempt + 1 < MAX_REFERENCE_ALLOCATION_ATTEMPTS => {
+                continue;
+            }
+            TransactionCommitOutcome::FailedDefinitely => {
+                rollback_balance(&users, user_id, price).await;
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
+            }
+            TransactionCommitOutcome::Ambiguous => {
+                let found = transactions
+                    .find_one(doc! { "_id": transaction_id, "referenceId": &internal_ref_id })
+                    .await
+                    .ok()
+                    .flatten();
+                if found.is_none() {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({
+                            "success": false,
+                            "message": "Transaction reference commit is unknown",
+                            "error": { "code": "TRANSACTION_REFERENCE_COMMIT_UNKNOWN" }
+                        })),
+                    )
+                        .into_response();
+                }
+                allocated_ok = true;
+                break;
+            }
+        }
+    }
+    if !allocated_ok {
+        rollback_balance(&users, user_id, price).await;
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     }
 
     if let Some(validation_config) = product_validation_config(&product) {

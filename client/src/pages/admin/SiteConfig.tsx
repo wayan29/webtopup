@@ -1048,6 +1048,7 @@ export default function SiteConfig() {
                 </div>
             </div>
 
+            {stepUp.dialog}
             {pendingConfirmMessage && (
                 <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm">
                     <div className="ui-panel ui-border w-full max-w-xl rounded-3xl border p-6 shadow-2xl" role="dialog" aria-modal="true" aria-labelledby="site-config-confirm-title">

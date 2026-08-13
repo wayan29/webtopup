@@ -80,6 +80,9 @@ pub async fn execute_site_config_mutation(
     let db_name = state.mongo_db.clone();
     let db = client.database(&db_name);
 
+    if crate::services::local_fault::consume_site_config_probe_fault().await {
+        return settings_transactions_unavailable();
+    }
     if let Err(response) = probe_site_config_transactions(client, &db_name).await {
         return response;
     }
@@ -191,6 +194,36 @@ pub async fn execute_site_config_mutation(
             claim_token,
             undo,
         } => {
+            if crate::services::local_fault::consume_site_config_start_fault().await {
+                if undo_pre_effect_claim(&db, &undo).await.is_ok() {
+                    return settings_transactions_unavailable();
+                }
+                return settings_commit_unknown();
+            }
+            if crate::services::local_fault::consume_site_config_undo_mismatch_fault().await {
+                let _ = db
+                    .collection::<Document>(SITE_CONFIG_CLAIMS_COLLECTION)
+                    .update_one(
+                        doc! { "_id": claim_id, "claimToken": &claim_token },
+                        doc! { "$set": { "claimToken": format!("{claim_token}x") } },
+                    )
+                    .await;
+                if undo_pre_effect_claim(&db, &undo).await.is_ok() {
+                    return settings_transactions_unavailable();
+                }
+                let _ = db
+                    .collection::<Document>(SITE_CONFIG_CLAIMS_COLLECTION)
+                    .update_one(
+                        doc! { "_id": claim_id, "idempotencyKey": &binding.key },
+                        doc! { "$set": { "commitUnknown": true } },
+                    )
+                    .await;
+                return settings_commit_unknown();
+            }
+            if crate::services::local_fault::consume_site_config_commit_unknown_fault().await {
+                let _ = mark_commit_unknown(&db, claim_id, &claim_token, &binding).await;
+                return settings_commit_unknown();
+            }
             if !mark_transaction_started(&db, claim_id, &claim_token, &binding)
                 .await
                 .unwrap_or(false)

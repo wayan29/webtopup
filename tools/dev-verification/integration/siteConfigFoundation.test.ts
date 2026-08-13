@@ -8,6 +8,7 @@ import { once } from 'node:events';
 import { MongoClient, ObjectId } from 'mongodb';
 import { chromium } from 'playwright';
 import { fixtureOtp, loginFixture } from '../e2e/fixtures.ts';
+import { readFaultEvidence, withFault } from '../faults.ts';
 
 const root = path.resolve(import.meta.dirname, '..', '..', '..');
 const stateDir = path.join(root, '.dev-verification');
@@ -44,6 +45,13 @@ test('site config foundation enforces permission, revision, step-up, idempotency
       databaseName: 'webtopup_task14_dev',
     });
     assert.ok(markerDoc);
+    const fixtureUsers = await db.collection('users').find(
+      { email: { $in: [denied.email, manager.email, inactive.email] }, task14Fixture: true },
+      { projection: { _id: 1 } },
+    ).toArray();
+    if (fixtureUsers.length) {
+      await db.collection('authsessions').deleteMany({ userId: { $in: fixtureUsers.map((item) => item._id) } });
+    }
 
     const deniedLogin = await loginAtGateway(nodeBase, denied, shared.PUBLIC_ORIGIN);
     const deniedGet = await jsonRequest(`${nodeBase}/api/v2/settings/admin/all`, {
@@ -51,6 +59,16 @@ test('site config foundation enforces permission, revision, step-up, idempotency
     });
     assert.equal(deniedGet.status, 403);
     assert.equal(errorCode(deniedGet.body), 'PERMISSION_DENIED');
+    const deniedPut = await jsonRequest(`${nodeBase}/api/v2/settings/admin/update`, {
+      method: 'PUT',
+      headers: {
+        ...bearerHeaders(deniedLogin.accessToken, shared.PUBLIC_ORIGIN),
+        'Idempotency-Key': `sitecfg_denied_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`,
+      },
+      body: JSON.stringify({ expectedRevision: 0, changes: { brand: `${marker}-denied` } }),
+    });
+    assert.equal(deniedPut.status, 403);
+    assert.equal(errorCode(deniedPut.body), 'PERMISSION_DENIED');
 
     const inactiveUser = await db.collection('users').findOne(
       { email: inactive.email, task14Fixture: true },
@@ -68,6 +86,21 @@ test('site config foundation enforces permission, revision, step-up, idempotency
       ),
     });
     assert.equal(inactiveTrusted.status, 403);
+    const inactivePut = await jsonRequest(`${rustBase}/v2/settings/admin/update`, {
+      method: 'PUT',
+      headers: {
+        ...trustedHeaders(
+          nodeSecrets.API_V2_PROXY_SECRET,
+          inactiveUser._id,
+          inactive.email,
+          String(inactiveUser.role),
+          shared.PUBLIC_ORIGIN,
+        ),
+        'Idempotency-Key': `sitecfg_inactive_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`,
+      },
+      body: JSON.stringify({ expectedRevision: 0, changes: { brand: `${marker}-inactive` } }),
+    });
+    assert.equal(inactivePut.status, 403);
 
     // Manager uses browser session so step-up grant binds to SID.
     browser = await chromium.launch({
@@ -110,6 +143,8 @@ test('site config foundation enforces permission, revision, step-up, idempotency
     const startRevision = Number(initial.data.revision);
     const originalBrand = String(initial.data.brand ?? 'Danayasa');
     const originalTitle = String(initial.data.title ?? 'Title');
+    const originalMaintenance = Boolean(initial.data.maintenanceMode);
+    const originalRegistration = initial.data.registrationEnabled !== false;
 
     cleanup.push(async () => {
       // Best-effort restore through versioned mutation if possible.
@@ -171,16 +206,24 @@ test('site config foundation enforces permission, revision, step-up, idempotency
     assert.equal(brandReplay.status, 200);
     assert.equal(brandReplay.data?.replayed, true);
     assert.equal(Number(brandReplay.data?.revision), startRevision + 1);
+    assert.equal(brandReplay.data?.revision, brandSave.data?.revision);
+    const domainAudits = await db.collection('adminauditlogs').countDocuments({
+      resource: 'Settings',
+      path: '/v2/settings/admin/update',
+      summary: { $regex: `r${startRevision}→r${startRevision + 1}` },
+    });
+    assert.equal(domainAudits, 1);
 
     // Sensitive change without grant → AUTH_STEP_UP_REQUIRED and no claim.
     const claimsBefore = await db.collection('siteconfigidempotencyclaims').countDocuments({});
     const sensitiveKey = `sitecfg_sens_${crypto.randomUUID().replace(/-/g, '').slice(0, 20)}`;
-    const sensitiveDenied = await page.evaluate(async ({ revision, key }) => {
+    const nextRegistration = !originalRegistration;
+    const sensitiveDenied = await page.evaluate(async ({ revision, key, registrationEnabled }) => {
       const api = (await import('/src/api/index.ts')).apiV2 as any;
       try {
         await api.put('/settings/admin/update', {
           expectedRevision: revision,
-          changes: { maintenanceMode: true, maintenanceMessage: 'Pemeliharaan verifikasi task14' },
+          changes: { registrationEnabled },
         }, {
           headers: { 'Idempotency-Key': key },
           _skipAuthRefresh: true,
@@ -193,7 +236,7 @@ test('site config foundation enforces permission, revision, step-up, idempotency
           group: error?.response?.data?.error?.actionGroup ?? error?.response?.data?.actionGroup ?? null,
         };
       }
-    }, { revision: startRevision + 1, key: sensitiveKey });
+    }, { revision: startRevision + 1, key: sensitiveKey, registrationEnabled: nextRegistration });
     assert.equal(sensitiveDenied.status, 403);
     assert.equal(sensitiveDenied.code, 'AUTH_STEP_UP_REQUIRED');
     assert.equal(sensitiveDenied.group, 'settings.sensitive');
@@ -216,11 +259,11 @@ test('site config foundation enforces permission, revision, step-up, idempotency
     assert.equal(grant.status, 200);
     assert.equal(typeof grant.token, 'string');
 
-    const sensitiveSave = await page.evaluate(async ({ revision, key, token }) => {
+    const sensitiveSave = await page.evaluate(async ({ revision, key, token, registrationEnabled }) => {
       const api = (await import('/src/api/index.ts')).apiV2 as any;
       const response = await api.put('/settings/admin/update', {
         expectedRevision: revision,
-        changes: { maintenanceMode: true, maintenanceMessage: 'Pemeliharaan verifikasi task14' },
+        changes: { registrationEnabled },
       }, {
         headers: {
           'Idempotency-Key': key,
@@ -229,7 +272,7 @@ test('site config foundation enforces permission, revision, step-up, idempotency
         _skipAuthRefresh: true,
       });
       return { status: response.status, data: response.data };
-    }, { revision: startRevision + 1, key: sensitiveKey, token: grant.token });
+    }, { revision: startRevision + 1, key: sensitiveKey, token: grant.token, registrationEnabled: nextRegistration });
     assert.equal(sensitiveSave.status, 200);
     assert.equal(sensitiveSave.data?.success, true);
     assert.equal(Number(sensitiveSave.data?.revision), startRevision + 2);
@@ -305,6 +348,208 @@ test('site config foundation enforces permission, revision, step-up, idempotency
     assert.equal(disabled.status, 503);
     assert.equal(errorCode(disabled.body), 'SETTINGS_TRANSACTIONS_UNAVAILABLE');
 
+    const capability = nodeSecrets.LOCAL_DESTRUCTIVE_CAPABILITY;
+    assert.equal(typeof capability, 'string');
+    const snapshotClaims = async () => JSON.stringify(await db.collection('siteconfigidempotencyclaims').find({}, { projection: { _id: 0 } }).sort({ updatedAt: 1 }).toArray());
+    const snapshotSettings = async () => JSON.stringify(await db.collection('settings').find({}, { projection: { _id: 0, key: 1, value: 1 } }).sort({ key: 1 }).toArray());
+    const snapshotAudits = async () => JSON.stringify(await db.collection('adminauditlogs').find({ resource: 'Settings', path: '/v2/settings/admin/update' }, { projection: { _id: 0, summary: 1, path: 1 } }).sort({ createdAt: 1 }).toArray());
+    const beforeProbe = {
+      claims: await snapshotClaims(),
+      settings: await snapshotSettings(),
+      audits: await snapshotAudits(),
+    };
+    const probe = await withFault({
+      stateDir,
+      capability: capability as string,
+      scenario: 'site_config_transaction_probe_unavailable',
+      ttlMs: 8_000,
+    }, () => page.evaluate(async ({ revision, brand, key }) => {
+      const api = (await import('/src/api/index.ts')).apiV2 as any;
+      try {
+        await api.put('/settings/admin/update', {
+          expectedRevision: revision,
+          changes: { brand },
+        }, {
+          headers: { 'Idempotency-Key': key },
+          _skipAuthRefresh: true,
+        });
+        return { status: 200, code: null };
+      } catch (error: any) {
+        return {
+          status: error?.response?.status ?? 0,
+          code: error?.response?.data?.error?.code ?? null,
+        };
+      }
+    }, {
+      revision: startRevision + 2,
+      brand: `${brandNext}-probe`,
+      key: `sitecfg_probe_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`,
+    }));
+    assert.equal(probe.status, 503);
+    assert.equal(probe.code, 'SETTINGS_TRANSACTIONS_UNAVAILABLE');
+    assert.equal(await snapshotClaims(), beforeProbe.claims);
+    assert.equal(await snapshotSettings(), beforeProbe.settings);
+    assert.equal(await snapshotAudits(), beforeProbe.audits);
+    assert.equal((await readFaultEvidence(stateDir))?.scenario, 'site_config_transaction_probe_unavailable');
+
+    const startFault = await withFault({
+      stateDir,
+      capability: capability as string,
+      scenario: 'site_config_transaction_start_unavailable',
+      ttlMs: 8_000,
+    }, () => page.evaluate(async ({ revision, brand, key }) => {
+      const api = (await import('/src/api/index.ts')).apiV2 as any;
+      try {
+        await api.put('/settings/admin/update', {
+          expectedRevision: revision,
+          changes: { brand },
+        }, {
+          headers: { 'Idempotency-Key': key },
+          _skipAuthRefresh: true,
+        });
+        return { status: 200, code: null };
+      } catch (error: any) {
+        return {
+          status: error?.response?.status ?? 0,
+          code: error?.response?.data?.error?.code ?? null,
+        };
+      }
+    }, {
+      revision: startRevision + 2,
+      brand: `${brandNext}-start`,
+      key: `sitecfg_start_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`,
+    }));
+    assert.equal(startFault.status, 503);
+    assert.equal(startFault.code, 'SETTINGS_TRANSACTIONS_UNAVAILABLE');
+    assert.equal(await snapshotClaims(), beforeProbe.claims);
+    assert.equal(await snapshotSettings(), beforeProbe.settings);
+
+    const undo = await withFault({
+      stateDir,
+      capability: capability as string,
+      scenario: 'site_config_claim_undo_mismatch',
+      ttlMs: 8_000,
+    }, () => page.evaluate(async ({ revision, brand, key }) => {
+      const api = (await import('/src/api/index.ts')).apiV2 as any;
+      try {
+        await api.put('/settings/admin/update', {
+          expectedRevision: revision,
+          changes: { brand },
+        }, {
+          headers: { 'Idempotency-Key': key },
+          _skipAuthRefresh: true,
+        });
+        return { status: 200, code: null };
+      } catch (error: any) {
+        return {
+          status: error?.response?.status ?? 0,
+          code: error?.response?.data?.error?.code ?? null,
+        };
+      }
+    }, {
+      revision: startRevision + 2,
+      brand: `${brandNext}-undo`,
+      key: `sitecfg_undo_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`,
+    }));
+    assert.equal(undo.status, 503);
+    assert.equal(undo.code, 'SETTINGS_COMMIT_UNKNOWN');
+    const unknownClaims = await db.collection('siteconfigidempotencyclaims').countDocuments({ commitUnknown: true });
+    assert.ok(unknownClaims >= 1);
+
+    const lostKey = `sitecfg_lost_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
+    const lostBrand = `${originalBrand} ${marker}-lost`.slice(0, 80);
+    const lost = await withFault({
+      stateDir,
+      capability: capability as string,
+      scenario: 'site_config_response_loss_after_commit',
+      ttlMs: 8_000,
+    }, () => page.evaluate(async ({ revision, brand, key }) => {
+      const api = (await import('/src/api/index.ts')).apiV2 as any;
+      try {
+        await api.put('/settings/admin/update', {
+          expectedRevision: revision,
+          changes: { brand },
+        }, {
+          headers: { 'Idempotency-Key': key },
+          _skipAuthRefresh: true,
+        });
+        return { lost: false, status: 200, revision: 0 };
+      } catch (error: any) {
+        return {
+          lost: !error?.response,
+          status: error?.response?.status ?? 0,
+          revision: 0,
+        };
+      }
+    }, { revision: startRevision + 2, brand: lostBrand, key: lostKey }));
+    assert.equal(lost.lost || lost.status >= 500, true);
+    const lostReplay = await page.evaluate(async ({ revision, brand, key }) => {
+      const api = (await import('/src/api/index.ts')).apiV2 as any;
+      const response = await api.put('/settings/admin/update', {
+        expectedRevision: revision,
+        changes: { brand },
+      }, {
+        headers: { 'Idempotency-Key': key },
+        _skipAuthRefresh: true,
+      });
+      return { status: response.status, data: response.data };
+    }, { revision: startRevision + 2, brand: lostBrand, key: lostKey });
+    assert.equal(lostReplay.status, 200);
+    assert.equal(lostReplay.data?.replayed, true);
+    assert.equal(Number(lostReplay.data?.revision), startRevision + 3);
+
+    const unknownKey = `sitecfg_unk_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
+    const unknown = await withFault({
+      stateDir,
+      capability: capability as string,
+      scenario: 'site_config_commit_unknown_unresolved',
+      ttlMs: 8_000,
+    }, () => page.evaluate(async ({ revision, brand, key }) => {
+      const api = (await import('/src/api/index.ts')).apiV2 as any;
+      try {
+        await api.put('/settings/admin/update', {
+          expectedRevision: revision,
+          changes: { brand },
+        }, {
+          headers: { 'Idempotency-Key': key },
+          _skipAuthRefresh: true,
+        });
+        return { status: 200, code: null };
+      } catch (error: any) {
+        return {
+          status: error?.response?.status ?? 0,
+          code: error?.response?.data?.error?.code ?? null,
+        };
+      }
+    }, { revision: startRevision + 3, brand: `${lostBrand}-unknown`, key: unknownKey }));
+    assert.equal(unknown.status, 503);
+    assert.equal(unknown.code, 'SETTINGS_COMMIT_UNKNOWN');
+    const unknownRetry = await page.evaluate(async ({ revision, brand, key }) => {
+      const api = (await import('/src/api/index.ts')).apiV2 as any;
+      try {
+        await api.put('/settings/admin/update', {
+          expectedRevision: revision,
+          changes: { brand },
+        }, {
+          headers: { 'Idempotency-Key': key },
+          _skipAuthRefresh: true,
+        });
+        return { status: 200, code: null };
+      } catch (error: any) {
+        return {
+          status: error?.response?.status ?? 0,
+          code: error?.response?.data?.error?.code ?? null,
+        };
+      }
+    }, { revision: startRevision + 3, brand: `${lostBrand}-unknown`, key: unknownKey });
+    assert.equal(unknownRetry.status, 503);
+    assert.equal(unknownRetry.code, 'SETTINGS_COMMIT_UNKNOWN');
+    const afterUnknown = await page.evaluate(async () => {
+      const api = (await import('/src/api/index.ts')).apiV2 as any;
+      return (await api.get('/settings/admin/all', { _skipAuthRefresh: true })).data;
+    });
+    assert.equal(Number(afterUnknown.revision), startRevision + 3);
+
     // Public ETag / no-cache / 304.
     const publicFirst = await jsonRequest(`${nodeBase}/api/v2/settings/public`, {
       headers: { Origin: shared.PUBLIC_ORIGIN },
@@ -323,6 +568,14 @@ test('site config foundation enforces permission, revision, step-up, idempotency
     });
     assert.equal(public304.status, 304);
     assert.equal(public304.text, '');
+    const publicMalformed = await jsonRequest(`${nodeBase}/api/v2/settings/public`, {
+      headers: {
+        Origin: shared.PUBLIC_ORIGIN,
+        'If-None-Match': 'not-a-valid-etag',
+      },
+    });
+    assert.equal(publicMalformed.status, 200);
+    assert.equal(typeof publicMalformed.body?.revision, 'number');
 
     // Restore maintenance off with fresh intent + grant.
     const restoreOtp = await fixtureOtp('site-config-manager');
@@ -339,12 +592,13 @@ test('site config foundation enforces permission, revision, step-up, idempotency
       const api = (await import('/src/api/index.ts')).apiV2 as any;
       return (await api.get('/settings/admin/all', { _skipAuthRefresh: true })).data;
     });
-    await page.evaluate(async ({ revision, token, brand, title, key }) => {
+    await page.evaluate(async ({ revision, token, brand, title, registrationEnabled, maintenanceMode, key }) => {
       const api = (await import('/src/api/index.ts')).apiV2 as any;
       await api.put('/settings/admin/update', {
         expectedRevision: revision,
         changes: {
-          maintenanceMode: false,
+          maintenanceMode,
+          registrationEnabled,
           brand,
           title,
         },
@@ -360,6 +614,8 @@ test('site config foundation enforces permission, revision, step-up, idempotency
       token: restoreGrant,
       brand: originalBrand,
       title: originalTitle,
+      registrationEnabled: originalRegistration,
+      maintenanceMode: originalMaintenance,
       key: `sitecfg_final_${crypto.randomUUID().replace(/-/g, '').slice(0, 18)}`,
     });
   } catch (error) {

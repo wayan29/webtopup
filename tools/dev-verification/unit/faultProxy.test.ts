@@ -225,3 +225,57 @@ test('oversized targeted response fails closed without consuming the lease', asy
     await fs.rm(stateDir, { recursive: true, force: true });
   }
 });
+
+test('site config fault inventory is closed and response-loss is PUT-only after 2xx', async () => {
+  const { FAULT_SCENARIOS, SITE_CONFIG_RUST_FAULT_SCENARIOS } = await import('../faults.ts');
+  assert.ok(FAULT_SCENARIOS.includes('site_config_response_loss_after_commit'));
+  assert.deepEqual([...SITE_CONFIG_RUST_FAULT_SCENARIOS].sort(), [
+    'site_config_claim_undo_mismatch',
+    'site_config_commit_unknown_unresolved',
+    'site_config_transaction_probe_unavailable',
+    'site_config_transaction_start_unavailable',
+  ]);
+  for (const scenario of SITE_CONFIG_RUST_FAULT_SCENARIOS) {
+    assert.ok(FAULT_SCENARIOS.includes(scenario));
+  }
+
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'webtopup-site-config-fault-'));
+  const capability = 'synthetic-local-capability';
+  await fs.mkdir(path.join(stateDir, 'env'), { recursive: true });
+  await fs.writeFile(path.join(stateDir, 'env', 'shared.env'), 'LOCAL_DEV_VERIFICATION=true\n');
+  await fs.writeFile(path.join(stateDir, 'env', 'node.env'), `LOCAL_DESTRUCTIVE_CAPABILITY=${capability}\n`);
+  let completed = 0;
+  const upstream = http.createServer((_req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ ok: true }), () => { completed += 1; }); });
+  const upstreamPort = await listen(upstream);
+  const proxy = await startFaultProxy({ stateDir, upstreamOrigin: `http://127.0.0.1:${upstreamPort}`, host: '127.0.0.1', port: 0 });
+  const proxyPort = (proxy.address() as { port: number }).port;
+  try {
+    const activationId = await activateFault({ stateDir, capability, scenario: 'site_config_response_loss_after_commit', ttlMs: 1_000 });
+    assert.deepEqual(await request(proxyPort, '/v2/settings/admin/update', 'GET'), { kind: 'response', status: 200, body: '{"ok":true}' });
+    assert.deepEqual(await request(proxyPort, '/v2/auth/refresh'), { kind: 'response', status: 200, body: '{"ok":true}' });
+    assert.deepEqual(await request(proxyPort, '/v2/settings/admin/update', 'PUT'), { kind: 'lost' });
+    assert.equal(completed, 3);
+    let evidence = await readFaultEvidence(stateDir);
+    for (let attempt = 0; attempt < 50 && !evidence; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      evidence = await readFaultEvidence(stateDir);
+    }
+    assert.deepEqual(evidence, {
+      activationId,
+      scenario: 'site_config_response_loss_after_commit',
+      upstreamComplete: true,
+      downstreamDestroyed: true,
+      consumed: true,
+    });
+    const serialized = JSON.stringify(evidence);
+    assert.doesNotMatch(serialized, /password|token|secret|cookie|otp|authorization|idempotency|MONGO_URI/i);
+    assert.deepEqual(await request(proxyPort, '/v2/settings/admin/update', 'PUT'), { kind: 'response', status: 200, body: '{"ok":true}' });
+
+    await activateFault({ stateDir, capability, scenario: 'site_config_transaction_probe_unavailable', ttlMs: 1_000 });
+    assert.deepEqual(await request(proxyPort, '/v2/settings/admin/update', 'PUT'), { kind: 'response', status: 200, body: '{"ok":true}' });
+    assert.equal(await readFaultEvidence(stateDir), null);
+  } finally {
+    await Promise.all([new Promise<void>((resolve) => proxy.close(() => resolve())), new Promise<void>((resolve) => upstream.close(() => resolve()))]);
+    await fs.rm(stateDir, { recursive: true, force: true });
+  }
+});

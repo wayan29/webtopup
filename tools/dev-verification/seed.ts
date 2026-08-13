@@ -19,6 +19,7 @@ export type FixtureDefinition = {
   twoFactorEnabled: boolean;
   twoFactorEnrollmentRequiredAt?: Date;
   activeDeviceCount: number;
+  syntheticBalance?: number;
 };
 
 export type PublicFixture = Pick<FixtureDefinition, 'alias' | 'scenario' | 'fixtureRunId' | 'role'>;
@@ -164,6 +165,7 @@ export function fixtureDefinitions(fixtureRunId: string, now = new Date()): Fixt
     }),
     make('identifier-member', 'identifier-integrity-member', 'member', {
       twoFactorEnabled: false,
+      syntheticBalance: 100_000,
     }),
   ];
 }
@@ -229,7 +231,7 @@ async function seedFixtureDefinitions(
     for (const fixture of definitions) {
       const user = new User({
         email: fixture.email, password: passwords[fixture.role], name: `Task 14 ${fixture.alias}`,
-        role: fixture.role, level: 'basic', balance: fixture.scenario === 'finance-idempotency' || fixture.scenario === 'identifier-integrity-member' ? 100_000 : 0,
+        role: fixture.role, level: 'basic', balance: fixture.syntheticBalance ?? (fixture.scenario === 'finance-idempotency' ? 100_000 : 0),
         permissions: {
           ...(fixture.permissions ?? {}),
           ...(fixture.scenario === 'finance-idempotency' ? { manageUsers: true, processManualTransaction: true } : {}),
@@ -252,7 +254,8 @@ async function seedFixtureDefinitions(
       if (!financeTargetId) throw new Error('finance target fixture is unavailable');
       await mongoose.connection.db!.collection('transactions').insertOne({
         user: financeTargetId, product: new mongoose.Types.ObjectId(), target: 'synthetic-task14-target', amount: 12_500,
-        status: 'failed', refunded: false, source: 'web', task14Fixture: true, fixtureRunId: definitions[0]!.fixtureRunId,
+        status: 'failed', refunded: false, source: 'web', referenceId: `TASK14-FIN-${definitions[0]!.fixtureRunId}`,
+        task14Fixture: true, fixtureRunId: definitions[0]!.fixtureRunId,
         fixtureScenario: 'finance-idempotency-refund', createdAt: new Date(), updatedAt: new Date(),
       });
     }

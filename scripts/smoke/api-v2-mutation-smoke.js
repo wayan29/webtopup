@@ -154,8 +154,8 @@ function objectIdFromAny(value, label) {
   return objectId(value?._id || value?.id, label);
 }
 
-async function authedJson(token, method, path, payload) {
-  const headers = { Authorization: `Bearer ${token}` };
+async function authedJson(token, method, path, payload, extraHeaders = {}) {
+  const headers = { Authorization: `Bearer ${token}`, ...extraHeaders };
   if (payload !== undefined) {
     headers['Content-Type'] = 'application/json';
   }
@@ -363,47 +363,54 @@ async function runTwoFactorE2eSmoke(token) {
 }
 
 async function runSettingsMutationSmoke(token, suffix) {
-  const original = await authedJson(token, 'GET', '/api/v2/settings/admin/title');
-  assertStatus('settings e2e read title', original.response, original.body, 200);
-  const originalTitle = original.body?.value || '';
+  const all = await authedJson(token, 'GET', '/api/v2/settings/admin/all');
+  assertStatus('settings e2e read all', all.response, all.body, 200);
+  if (typeof all.body?.revision !== 'number') {
+    throw new Error('settings admin all is missing revision');
+  }
+  optionalSettingsE2eChecks += 1;
+  ok('settings e2e read all', all.response.status);
 
   const unknown = await authedJson(token, 'PUT', '/api/v2/settings/admin/update', {
-    [`unknownSmoke${suffix}`]: true,
-  });
+    expectedRevision: all.body.revision,
+    changes: { [`unknownSmoke${suffix}`]: true },
+  }, { 'Idempotency-Key': `smoke_unknown_${suffix}` });
   assertStatus('settings unknown key boundary', unknown.response, unknown.body, 400);
   optionalSettingsE2eChecks += 1;
   ok('settings unknown key boundary', unknown.response.status);
 
   const invalidRange = await authedJson(token, 'PUT', '/api/v2/settings/admin/update', {
-    minDeposit: 20000,
-    maxDeposit: 10000,
-  });
+    expectedRevision: all.body.revision,
+    changes: { minDeposit: 20000, maxDeposit: 10000 },
+  }, { 'Idempotency-Key': `smoke_range_${suffix}` });
   assertStatus('settings deposit range boundary', invalidRange.response, invalidRange.body, 400);
   optionalSettingsE2eChecks += 1;
   ok('settings deposit range boundary', invalidRange.response.status);
 
-  const invalidPath = await authedJson(token, 'PUT', '/api/v2/settings/admin/logo', {
+  const closedSingle = await authedJson(token, 'PUT', '/api/v2/settings/admin/logo', {
     value: 'javascript:alert(1)',
   });
-  assertStatus('settings unsafe path boundary', invalidPath.response, invalidPath.body, 400);
-  optionalSettingsE2eChecks += 1;
-  ok('settings unsafe path boundary', invalidPath.response.status);
-
-  try {
-    const nextTitle = `Smoke Title ${suffix}`.slice(0, 80);
-    const update = await authedJson(token, 'PUT', '/api/v2/settings/admin/title', { value: nextTitle });
-    assertStatus('settings valid update', update.response, update.body, 200);
-    if (update.body?.value !== nextTitle) {
-      throw new Error('settings valid update returned unexpected value');
-    }
-    optionalSettingsE2eChecks += 1;
-    ok('settings valid update', update.response.status);
-  } finally {
-    const restore = await authedJson(token, 'PUT', '/api/v2/settings/admin/title', { value: originalTitle });
-    assertStatus('settings restore title', restore.response, restore.body, 200);
-    optionalSettingsE2eChecks += 1;
-    ok('settings restore title', restore.response.status);
+  if (![400, 405].includes(closedSingle.response.status)) {
+    throw new Error(`settings single mutation expected 400/405, got ${closedSingle.response.status}`);
   }
+  optionalSettingsE2eChecks += 1;
+  ok('settings single mutation closed', closedSingle.response.status);
+
+  const pub = await jsonRequest('GET', '/api/v2/settings/public');
+  assertStatus('settings public get', pub.response, pub.body, 200);
+  const etag = pub.response.headers.get('etag');
+  const cacheControl = pub.response.headers.get('cache-control') || '';
+  if (!etag || !/no-cache/i.test(cacheControl) || typeof pub.body?.revision !== 'number') {
+    throw new Error('settings public freshness contract is incomplete');
+  }
+  const cached = await jsonRequest('GET', '/api/v2/settings/public', undefined, {
+    headers: { 'If-None-Match': etag },
+  });
+  if (cached.response.status !== 304) {
+    throw new Error(`settings public If-None-Match expected 304, got ${cached.response.status}`);
+  }
+  optionalSettingsE2eChecks += 1;
+  ok('settings public etag', cached.response.status);
 }
 
 async function runNotificationMutationSmoke(token) {

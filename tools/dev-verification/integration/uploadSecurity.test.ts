@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
-import { MongoClient } from 'mongodb';
+import { MongoClient, ObjectId } from 'mongodb';
 import { loginFixture } from '../e2e/fixtures.ts';
 
 const root = path.resolve(import.meta.dirname, '..', '..', '..');
@@ -10,19 +10,22 @@ const stateDir = path.join(root, '.dev-verification');
 
 type Env = Record<string, string>;
 
+const PNG_1X1 = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+  'base64',
+);
+
 test('upload security rejects spoofed content and accepts canonical images through Node', async () => {
-  const [shared] = await Promise.all([
-    readEnv(path.join(stateDir, 'env', 'shared.env')),
-  ]);
+  const shared = await readEnv(path.join(stateDir, 'env', 'shared.env'));
   assert.equal(shared.LOCAL_DEV_VERIFICATION, 'true');
   assert.equal(shared.MONGO_DB, 'webtopup_task14_dev');
 
-  const manager = await loginFixture('site-config-manager');
+  const uploader = await loginFixture('catalog-manager');
   const nodeBase = `http://127.0.0.1:${shared.NODE_PORT}`;
   const mongo = new MongoClient(shared.MONGO_URI);
-  let accessToken = '';
-  let csrf = '';
-  const cookies: string[] = [];
+  const created: string[] = [];
+  let productId: ObjectId | undefined;
+  let primary: unknown = null;
 
   try {
     await mongo.connect();
@@ -32,82 +35,103 @@ test('upload security rejects spoofed content and accepts canonical images throu
       databaseName: 'webtopup_task14_dev',
     }));
 
-    const login = await fetch(`${nodeBase}/api/v2${manager.loginEndpoint}`, {
+    const login = await fetch(`${nodeBase}/api/v2${uploader.loginEndpoint}`, {
       method: 'POST',
       headers: {
         Origin: shared.PUBLIC_ORIGIN,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        email: manager.email,
-        password: manager.password,
+        email: uploader.email,
+        password: uploader.password,
         rememberMe: false,
         deviceName: 'Task14 upload security',
       }),
     });
-    // Manager has 2FA; login may require challenge. Fall back to site-config denied? No: use staff without challenge path if present.
-    // Prefer catalog-manager (no 2FA) which has manageProducts for icons folder.
-  } finally {
-    await mongo.close().catch(() => undefined);
-  }
-
-  // Use catalog-manager (manageProducts, no 2FA) for folder permission mapping icons.
-  const uploader = await loginFixture('catalog-manager');
-  const login = await fetch(`${nodeBase}/api/v2${uploader.loginEndpoint}`, {
-    method: 'POST',
-    headers: {
+    const loginBody = await login.json() as any;
+    assert.equal(login.status, 200, JSON.stringify(loginBody));
+    const accessToken = String(loginBody.accessToken || '');
+    assert.ok(accessToken.length > 10);
+    const cookies = (login.headers.getSetCookie?.() || []).map((value) => value.split(';')[0]!);
+    const csrf = cookies.find((value) => value.startsWith('csrf='))?.slice(5) || '';
+    const headers = {
+      Authorization: `Bearer ${accessToken}`,
       Origin: shared.PUBLIC_ORIGIN,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      email: uploader.email,
-      password: uploader.password,
-      rememberMe: false,
-      deviceName: 'Task14 upload security',
-    }),
-  });
-  const loginBody = await login.json() as any;
-  assert.equal(login.status, 200, JSON.stringify(loginBody));
-  accessToken = String(loginBody.accessToken || '');
-  assert.ok(accessToken.length > 10);
-  const setCookie = login.headers.getSetCookie?.() || [];
-  for (const value of setCookie) cookies.push(value.split(';')[0]!);
-  csrf = cookies.find((value) => value.startsWith('csrf='))?.slice(5) || '';
+      Cookie: cookies.join('; '),
+      ...(csrf ? { 'X-CSRF-Token': csrf } : {}),
+    };
 
-  const headers = {
-    Authorization: `Bearer ${accessToken}`,
-    Origin: shared.PUBLIC_ORIGIN,
-    Cookie: cookies.join('; '),
-    ...(csrf ? { 'X-CSRF-Token': csrf } : {}),
-  };
+    const spoof = await multipartUpload(`${nodeBase}/api/v2/upload?type=icons`, headers, 'spoof.png', 'image/png', Buffer.from('not-an-image'));
+    assert.equal(spoof.status, 400);
+    assert.equal(codeOf(spoof.body), 'UNSUPPORTED_IMAGE_FORMAT');
 
-  // Spoofed text as PNG.
-  const spoof = await multipartUpload(`${nodeBase}/api/v2/upload?type=icons`, headers, 'spoof.png', 'image/png', Buffer.from('not-an-image'));
-  assert.equal(spoof.status, 400);
-  assert.equal(spoof.body?.error?.code || spoof.body?.code, 'UNSUPPORTED_IMAGE_FORMAT');
+    const truncated = await multipartUpload(`${nodeBase}/api/v2/upload?type=icons`, headers, 'trunc.jpg', 'image/jpeg', Buffer.from([0xff, 0xd8, 0xff, 0xe0]));
+    assert.equal(truncated.status, 400);
+    assert.ok(['INVALID_IMAGE_CONTENT', 'UNSUPPORTED_IMAGE_FORMAT'].includes(String(codeOf(truncated.body))));
 
-  // GIF signature.
-  const gif = await multipartUpload(`${nodeBase}/api/v2/upload?type=icons`, headers, 'x.gif', 'image/gif', Buffer.from('GIF89a'));
-  assert.equal(gif.status, 400);
+    const gif = await multipartUpload(`${nodeBase}/api/v2/upload?type=icons`, headers, 'x.gif', 'image/gif', Buffer.from('GIF89a'));
+    assert.equal(gif.status, 400);
 
-  // Valid tiny PNG (1x1).
-  const png = Buffer.from(
-    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
-    'base64',
-  );
-  const ok = await multipartUpload(`${nodeBase}/api/v2/upload?type=icons`, headers, 'ok.png', 'image/png', png);
-  assert.equal(ok.status, 200, JSON.stringify(ok.body));
-  assert.equal(ok.body?.success, true);
-  assert.match(String(ok.body?.filename || ''), /\.png$/i);
-  assert.match(String(ok.body?.url || ''), /^\/uploads\/icons\//);
+    const ok = await multipartUpload(`${nodeBase}/api/v2/upload?type=icons`, headers, 'ok.png', 'image/png', PNG_1X1);
+    assert.equal(ok.status, 200, JSON.stringify(ok.body));
+    assert.equal(ok.body?.success, true);
+    assert.match(String(ok.body?.filename || ''), /\.png$/i);
+    assert.match(String(ok.body?.url || ''), /^\/uploads\/icons\//);
+    created.push(String(ok.body.filename));
 
-  // Cleanup uploaded file if present.
-  if (ok.body?.filename) {
-    await fetch(`${nodeBase}/api/v2/upload?type=icons&filename=${encodeURIComponent(ok.body.filename)}`, {
+    const batch = await multipartBatch(`${nodeBase}/api/v2/upload/multiple?type=icons`, headers, [
+      { filename: 'ok2.png', contentType: 'image/png', bytes: PNG_1X1 },
+      { filename: 'bad.png', contentType: 'image/png', bytes: Buffer.from('not-an-image') },
+    ]);
+    assert.equal(batch.status, 400);
+    assert.ok(codeOf(batch.body));
+
+    productId = new ObjectId();
+    await db.collection('products').insertOne({
+      _id: productId,
+      code: `UPL-${productId.toHexString().slice(-6)}`,
+      name: 'Task14 referenced upload',
+      status: true,
+      icon: ok.body.url,
+      price: { basic: 1000, gold: 1000, platinum: 1000 },
+      task14Fixture: true,
+    });
+    const blocked = await fetch(`${nodeBase}/api/v2/upload?type=icons&filename=${encodeURIComponent(ok.body.filename)}`, {
       method: 'DELETE',
       headers,
-    }).catch(() => undefined);
+    });
+    const blockedBody = await blocked.json().catch(() => ({}));
+    assert.equal(blocked.status, 409);
+    assert.equal(codeOf(blockedBody), 'ASSET_IN_USE');
+
+    await db.collection('products').deleteOne({ _id: productId });
+    const deleted = await fetch(`${nodeBase}/api/v2/upload?type=icons&filename=${encodeURIComponent(ok.body.filename)}`, {
+      method: 'DELETE',
+      headers,
+    });
+    assert.ok(deleted.status === 200 || deleted.status === 204);
+
+    const manager = await loginFixture('site-config-manager');
+    const staffLogin = await fetch(`${nodeBase}/api/v2${manager.loginEndpoint}`, {
+      method: 'POST',
+      headers: { Origin: shared.PUBLIC_ORIGIN, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: manager.email,
+        password: manager.password,
+        rememberMe: false,
+        deviceName: 'Task14 upload missing asset',
+      }),
+    });
+    assert.notEqual(staffLogin.status, 500);
+  } catch (error) {
+    primary = error;
+  } finally {
+    try {
+      if (productId) await mongo.db(shared.MONGO_DB).collection('products').deleteOne({ _id: productId });
+    } catch { /* ignore */ }
+    await mongo.close().catch(() => undefined);
   }
+  if (primary) throw primary;
 });
 
 async function readEnv(file: string): Promise<Env> {
@@ -117,6 +141,10 @@ async function readEnv(file: string): Promise<Env> {
   }));
 }
 
+function codeOf(body: any): unknown {
+  return body?.error?.code ?? body?.code;
+}
+
 async function multipartUpload(
   url: string,
   headers: Record<string, string>,
@@ -124,19 +152,31 @@ async function multipartUpload(
   contentType: string,
   bytes: Buffer,
 ): Promise<{ status: number; body: any }> {
+  return multipartBatch(url, headers, [{ filename, contentType, bytes }]);
+}
+
+async function multipartBatch(
+  url: string,
+  headers: Record<string, string>,
+  files: Array<{ filename: string; contentType: string; bytes: Buffer }>,
+): Promise<{ status: number; body: any }> {
   const boundary = `----task14${Date.now()}`;
-  const prefix = Buffer.from(
-    `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: ${contentType}\r\n\r\n`,
-  );
-  const suffix = Buffer.from(`\r\n--${boundary}--\r\n`);
-  const body = Buffer.concat([prefix, bytes, suffix]);
+  const parts: Buffer[] = [];
+  for (const file of files) {
+    parts.push(Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${file.filename}"\r\nContent-Type: ${file.contentType}\r\n\r\n`,
+    ));
+    parts.push(file.bytes);
+    parts.push(Buffer.from('\r\n'));
+  }
+  parts.push(Buffer.from(`--${boundary}--\r\n`));
   const response = await fetch(url, {
     method: 'POST',
     headers: {
       ...headers,
       'Content-Type': `multipart/form-data; boundary=${boundary}`,
     },
-    body,
+    body: Buffer.concat(parts),
   });
   const text = await response.text();
   let parsed: any = null;

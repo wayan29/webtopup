@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 const GUEST_POST_COMMIT_SCENARIO: &str = "guest_checkout_response_loss_after_commit";
+const SITE_CONFIG_PROBE_SCENARIO: &str = "site_config_transaction_probe_unavailable";
+const SITE_CONFIG_START_SCENARIO: &str = "site_config_transaction_start_unavailable";
+const SITE_CONFIG_UNDO_MISMATCH_SCENARIO: &str = "site_config_claim_undo_mismatch";
+const SITE_CONFIG_COMMIT_UNKNOWN_SCENARIO: &str = "site_config_commit_unknown_unresolved";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,7 +55,81 @@ pub async fn consume_guest_post_commit_fault() -> bool {
     consume_guest_fault_files(&state_dir, &capability).await
 }
 
+pub async fn consume_site_config_probe_fault() -> bool {
+    consume_site_config_fault(SITE_CONFIG_PROBE_SCENARIO).await
+}
+
+pub async fn consume_site_config_start_fault() -> bool {
+    consume_site_config_fault(SITE_CONFIG_START_SCENARIO).await
+}
+
+pub async fn consume_site_config_undo_mismatch_fault() -> bool {
+    consume_site_config_fault(SITE_CONFIG_UNDO_MISMATCH_SCENARIO).await
+}
+
+pub async fn consume_site_config_commit_unknown_fault() -> bool {
+    consume_site_config_fault(SITE_CONFIG_COMMIT_UNKNOWN_SCENARIO).await
+}
+
+async fn consume_site_config_fault(scenario: &str) -> bool {
+    let Some((state_dir, capability)) = guarded_fault_context() else {
+        return false;
+    };
+    consume_named_fault_files(&state_dir, &capability, scenario, serde_json::json!({
+        "activationId": "",
+        "scenario": scenario,
+        "rustOnly": true,
+        "consumed": true,
+    })).await
+}
+
+fn guarded_fault_context() -> Option<(PathBuf, String)> {
+    if std::env::var("LOCAL_DEV_VERIFICATION").ok().as_deref() != Some("true")
+        || std::env::var("MONGO_DB").ok().as_deref() != Some("webtopup_task14_dev")
+    {
+        return None;
+    }
+    let uri = std::env::var("MONGO_URI").ok()?;
+    if !(uri.starts_with("mongodb://127.0.0.1:27018/webtopup_task14_dev?")
+        && uri.contains("replicaSet=rs0")
+        && uri.contains("directConnection=true"))
+    {
+        return None;
+    }
+    let state_dir = PathBuf::from(std::env::var("DEV_VERIFICATION_STATE_DIR").ok()?);
+    if state_dir.file_name().and_then(|name| name.to_str()) != Some(".dev-verification") {
+        return None;
+    }
+    let capability = std::env::var("LOCAL_DESTRUCTIVE_CAPABILITY").ok()?;
+    if capability.is_empty() {
+        return None;
+    }
+    Some((state_dir, capability))
+}
+
 async fn consume_guest_fault_files(state_dir: &Path, capability: &str) -> bool {
+    consume_named_fault_files(
+        state_dir,
+        capability,
+        GUEST_POST_COMMIT_SCENARIO,
+        serde_json::json!({
+            "activationId": "",
+            "scenario": GUEST_POST_COMMIT_SCENARIO,
+            "mongoTransactionCommitted": true,
+            "guestMarkerDurable": true,
+            "idempotencyCompleteSkipped": true,
+            "consumed": true,
+        }),
+    )
+    .await
+}
+
+async fn consume_named_fault_files(
+    state_dir: &Path,
+    capability: &str,
+    scenario: &str,
+    mut evidence: serde_json::Value,
+) -> bool {
     let lease_path = state_dir.join("fault-lease.json");
     let claimed_path = state_dir.join(format!("fault-lease.rust-{}.json", std::process::id()));
     let raw = match tokio::fs::read_to_string(&lease_path).await {
@@ -64,7 +142,7 @@ async fn consume_guest_fault_files(state_dir: &Path, capability: &str) -> bool {
     let capability_digest = crate::services::idempotency::sha256_hex(capability.as_bytes());
     let now_ms = chrono::Utc::now().timestamp_millis();
     if lease.version != 1
-        || lease.scenario != GUEST_POST_COMMIT_SCENARIO
+        || lease.scenario != scenario
         || lease.capability_digest != capability_digest
         || lease.expires_at < now_ms
         || lease.activation_id.is_empty()
@@ -74,14 +152,12 @@ async fn consume_guest_fault_files(state_dir: &Path, capability: &str) -> bool {
     if tokio::fs::rename(&lease_path, &claimed_path).await.is_err() {
         return false;
     }
-    let evidence = serde_json::json!({
-        "activationId": lease.activation_id,
-        "scenario": GUEST_POST_COMMIT_SCENARIO,
-        "mongoTransactionCommitted": true,
-        "guestMarkerDurable": true,
-        "idempotencyCompleteSkipped": true,
-        "consumed": true,
-    });
+    if let Some(object) = evidence.as_object_mut() {
+        object.insert(
+            "activationId".to_string(),
+            serde_json::Value::String(lease.activation_id),
+        );
+    }
     let temporary = state_dir.join(format!("fault-evidence.{}.tmp", std::process::id()));
     let evidence_path = state_dir.join("fault-evidence.json");
     let wrote = tokio::fs::write(&temporary, evidence.to_string()).await.is_ok()

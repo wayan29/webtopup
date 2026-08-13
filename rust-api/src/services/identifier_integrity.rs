@@ -130,6 +130,7 @@ pub struct AllocatedReference {
 pub enum ReferenceError {
     SequenceExhausted,
     Storage,
+    TransientConflict,
 }
 
 impl ReferenceError {
@@ -137,8 +138,23 @@ impl ReferenceError {
         match self {
             Self::SequenceExhausted => "REF_ID_SEQUENCE_EXHAUSTED",
             Self::Storage => "REFERENCE_ALLOCATION_FAILED",
+            Self::TransientConflict => "REFERENCE_ALLOCATION_CONFLICT",
         }
     }
+}
+
+pub const MAX_REFERENCE_ALLOCATION_ATTEMPTS: usize = 8;
+
+pub fn is_transient_identifier_write_conflict(error: &mongodb::error::Error) -> bool {
+    is_transient_identifier_write_conflict_text(&format!("{error:?}"))
+}
+
+pub fn is_transient_identifier_write_conflict_text(haystack: &str) -> bool {
+    let haystack = haystack.to_lowercase();
+    haystack.contains("writeconflict")
+        || haystack.contains("transienttransactionerror")
+        || haystack.contains("label: \"transienttransactionerror\"")
+        || haystack.contains("write conflict")
 }
 
 impl ReferenceFormat {
@@ -302,7 +318,13 @@ pub async fn allocate_reference_in_session(
         .return_document(ReturnDocument::After)
         .session(&mut *session)
         .await
-        .map_err(|_| ReferenceError::Storage)?
+        .map_err(|error| {
+            if is_transient_identifier_write_conflict(&error) {
+                ReferenceError::TransientConflict
+            } else {
+                ReferenceError::Storage
+            }
+        })?
         .ok_or(ReferenceError::Storage)?;
     let sequence = match updated.get("sequence") {
         Some(mongodb::bson::Bson::Int32(value)) => i64::from(*value),
@@ -426,7 +448,14 @@ pub async fn inspect_identifier_indexes(
 
     for requirement in identifier_index_models() {
         let collection = db.collection::<Document>(requirement.collection);
-        let listed = list_index_models(&collection).await?;
+        let listed = match list_index_models(&collection).await {
+            Ok(listed) => listed,
+            Err(error) if is_namespace_not_found(&error) => {
+                missing.push(requirement.name.to_string());
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         match listed.iter().find(|model| {
             model
                 .options
@@ -585,6 +614,15 @@ pub async fn apply_identifier_indexes(
     }
     clear_identifier_index_cache_for_tests();
     Ok(())
+}
+
+fn is_namespace_not_found(error: &mongodb::error::Error) -> bool {
+    is_namespace_not_found_text(&format!("{error:?}"))
+}
+
+fn is_namespace_not_found_text(haystack: &str) -> bool {
+    let haystack = haystack.to_lowercase();
+    haystack.contains("namespacenotfound") || haystack.contains("ns does not exist")
 }
 
 async fn list_index_models(
@@ -844,6 +882,13 @@ mod tests {
     }
 
     #[test]
+    fn namespace_not_found_classifier_matches_mongo_missing_collection() {
+        assert!(is_namespace_not_found_text(
+            "Kind: Command failed: Error code 26 (NamespaceNotFound): ns does not exist: webtopup_task14_dev.identifiercounters"
+        ));
+        assert!(!is_namespace_not_found_text("duplicate key error"));
+    }
+
     fn apply_is_allowed_only_for_exact_disposable_database() {
         assert!(apply_is_allowed("webtopup_task14_dev"));
         for name in [
@@ -915,6 +960,17 @@ mod tests {
     }
 
     #[test]
+    fn transient_identifier_conflicts_are_classified_for_retry() {
+        assert!(is_transient_identifier_write_conflict_text(
+            "WriteConflict error: WriteConflict caused by concurrent transaction"
+        ));
+        assert!(is_transient_identifier_write_conflict_text(
+            "Kind: Command failed, labels: { TransientTransactionError }"
+        ));
+        assert!(!is_transient_identifier_write_conflict_text("duplicate key error"));
+        assert_eq!(MAX_REFERENCE_ALLOCATION_ATTEMPTS, 8);
+    }
+
     fn invoice_retry_is_bounded_and_constraint_specific() {
         assert_eq!(MAX_INVOICE_CANDIDATES, 5);
         assert!(retry_invoice_candidate(0, DuplicateConstraint::InvoiceNumber));

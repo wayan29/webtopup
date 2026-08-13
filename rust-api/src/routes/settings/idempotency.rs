@@ -180,12 +180,20 @@ pub async fn ensure_site_config_foundation_indexes(
     Ok(())
 }
 
+fn is_namespace_not_found(error: &mongodb::error::Error) -> bool {
+    let haystack = format!("{error:?}").to_lowercase();
+    haystack.contains("namespacenotfound") || haystack.contains("ns does not exist")
+}
+
 async fn ensure_settings_key_unique(db: &Database) -> Result<(), SiteConfigClaimError> {
     let settings = db.collection::<Document>("settings");
-    let mut cursor = settings
-        .list_indexes()
-        .await
-        .map_err(|_| SiteConfigClaimError::IndexesNotReady)?;
+    let mut cursor = match settings.list_indexes().await {
+        Ok(cursor) => cursor,
+        Err(error) if is_namespace_not_found(&error) => {
+            return create_settings_key_index(&settings).await;
+        }
+        Err(_) => return Err(SiteConfigClaimError::IndexesNotReady),
+    };
     let mut found_compatible = false;
     while cursor
         .advance()
@@ -217,6 +225,12 @@ async fn ensure_settings_key_unique(db: &Database) -> Result<(), SiteConfigClaim
     if found_compatible {
         return Ok(());
     }
+    create_settings_key_index(&settings).await
+}
+
+async fn create_settings_key_index(
+    settings: &mongodb::Collection<Document>,
+) -> Result<(), SiteConfigClaimError> {
     settings
         .create_index(
             IndexModel::builder()

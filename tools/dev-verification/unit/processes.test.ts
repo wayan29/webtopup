@@ -3,7 +3,7 @@ import test from 'node:test';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { resolveServerHost } from '../../../server/src/config/serverHost.ts';
-import { assertDevicePolicyTarget, assertProcessesExited, assertVerificationHostPortsFree, buildHostChildEnv, devicePolicyRolloutEnv, financePolicyRolloutEnv, faultProfilePorts, faultProxyPort, hostProcessCommands, processIdentityMatches, sessionTestRolloutEnv, type OwnedProcess, type ObservedProcess } from '../processes.ts';
+import { assertDevicePolicyTarget, assertProcessesExited, assertVerificationHostPortsFree, buildHostChildEnv, devicePolicyRolloutEnv, financePolicyRolloutEnv, faultProfilePorts, faultProxyPort, hostProcessCommands, identifierReadinessApplyPlan, processIdentityMatches, sessionTestRolloutEnv, type OwnedProcess, type ObservedProcess } from '../processes.ts';
 
 test('server host preserves default and accepts loopback verification binding', () => {
   assert.equal(resolveServerHost({}), '0.0.0.0');
@@ -84,6 +84,41 @@ test('fault profile reserves and preflights all four host ports', () => {
   assert.equal(faultProxyPort({ rust: 19010 }), 19011);
   assert.deepEqual(faultProfilePorts({ node: 19005, rust: 19010, vite: 19006 }), [19005, 19010, 19006, 19011]);
   assert.throws(() => faultProxyPort({ rust: 65535 }), /port/);
+});
+
+test('identifier readiness apply plan is disposable-only and never logs credentials', async () => {
+  const root = '/repo';
+  const allowed = identifierReadinessApplyPlan({
+    root,
+    stateDir: '/repo/.dev-verification',
+    databaseName: 'webtopup_task14_dev',
+    mongoUri: 'mongodb://127.0.0.1:27018/webtopup_task14_dev?replicaSet=rs0&directConnection=true',
+    executable: '/repo/rust-api/target/debug/site_config_identifier_readiness',
+  });
+  assert.deepEqual(allowed, {
+    command: '/repo/rust-api/target/debug/site_config_identifier_readiness',
+    args: ['--apply'],
+    cwd: '/repo/rust-api',
+    envKeys: ['MONGO_URI', 'MONGO_DB'],
+  });
+  assert.throws(() => identifierReadinessApplyPlan({
+    root,
+    stateDir: '/repo/.dev-verification',
+    databaseName: 'webtopup',
+    mongoUri: 'mongodb://127.0.0.1:27018/webtopup?replicaSet=rs0&directConnection=true',
+    executable: '/repo/rust-api/target/debug/site_config_identifier_readiness',
+  }), /webtopup_task14_dev/);
+  assert.throws(() => identifierReadinessApplyPlan({
+    root,
+    stateDir: '/repo/.dev-verification',
+    databaseName: 'webtopup_task14_dev',
+    mongoUri: 'mongodb://127.0.0.1:27018/webtopup_task14_dev?replicaSet=rs0&directConnection=true',
+    executable: '/tmp/site_config_identifier_readiness',
+  }), /expected target binary/);
+  const source = await fs.readFile(path.resolve(import.meta.dirname, '..', 'processes.ts'), 'utf8');
+  assert.match(source, /await prepareDisposableIdentifierIndexes\(config\)/);
+  assert.match(source, /assertMarkedVerificationDatabaseReady\(config\)/);
+  assert.doesNotMatch(source, /allow-protected-database/);
 });
 
 test('bootstrap rejects any listener on verification host process ports', () => {

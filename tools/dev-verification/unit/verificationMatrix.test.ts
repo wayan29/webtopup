@@ -22,7 +22,28 @@ test('aggregate matrix names every required evidence group exactly once', () => 
   });
   assert.equal(matrix.find(({ name }) => name === 'finance-idempotency')?.profile, 'session-finance-fault');
   assert.equal(matrix.find(({ name }) => name === 'giveaway-atomic')?.profile, 'session-finance-policy');
+  assert.deepEqual(matrix.find(({ name }) => name === 'upload-security'), {
+    name: 'upload-security', required: true, profile: 'session-cs', isolated: true,
+    command: 'node', args: ['--import', 'tsx', '--test', 'tools/dev-verification/integration/uploadSecurity.test.ts'],
+  });
+  assert.deepEqual(matrix.find(({ name }) => name === 'identifier-integrity'), {
+    name: 'identifier-integrity', required: true, profile: 'session-device-policy', isolated: true,
+    command: 'node', args: ['--import', 'tsx', '--test', 'tools/dev-verification/integration/identifierIntegrity.test.ts'],
+  });
+  assert.deepEqual(matrix.find(({ name }) => name === 'site-config-foundation'), {
+    name: 'site-config-foundation', required: true, profile: 'session-cs-fault', isolated: true,
+    command: 'node', args: ['--import', 'tsx', '--test', 'tools/dev-verification/integration/siteConfigFoundation.test.ts'],
+  });
+  assert.deepEqual(matrix.find(({ name }) => name === 'site-config-foundation-desktop'), {
+    name: 'site-config-foundation-desktop', required: true, profile: 'session-cs-fault', isolated: true,
+    command: 'npx', args: ['playwright', 'test', '--config', 'tools/dev-verification/playwright.config.ts', 'site-config-foundation.spec.ts', '--project=chromium-desktop', '--workers=1'],
+  });
+  assert.deepEqual(matrix.find(({ name }) => name === 'site-config-foundation-mobile'), {
+    name: 'site-config-foundation-mobile', required: true, profile: 'session-cs-fault', isolated: true,
+    command: 'npx', args: ['playwright', 'test', '--config', 'tools/dev-verification/playwright.config.ts', 'site-config-foundation.spec.ts', '--project=chromium-mobile', '--workers=1'],
+  });
   assert.equal(matrix.find(({ name }) => name === 'rollout-transition')?.profile, 'self-managed');
+  assert.equal(matrix.at(-1)?.name, 'stopped-state');
   assert.equal(matrix.at(-1)?.profile, 'stopped');
   assert.ok(matrix.filter(({ profile }) => profile === 'session-cs' || profile === 'session-device-policy').every(({ isolated }) => isolated));
 });
