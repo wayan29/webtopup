@@ -108,6 +108,14 @@ fn storage_error(_: mongodb::error::Error) -> RegistryError {
     RegistryError::Storage
 }
 
+async fn abort_preserving(
+    session: &mut ClientSession,
+    error: RegistryError,
+) -> RegistryError {
+    let _ = session.abort_transaction().await;
+    error
+}
+
 pub fn managed_asset_index_models() -> Vec<IndexModel> {
     fn model(keys: Document, unique: bool) -> IndexModel {
         IndexModel::builder()
@@ -337,7 +345,7 @@ pub async fn acquire_slider_reference(
         ReferenceAction::Acquire,
     )?;
     let reference_id = ObjectId::new();
-    references
+    if let Err(error) = references
         .insert_one(doc! {
             "_id": reference_id,
             "assetId": asset_id,
@@ -349,14 +357,15 @@ pub async fn acquire_slider_reference(
         })
         .session(&mut *session)
         .await
-        .map_err(|error| {
-            if is_duplicate_key(&error) {
-                RegistryError::ReferenceMismatch
-            } else {
-                RegistryError::Storage
-            }
-        })?;
-    let result = assets
+    {
+        let mapped = if is_duplicate_key(&error) {
+            RegistryError::ReferenceMismatch
+        } else {
+            RegistryError::Storage
+        };
+        return Err(abort_preserving(session, mapped).await);
+    }
+    let result = match assets
         .update_one(
             doc! {
                 "_id": asset_id,
@@ -372,9 +381,12 @@ pub async fn acquire_slider_reference(
         )
         .session(&mut *session)
         .await
-        .map_err(storage_error)?;
+    {
+        Ok(result) => result,
+        Err(error) => return Err(abort_preserving(session, storage_error(error)).await),
+    };
     if result.modified_count != 1 {
-        return Err(RegistryError::Unavailable);
+        return Err(abort_preserving(session, RegistryError::Unavailable).await);
     }
     Ok(ManagedReferenceOutcome {
         asset_id,
@@ -402,8 +414,10 @@ pub async fn release_slider_reference(
         .get_object_id("_id")
         .map_err(|_| RegistryError::Storage)?;
     let expected_count = document_i64(&asset, "referenceCount")?;
-    let deleted = references
-        .delete_one(doc! {
+    // find_one_and_delete returns the deleted document (the MongoDB operation is inherently
+    // the "before" image; unlike find_one_and_update it has no after-image mode).
+    let deleted = match references
+        .find_one_and_delete(doc! {
             "assetId": asset_id,
             "canonicalPath": path,
             "resourceType": "slider",
@@ -412,16 +426,24 @@ pub async fn release_slider_reference(
         })
         .session(&mut *session)
         .await
-        .map_err(storage_error)?;
-    if deleted.deleted_count != 1 {
-        return Err(RegistryError::ReferenceMismatch);
-    }
-    let next_count = reference_transition(
+    {
+        Ok(Some(document)) => document,
+        Ok(None) => return Err(RegistryError::ReferenceMismatch),
+        Err(error) => return Err(abort_preserving(session, storage_error(error)).await),
+    };
+    let reference_id = match deleted.get_object_id("_id") {
+        Ok(reference_id) => reference_id,
+        Err(_) => return Err(abort_preserving(session, RegistryError::Storage).await),
+    };
+    let next_count = match reference_transition(
         ManagedAssetState::Available,
         expected_count,
         ReferenceAction::Release,
-    )?;
-    let result = assets
+    ) {
+        Ok(next_count) => next_count,
+        Err(error) => return Err(abort_preserving(session, error).await),
+    };
+    let result = match assets
         .update_one(
             doc! {
                 "_id": asset_id,
@@ -436,13 +458,16 @@ pub async fn release_slider_reference(
         )
         .session(&mut *session)
         .await
-        .map_err(storage_error)?;
+    {
+        Ok(result) => result,
+        Err(error) => return Err(abort_preserving(session, storage_error(error)).await),
+    };
     if result.modified_count != 1 {
-        return Err(RegistryError::Unavailable);
+        return Err(abort_preserving(session, RegistryError::Unavailable).await);
     }
     Ok(ManagedReferenceOutcome {
         asset_id,
-        reference_id: ObjectId::new(),
+        reference_id,
         reference_count: next_count,
     })
 }
