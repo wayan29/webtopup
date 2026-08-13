@@ -79,6 +79,21 @@ test('upload security rejects spoofed content and accepts canonical images throu
     assert.match(String(ok.body?.url || ''), /^\/uploads\/icons\//);
     created.push(String(ok.body.filename));
 
+    const canonicalUrl = String(ok.body.url);
+    const managed = await db.collection('managedassets').findOne({ canonicalPath: canonicalUrl });
+    assert.ok(managed, `managed asset row missing for ${canonicalUrl}`);
+    assert.equal(managed.state, 'available');
+    assert.equal(managed.referenceCount, 0);
+    assert.equal(managed.folder, 'icons');
+    assert.equal(managed.filename, ok.body.filename);
+    assert.equal(managed.format, 'png');
+    assert.equal(managed.width, 1);
+    assert.equal(managed.height, 1);
+    const uploadPath = path.join(root, 'uploads', 'icons', String(ok.body.filename));
+    const publishedBytes = await fs.readFile(uploadPath);
+    assert.ok(publishedBytes.length > 0);
+    assert.equal(managed.size, publishedBytes.length);
+
     const batch = await multipartBatch(`${nodeBase}/api/v2/upload/multiple?type=icons`, headers, [
       { filename: 'ok2.png', contentType: 'image/png', bytes: PNG_1X1 },
       { filename: 'bad.png', contentType: 'image/png', bytes: Buffer.from('not-an-image') },

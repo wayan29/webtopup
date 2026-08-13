@@ -88,12 +88,19 @@ pub enum RegistryError {
     PathInvalid,
     AlreadyDeleting,
     Storage,
+    /// Transaction abort failed after an operation error, so row absence cannot be proven.
+    TransactionAbortFailed,
+    /// The transaction commit result is unknown; published files must be retained for
+    /// reconciliation because the server may already have committed the registry rows.
+    AmbiguousCommit,
 }
 
 impl RegistryError {
     pub fn code(self) -> &'static str {
         match self {
-            Self::Unavailable => "MANAGED_ASSET_REGISTRY_UNAVAILABLE",
+            Self::Unavailable
+            | Self::TransactionAbortFailed
+            | Self::AmbiguousCommit => "MANAGED_ASSET_REGISTRY_UNAVAILABLE",
             Self::NotFound => "MANAGED_ASSET_NOT_FOUND",
             Self::ReferenceMismatch => "MANAGED_ASSET_REFERENCE_MISMATCH",
             Self::ReferenceUnderflow => "MANAGED_ASSET_REFERENCE_UNDERFLOW",
@@ -101,6 +108,13 @@ impl RegistryError {
             Self::AlreadyDeleting => "MANAGED_ASSET_ALREADY_DELETING",
             Self::Storage => "MANAGED_ASSET_STORAGE_FAILURE",
         }
+    }
+
+    pub fn requires_reconciliation(self) -> bool {
+        matches!(
+            self,
+            Self::TransactionAbortFailed | Self::AmbiguousCommit
+        )
     }
 }
 
@@ -112,8 +126,10 @@ async fn abort_preserving(
     session: &mut ClientSession,
     error: RegistryError,
 ) -> RegistryError {
-    let _ = session.abort_transaction().await;
-    error
+    match session.abort_transaction().await {
+        Ok(()) => error,
+        Err(_) => RegistryError::TransactionAbortFailed,
+    }
 }
 
 pub fn managed_asset_index_models() -> Vec<IndexModel> {
@@ -196,6 +212,14 @@ fn is_safe_filename(filename: &str) -> bool {
         && filename.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
         })
+}
+
+fn validate_slider_reference_path(path: &str) -> Result<(&str, &str), RegistryError> {
+    let (folder, filename) = canonical_managed_path(path)?;
+    if folder != "covers" {
+        return Err(RegistryError::PathInvalid);
+    }
+    Ok((folder, filename))
 }
 
 fn asset_document(
@@ -296,27 +320,36 @@ pub async fn register_published_batch_in_transaction(
         let asset_id = ObjectId::new();
         let document = match asset_document(asset_id, registration, DateTime::now()) {
             Ok(document) => document,
-            Err(error) => {
-                let _ = session.abort_transaction().await;
-                return Err(error);
-            }
+            Err(error) => return Err(abort_preserving(&mut session, error).await),
         };
         if let Err(error) = assets.insert_one(document).session(&mut session).await {
-            let _ = session.abort_transaction().await;
-            return Err(if is_duplicate_key(&error) {
+            let mapped = if is_duplicate_key(&error) {
                 RegistryError::ReferenceMismatch
             } else {
                 RegistryError::Storage
-            });
+            };
+            return Err(abort_preserving(&mut session, mapped).await);
         }
         ids.push(asset_id);
     }
 
-    session
-        .commit_transaction()
-        .await
-        .map_err(|_| RegistryError::Unavailable)?;
-    Ok(ids)
+    match session.commit_transaction().await {
+        Ok(()) => Ok(ids),
+        Err(error) if error.contains_label(mongodb::error::UNKNOWN_TRANSACTION_COMMIT_RESULT) => {
+            // The commit may already be durable. Do not issue a compensating abort or imply that
+            // the registry is definitely empty; callers retain published files for reconciliation.
+            Err(RegistryError::AmbiguousCommit)
+        }
+        Err(_) => {
+            // A pre-commit transaction error is rolled back explicitly. The caller may then
+            // safely remove the files that were published for this batch only when the abort is
+            // acknowledged; otherwise retain them for reconciliation.
+            match session.abort_transaction().await {
+                Ok(()) => Err(RegistryError::Unavailable),
+                Err(_) => Err(RegistryError::TransactionAbortFailed),
+            }
+        }
+    }
 }
 
 pub async fn acquire_slider_reference(
@@ -325,7 +358,7 @@ pub async fn acquire_slider_reference(
     path: &str,
     slider_id: ObjectId,
 ) -> Result<ManagedReferenceOutcome, RegistryError> {
-    canonical_managed_path(path)?;
+    validate_slider_reference_path(path)?;
     let assets = db.collection::<Document>(MANAGED_ASSETS_COLLECTION);
     let references = db.collection::<Document>(MANAGED_ASSET_REFERENCES_COLLECTION);
     let asset = assets
@@ -404,7 +437,7 @@ pub async fn release_slider_reference(
     path: &str,
     slider_id: ObjectId,
 ) -> Result<ManagedReferenceOutcome, RegistryError> {
-    canonical_managed_path(path)?;
+    validate_slider_reference_path(path)?;
     let assets = db.collection::<Document>(MANAGED_ASSETS_COLLECTION);
     let references = db.collection::<Document>(MANAGED_ASSET_REFERENCES_COLLECTION);
     let asset = assets
@@ -664,6 +697,64 @@ mod tests {
             "https://example.test/example.webp",
         ] {
             assert!(canonical_managed_path(path).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn slider_reference_paths_reject_non_covers_folders() {
+        assert!(validate_slider_reference_path("/uploads/covers/example.webp").is_ok());
+        for folder in ["icons", "popups", "instructions"] {
+            assert_eq!(
+                validate_slider_reference_path(&format!("/uploads/{folder}/example.webp"))
+                    .unwrap_err(),
+                RegistryError::PathInvalid,
+                "slider references must reject {folder} assets"
+            );
+        }
+    }
+
+    #[test]
+    fn registration_documents_preserve_metadata_with_one_row_per_upload() {
+        let now = DateTime::now();
+        let registrations = [
+            PublishedAssetRegistration {
+                url: "/uploads/icons/first.png".to_string(),
+                filename: "first.png".to_string(),
+                path: PathBuf::from("/uploads-root/icons/first.png"),
+                metadata: CanonicalImageMetadata {
+                    format: "png".to_string(),
+                    width: 2,
+                    height: 3,
+                    byte_length: 17,
+                },
+            },
+            PublishedAssetRegistration {
+                url: "/uploads/icons/second.webp".to_string(),
+                filename: "second.webp".to_string(),
+                path: PathBuf::from("/uploads-root/icons/second.webp"),
+                metadata: CanonicalImageMetadata {
+                    format: "webp".to_string(),
+                    width: 4,
+                    height: 5,
+                    byte_length: 29,
+                },
+            },
+        ];
+        let rows = registrations
+            .iter()
+            .map(|registration| asset_document(ObjectId::new(), registration, now).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(rows.len(), registrations.len());
+        for (row, registration) in rows.iter().zip(registrations.iter()) {
+            assert_eq!(row.get_str("canonicalPath").unwrap(), registration.url);
+            assert_eq!(row.get_str("filename").unwrap(), registration.filename);
+            assert_eq!(row.get_str("format").unwrap(), registration.metadata.format);
+            assert_eq!(row.get_i64("size").unwrap(), registration.metadata.byte_length as i64);
+            assert_eq!(row.get_i64("width").unwrap(), registration.metadata.width as i64);
+            assert_eq!(row.get_i64("height").unwrap(), registration.metadata.height as i64);
+            assert_eq!(row.get_i64("referenceCount").unwrap(), 0);
+            assert_eq!(row.get_str("state").unwrap(), AVAILABLE);
         }
     }
 }

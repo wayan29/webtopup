@@ -48,27 +48,40 @@ pub struct PublishedUpload {
 pub enum UploadStorageError {
     Failed,
     RegistryUnavailable,
+    /// The registry commit result is unknown. Published files are intentionally retained so a
+    /// later reconciliation can determine whether the corresponding rows committed.
+    RegistryReconciliationRequired,
 }
 
 impl UploadStorageError {
     pub fn code(self) -> &'static str {
         match self {
             Self::Failed => "UPLOAD_STORAGE_FAILED",
-            Self::RegistryUnavailable => "MANAGED_ASSET_REGISTRY_UNAVAILABLE",
+            Self::RegistryUnavailable | Self::RegistryReconciliationRequired => {
+                "MANAGED_ASSET_REGISTRY_UNAVAILABLE"
+            }
         }
     }
 
     pub fn message(self) -> &'static str {
         match self {
             Self::Failed => "Gagal menyimpan file upload",
-            Self::RegistryUnavailable => "Registry aset terkelola tidak tersedia",
+            Self::RegistryUnavailable | Self::RegistryReconciliationRequired => {
+                "Registry aset terkelola tidak tersedia"
+            }
         }
+    }
+
+    pub fn requires_reconciliation(self) -> bool {
+        matches!(self, Self::RegistryReconciliationRequired)
     }
 
     fn status(self) -> StatusCode {
         match self {
             Self::Failed => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::RegistryUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::RegistryUnavailable | Self::RegistryReconciliationRequired => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
         }
     }
 }
@@ -239,7 +252,12 @@ where
     Fut: Future<Output = Result<(), RegistryError>>,
 {
     let published = publish_batch(staged)?;
-    if register(&published).await.is_err() {
+    if let Err(error) = register(&published).await {
+        if error.requires_reconciliation() {
+            // An UnknownTransactionCommitResult means the server may have committed the rows.
+            // Unlinking here could leave durable registry metadata pointing at missing bytes.
+            return Err(UploadStorageError::RegistryReconciliationRequired);
+        }
         rollback_published_files(&published)?;
         return Err(UploadStorageError::RegistryUnavailable);
     }
@@ -374,6 +392,26 @@ mod tests {
         .await;
         assert_eq!(result.unwrap_err().code(), "MANAGED_ASSET_REGISTRY_UNAVAILABLE");
         assert!(public_batch_files_in(&root, "covers").is_empty());
+        assert!(private_stage_files(&root).is_empty());
+        if let Some(base) = root.parent() {
+            let _ = fs::remove_dir_all(base);
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_registry_commit_fails_closed_and_retains_published_files_for_reconciliation() {
+        let root = fixture_root();
+        let staged = valid_staged(&root, "covers");
+        let result = publish_and_register_batch(vec![staged], |_uploads| async {
+            Err(RegistryError::AmbiguousCommit)
+        })
+        .await;
+        let error = result.unwrap_err();
+        assert_eq!(error.code(), "MANAGED_ASSET_REGISTRY_UNAVAILABLE");
+        assert!(error.requires_reconciliation());
+        let files = public_batch_files_in(&root, "covers");
+        assert_eq!(files.len(), 1);
+        assert!(files[0].is_file());
         assert!(private_stage_files(&root).is_empty());
         if let Some(base) = root.parent() {
             let _ = fs::remove_dir_all(base);
