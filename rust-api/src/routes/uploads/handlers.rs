@@ -7,7 +7,10 @@ use axum::{
 };
 use crate::{
     security::{require_any_permission, ErrorResponse},
-    services::managed_assets::{count_asset_references, normalize_managed_asset},
+    services::{
+        managed_asset_registry::register_published_batch_in_transaction,
+        managed_assets::{count_asset_references, normalize_managed_asset},
+    },
     state::AppState,
 };
 
@@ -16,7 +19,7 @@ use super::{
         validate_and_reencode_image, ImagePolicyError, MAX_UPLOAD_BATCH_BYTES,
         MAX_UPLOAD_BATCH_FILES, MAX_UPLOAD_BYTES,
     },
-    publication::{publish_batch, stage_canonical_image, UploadStorageError},
+    publication::{stage_canonical_image, UploadStorageError},
     storage::{list_uploaded_files, upload_root},
     types::{
         AssetInUseErrorBody, AssetInUseErrorEnvelope, UploadDeleteQuery, UploadDeleteResponse,
@@ -78,7 +81,7 @@ pub async fn upload_file(
             Ok(staged) => staged,
             Err(error) => return error.into_response(),
         };
-        let published = match publish_batch(vec![staged]) {
+        let published = match publish_and_register_with_state(&state, vec![staged]).await {
             Ok(published) => published,
             Err(error) => return error.into_response(),
         };
@@ -152,7 +155,7 @@ pub async fn upload_multiple(
         );
     }
 
-    match publish_batch(staged_items) {
+    match publish_and_register_with_state(&state, staged_items).await {
         Ok(published) => Json(UploadMultipleResponse {
             success: true,
             files: published
@@ -241,6 +244,31 @@ pub async fn delete_file(
         .into_response(),
         Err(_) => status_message(axum::http::StatusCode::NOT_FOUND, "File not found"),
     }
+}
+
+async fn publish_and_register_with_state(
+    state: &AppState,
+    staged: Vec<super::publication::StagedUpload>,
+) -> Result<Vec<super::publication::PublishedUpload>, UploadStorageError> {
+    let Some(client) = state.mongo_client.as_ref() else {
+        return Err(UploadStorageError::RegistryUnavailable);
+    };
+    if !state.mongo_transactions_enabled {
+        return Err(UploadStorageError::RegistryUnavailable);
+    }
+    let db = client.database(&state.mongo_db);
+    super::publication::publish_and_register_batch(staged, move |published| {
+        let registrations = published
+            .iter()
+            .map(super::publication::PublishedUpload::registry_registration)
+            .collect::<Vec<_>>();
+        async move {
+            register_published_batch_in_transaction(&db, &registrations)
+                .await
+                .map(|_| ())
+        }
+    })
+    .await
 }
 
 async fn read_bounded_field(

@@ -49,6 +49,21 @@ pub struct CanonicalImage {
     pub height: u32,
 }
 
+impl CanonicalImage {
+    /// Convert policy output into the durable metadata stored with a published asset.
+    ///
+    /// This deliberately derives size from the canonical bytes, rather than the client payload,
+    /// so registry rows describe exactly what was published to the filesystem.
+    pub fn registry_metadata(&self) -> crate::services::managed_asset_registry::CanonicalImageMetadata {
+        crate::services::managed_asset_registry::CanonicalImageMetadata {
+            format: self.format.extension().to_string(),
+            width: self.width,
+            height: self.height,
+            byte_length: self.bytes.len() as u64,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImagePolicyError {
     UploadTooLarge,

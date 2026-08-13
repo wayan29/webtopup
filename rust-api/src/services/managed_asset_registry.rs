@@ -180,7 +180,10 @@ pub fn canonical_managed_path(path: &str) -> Result<(&str, &str), RegistryError>
     let mut parts = remainder.split('/');
     let folder = parts.next().ok_or(RegistryError::PathInvalid)?;
     let filename = parts.next().ok_or(RegistryError::PathInvalid)?;
-    if parts.next().is_some() || folder != "covers" || !is_safe_filename(filename) {
+    if parts.next().is_some()
+        || !matches!(folder, "icons" | "covers" | "popups" | "instructions")
+        || !is_safe_filename(filename)
+    {
         return Err(RegistryError::PathInvalid);
     }
     Ok((folder, filename))
@@ -649,9 +652,12 @@ mod tests {
 
     #[test]
     fn canonical_folder_and_path_checks_are_strict() {
-        assert!(canonical_managed_path("/uploads/covers/example.webp").is_ok());
+        for folder in ["icons", "covers", "popups", "instructions"] {
+            assert!(
+                canonical_managed_path(&format!("/uploads/{folder}/example.webp")).is_ok()
+            );
+        }
         for path in [
-            "/uploads/icons/example.webp",
             "/uploads/covers/../example.webp",
             "/uploads/covers/a/b.webp",
             "/uploads/covers/%2e%2e.webp",
