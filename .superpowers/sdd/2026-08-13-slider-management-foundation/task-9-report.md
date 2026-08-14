@@ -69,3 +69,22 @@ Added focused pure RED seams for immediate pre-transaction step-up claim resumpt
 - `git diff --check`: passed.
 
 Residual live Mongo risks remain: claim reclaim races, transaction proof under replica-set failover, managed-reference swap behavior, and correlation values from live trusted gateway spans were not exercised; no services were started.
+
+## Fix round 3
+
+### RED evidence
+
+Added focused source-contract tests for transaction-probe ordering, exact probe failure mapping, unresolved fenced-claim recovery, and step-up claim-transition handling. The first focused run failed to compile because the new probe error seam was absent (and the route contract include path was initially incorrect); these were the intended RED failures before implementation.
+
+### GREEN implementation
+
+- E: create/update now run a real session-bound, snapshot read-only Mongo transaction probe with majority abort before initial slider reads, normalization, claim creation, or any mutation work. Probe failures map to exact `503 SLIDER_TRANSACTIONS_UNAVAILABLE`.
+- F: durable start-fence reads use majority concern; missing/ambiguous timestamps perform bounded read-only recovery and return exact `503 SLIDER_COMMIT_UNKNOWN`, conditionally marking unknown only when a start fence is proven. The unresolved path cannot retry execution or return `SLIDER_CLAIM_FENCE_LOST`.
+- G: missing trusted step-up proof now checks `mark_slider_step_up_required`; failed transitions fail closed with a `503` claim/fence error, while successful transitions preserve `403 AUTH_STEP_UP_REQUIRED` and immediate same-key resume.
+
+### Fix-round 3 validation
+
+- `cd rust-api && cargo test slider_mutation_create -- --nocapture`: passed (focused source/policy tests; build clean).
+- Remaining required focused suites and final check/commit are pending.
+
+Residual live Mongo risks: replica-set transaction support and snapshot-read probe behavior, majority read visibility during failover, bounded recovery timing, and claim-transition races were not exercised against live services; no services were started.

@@ -11,7 +11,7 @@ use axum::{
 };
 use mongodb::{
     bson::{doc, oid::ObjectId, Bson, DateTime, Document},
-    options::UpdateOptions,
+    options::{ReadConcern, UpdateOptions, WriteConcern},
     ClientSession, Database,
 };
 use serde_json::{json, Value};
@@ -34,7 +34,8 @@ use super::{
     mark_slider_commit_unknown_conditionally, mark_slider_step_up_required,
     mark_slider_transaction_started,
     normalize_create, normalize_update, normalize_slider_claim_binding, preallocate_slider_recovery_ids,
-    recover_slider_commit, store_recovery_identifiers, verify_slider_claim_fence_in_session,
+    read_slider_transaction_started_at, recover_slider_commit, store_recovery_identifiers,
+    verify_slider_claim_fence_in_session,
     SliderAction, SliderClaimBegin, SliderClaimBinding, SliderClaimError, SliderCommitRecovery,
     SliderCreateRequest, SliderSnapshotItem, SliderUpdateRequest, SliderAdminSnapshot,
     SLIDER_MUTATION_CONTRACT, SLIDER_METADATA_COLLECTION, MAX_CURRENT_SLIDERS, MAX_PUBLIC_SLIDERS,
@@ -102,6 +103,9 @@ pub async fn execute_slider_mutation(
         return mutation_error(StatusCode::METHOD_NOT_ALLOWED, "SLIDER_ACTION_NOT_IMPLEMENTED", "Aksi slider belum tersedia");
     }
     let db = client.database(&state.mongo_db);
+    if probe_slider_transaction_capability(&db).await.is_err() {
+        return transaction_unavailable();
+    }
 
     // Normalize against an initial read solely to construct the claim binding. The authoritative
     // read-only transaction below repeats this work and is the source of truth.
@@ -161,15 +165,25 @@ pub async fn execute_slider_mutation(
         if let Err(response) = require_trusted_step_up_group(&headers, SENSITIVE_GROUP) {
             // Keep the permanent claim, but explicitly return it to an immediate pre-transaction
             // retry state. No transaction fence, commitUnknown, or frozen result is written.
-            let _ = mark_slider_step_up_required(
+            match mark_slider_step_up_required(
                 &db,
                 claim_id,
                 &claim_token,
                 &binding,
                 lease_generation,
             )
-            .await;
-            return response;
+            .await
+            {
+                Ok(true) => return response,
+                Ok(false) => {
+                    return mutation_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "SLIDER_CLAIM_FENCE_LOST",
+                        "Klaim mutasi slider tidak dapat diamankan",
+                    )
+                }
+                Err(error) => return claim_error_response(error),
+            }
         }
     }
 
@@ -180,9 +194,27 @@ pub async fn execute_slider_mutation(
     if !mark_slider_transaction_started(&db, claim_id, &claim_token, &binding, lease_generation, &recovery_ids).await.unwrap_or(false) {
         return mutation_error(StatusCode::SERVICE_UNAVAILABLE, "SLIDER_CLAIM_FENCE_LOST", "Klaim mutasi slider tidak dapat diamankan");
     }
-    let started_at = match db.collection::<Document>(super::SLIDER_IDEMPOTENCY_CLAIMS_COLLECTION).find_one(doc! {"_id": claim_id}).await {
-        Ok(Some(claim)) => match claim.get_datetime("transactionStartedAt") { Ok(value) => *value, Err(_) => return recover_or_commit_unknown_from_claim(&db, claim_id, &claim_token, &binding, lease_generation, &recovery_ids).await },
-        _ => return recover_or_commit_unknown_from_claim(&db, claim_id, &claim_token, &binding, lease_generation, &recovery_ids).await,
+    let started_at = match read_slider_transaction_started_at(
+        &db,
+        claim_id,
+        &claim_token,
+        &binding,
+        lease_generation,
+    )
+    .await
+    {
+        Ok(Some(value)) => value,
+        Ok(None) | Err(_) => {
+            return recover_or_commit_unknown_from_claim(
+                &db,
+                claim_id,
+                &claim_token,
+                &binding,
+                lease_generation,
+                &recovery_ids,
+            )
+            .await
+        }
     };
 
     let mut session = match client.start_session().await {
@@ -274,6 +306,30 @@ fn normalize_input(action: SliderAction, payload: Value, current: Option<&Docume
         }
         _ => Err(mutation_error(StatusCode::METHOD_NOT_ALLOWED, "SLIDER_ACTION_NOT_IMPLEMENTED", "Aksi slider belum tersedia")),
     }
+}
+
+/// Verify that this Mongo deployment can execute a real read-only transaction before any
+/// request-derived read, normalization, claim, or mutation work begins.  The transaction is
+/// intentionally aborted after session-bound reads; it never creates a collection or writes data.
+async fn probe_slider_transaction_capability(db: &Database) -> Result<(), ()> {
+    let mut session = db.client().start_session().await.map_err(|_| ())?;
+    session
+        .start_transaction()
+        .read_concern(ReadConcern::snapshot())
+        .write_concern(WriteConcern::majority())
+        .await
+        .map_err(|_| ())?;
+    db.collection::<Document>(SLIDER_METADATA_COLLECTION)
+        .find_one(doc! { "_id": "global" })
+        .session(&mut session)
+        .await
+        .map_err(|_| ())?;
+    db.collection::<Document>("sliders")
+        .find_one(doc! { "_id": { "$exists": true } })
+        .session(&mut session)
+        .await
+        .map_err(|_| ())?;
+    session.abort_transaction().await.map_err(|_| ())
 }
 
 async fn authoritative_preflight(db: &Database, action: SliderAction, target: Option<ObjectId>, input: &MutationInput, _initial: Option<&Document>) -> Result<Preflight, Response> {
@@ -540,14 +596,33 @@ async fn recover_or_commit_unknown_from_claim(
     generation: u64,
     ids: &super::SliderRecoveryIdentifiers,
 ) -> Response {
-    if let Ok(SliderCommitRecovery::Completed { status, body, .. }) = recover_slider_commit(
-        db, claim_id, token, binding, generation, ids,
+    // Recovery is read-only and bounded. A missing/ambiguous start timestamp cannot prove that
+    // the claim was pre-transaction, so this path must never return a retry/fence-loss response.
+    for _ in 0..2 {
+        match recover_slider_commit(db, claim_id, token, binding, generation, ids).await {
+            Ok(SliderCommitRecovery::Completed { status, body, .. }) => {
+                return (StatusCode::from_u16(status).unwrap_or(StatusCode::OK), Json(body))
+                    .into_response();
+            }
+            Ok(SliderCommitRecovery::CommitUnknown) | Err(_) => {}
+        }
+    }
+    if let Ok(Some(started_at)) = read_slider_transaction_started_at(
+        db, claim_id, token, binding, generation,
     )
     .await
     {
-        return (StatusCode::from_u16(status).unwrap_or(StatusCode::OK), Json(body)).into_response();
+        // Conditional fencing prevents a stale recovery worker from changing a completed claim.
+        let _ = mark_slider_commit_unknown_conditionally(
+            db, claim_id, token, binding, generation, started_at,
+        )
+        .await;
     }
-    mutation_error(StatusCode::SERVICE_UNAVAILABLE, "SLIDER_CLAIM_FENCE_LOST", "Klaim mutasi slider tidak dapat diamankan")
+    mutation_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "SLIDER_COMMIT_UNKNOWN",
+        "Status mutasi slider belum dapat dipastikan",
+    )
 }
 
 async fn recover_or_commit_unknown(
@@ -575,16 +650,75 @@ async fn is_registered_asset(db:&Database, session:&mut ClientSession, path:&str
 
 async fn commit_unknown_response(db:&Database, claim_id:ObjectId, token:&str, binding:&SliderClaimBinding, generation:u64, started_at:DateTime)->Response { let _=mark_slider_commit_unknown_conditionally(db,claim_id,token,binding,generation,started_at).await; mutation_error(StatusCode::SERVICE_UNAVAILABLE,"SLIDER_COMMIT_UNKNOWN","Status mutasi slider belum dapat dipastikan") }
 fn policy_error_response(error: super::SliderPolicyError)->Response { mutation_error(StatusCode::BAD_REQUEST,error.code(),error.message()) }
-fn claim_error_response(error: SliderClaimError)->Response { let status=match error {SliderClaimError::InvalidKey=>StatusCode::BAD_REQUEST,SliderClaimError::Fenced=>StatusCode::SERVICE_UNAVAILABLE,SliderClaimError::IndexesNotReady=>StatusCode::SERVICE_UNAVAILABLE,_=>StatusCode::INTERNAL_SERVER_ERROR}; mutation_error(status,error.code(),"Klaim mutasi slider tidak tersedia") }
+fn claim_error_response(error: SliderClaimError)->Response { let status=match error {SliderClaimError::InvalidKey=>StatusCode::BAD_REQUEST,SliderClaimError::Fenced|SliderClaimError::IndexesNotReady|SliderClaimError::Storage=>StatusCode::SERVICE_UNAVAILABLE,_=>StatusCode::INTERNAL_SERVER_ERROR}; mutation_error(status,error.code(),"Klaim mutasi slider tidak tersedia") }
 fn registry_error_response(error: RegistryError)->Response { mutation_error(StatusCode::SERVICE_UNAVAILABLE,error.code(),"Managed asset registry tidak tersedia") }
 fn transaction_unavailable()->Response { mutation_error(StatusCode::SERVICE_UNAVAILABLE,"SLIDER_TRANSACTIONS_UNAVAILABLE","Transaksi slider tidak tersedia") }
 fn internal_mutation_error()->Response { mutation_error(StatusCode::INTERNAL_SERVER_ERROR,"SLIDER_MUTATION_FAILED","Mutasi slider gagal") }
 fn mutation_error(status:StatusCode,code:&'static str,message:&'static str)->Response {(status,Json(json!({"error":{"code":code,"message":message},"replayed":false}))).into_response()}
 pub(crate) fn mutation_error_code_for_test()->&'static str { "SLIDER_TRANSACTIONS_UNAVAILABLE" }
+pub(crate) fn transaction_probe_failure_code_for_test()->&'static str { "SLIDER_TRANSACTIONS_UNAVAILABLE" }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn slider_transaction_probe_is_before_initial_read_normalization_and_claim() {
+        let source = include_str!("slider_mutation.rs");
+        let probe = source
+            .find("probe_slider_transaction_capability(&db)")
+            .expect("mutation must probe Mongo transactions");
+        let initial_read = source
+            .find("load_initial_state(&db")
+            .expect("mutation must retain the initial state seam");
+        let normalization = source
+            .find("normalize_input(action")
+            .expect("mutation must normalize after probing");
+        let claim = source
+            .find("begin_slider_claim(&db")
+            .expect("mutation must claim after probing");
+        assert!(probe < initial_read);
+        assert!(probe < normalization);
+        assert!(probe < claim);
+    }
+
+    #[test]
+    fn transaction_probe_failure_maps_to_exact_unavailable_error() {
+        assert_eq!(transaction_probe_failure_code_for_test(), "SLIDER_TRANSACTIONS_UNAVAILABLE");
+        assert_eq!(StatusCode::SERVICE_UNAVAILABLE.as_u16(), 503);
+    }
+
+    #[test]
+    fn unresolved_start_timestamp_recovery_returns_commit_unknown_not_fence_lost() {
+        let source = include_str!("slider_mutation.rs");
+        let recovery = source
+            .find("async fn recover_or_commit_unknown_from_claim")
+            .expect("missing start timestamp must have bounded recovery");
+        let recovery_tail = &source[recovery..];
+        let end = recovery_tail
+            .find("\n}\n\nasync fn recover_or_commit_unknown(")
+            .expect("recovery helper boundary changed unexpectedly");
+        let helper = &recovery_tail[..end];
+        assert!(helper.contains("recover_slider_commit"));
+        assert!(helper.contains("read_slider_transaction_started_at"));
+        assert!(helper.contains("SLIDER_COMMIT_UNKNOWN"));
+        assert!(!helper.contains("SLIDER_CLAIM_FENCE_LOST"));
+    }
+
+    #[test]
+    fn missing_step_up_proof_checks_claim_transition_before_returning_forbidden() {
+        let source = include_str!("slider_mutation.rs");
+        let mark = source
+            .find("mark_slider_step_up_required(")
+            .expect("step-up claim transition must remain explicit");
+        let response = source
+            .find("return response;")
+            .expect("normal missing-proof response must remain available");
+        assert!(mark < response);
+        let nearby = &source[mark..response];
+        assert!(nearby.contains("match"));
+        assert!(!nearby.contains("let _ = mark_slider_step_up_required"));
+    }
+
     #[test]
     fn slider_mutation_create_policy_keeps_drafts_non_sensitive() {
         let input=MutationInput{expected_revision:14,name:"Promo".into(),image:"/uploads/covers/1710000000000-deadbeef.webp".into(),link:"/promo".into(),status:false};

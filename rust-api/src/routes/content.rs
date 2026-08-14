@@ -45,8 +45,9 @@ pub use slider_idempotency::{
     mark_slider_step_up_required, mark_slider_transaction_started, normalize_slider_claim_binding,
     pre_transaction_retry_filter,
     normalize_slider_idempotency_key, preallocate_slider_recovery_ids,
-    recover_slider_commit, store_recovery_identifiers, verify_slider_claim_fence_in_session,
-    SliderClaimBegin, SliderClaimBinding, SliderClaimError, SliderCommitRecovery,
+    read_slider_transaction_started_at, recover_slider_commit, store_recovery_identifiers,
+    verify_slider_claim_fence_in_session, SliderClaimBegin, SliderClaimBinding, SliderClaimError,
+    SliderCommitRecovery,
     SliderRecoveryIdentifiers, SLIDER_IDEMPOTENCY_CLAIMS_COLLECTION, slider_idempotency_index_models,
 };
 pub use slider_snapshot::{
@@ -72,7 +73,7 @@ use utils::*;
 mod route_contract_tests {
     #[test]
     fn slider_create_and_update_routes_use_the_shared_json_body_limit() {
-        let source = include_str!("../mod.rs");
+        let source = include_str!("mod.rs");
         assert_eq!(
             source
                 .matches("DefaultBodyLimit::max(MAX_SLIDER_JSON_BYTES)")

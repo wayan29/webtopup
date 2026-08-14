@@ -265,6 +265,36 @@ pub fn recovery_read_concern() -> ReadConcern {
     ReadConcern::majority()
 }
 
+/// Read the durable transaction-start fence with majority visibility.  A missing timestamp is
+/// deliberately represented as `None`: callers must not infer that a fenced claim is retryable
+/// from an eventually-consistent or malformed read.
+pub async fn read_slider_transaction_started_at(
+    db: &Database,
+    claim_id: ObjectId,
+    claim_token: &str,
+    binding: &SliderClaimBinding,
+    lease_generation: u64,
+) -> Result<Option<DateTime>, SliderClaimError> {
+    let options = FindOneOptions::builder()
+        .read_concern(recovery_read_concern())
+        .build();
+    let claim = db
+        .collection::<Document>(SLIDER_IDEMPOTENCY_CLAIMS_COLLECTION)
+        .find_one(slider_claim_fence_filter(
+            claim_id,
+            claim_token,
+            binding,
+            lease_generation,
+        ))
+        .with_options(options)
+        .await
+        .map_err(|_| SliderClaimError::Storage)?;
+    let Some(claim) = claim else {
+        return Ok(None);
+    };
+    Ok(claim.get_datetime("transactionStartedAt").ok().copied())
+}
+
 pub fn generate_slider_claim_token() -> String {
     rand::thread_rng()
         .sample_iter(&Alphanumeric)
