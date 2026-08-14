@@ -4,14 +4,31 @@
 //! do not advertise a mutation capability marker while the legacy mutation handlers remain in
 //! place for compatibility.
 
-use axum::http::HeaderValue;
+use axum::http::{HeaderMap, HeaderValue, Method, Uri};
 use futures_util::TryStreamExt;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use subtle::ConstantTimeEq;
+use std::fmt::Write as _;
+use std::time::{SystemTime, UNIX_EPOCH};
 use mongodb::{bson::{doc, oid::ObjectId, Bson, Document}, Client, Database};
 use serde::Serialize;
 
 use super::{
     public_slider_from_document, PublicSliderItem, MAX_CURRENT_SLIDERS, MAX_PUBLIC_SLIDERS,
+    SLIDER_MUTATION_CONTRACT,
 };
+use crate::{
+    security::require_proxy_context,
+    services::correlation::validate_trace_id,
+    state::AppState,
+};
+
+pub const SLIDER_CAPABILITY_VERSION_HEADER: &str = "x-webtopup-slider-contract-version";
+pub const SLIDER_CAPABILITY_TIMESTAMP_HEADER: &str = "x-webtopup-slider-contract-timestamp";
+pub const SLIDER_CAPABILITY_ASSERTION_HEADER: &str = "x-webtopup-slider-contract-assertion";
+const SLIDER_CAPABILITY_INPUT_VERSION: &str = "slider-contract-capability/v1";
+const SLIDER_CAPABILITY_MAX_CLOCK_SKEW_MS: i128 = 30_000;
 use crate::utils::bson::{read_i64, read_string};
 
 /// Dedicated collection containing the one global slider revision document.
@@ -68,16 +85,15 @@ pub struct SliderLimits {
     pub remaining_active: i64,
 }
 
-/// A versioned, read-only administrative snapshot.
-///
-/// `mutationContract` is intentionally absent in this milestone.  The client must treat this
-/// shape as read-only until the later transaction, readiness, and gateway capability gates are
-/// complete.
+/// A versioned administrative snapshot.  The mutation contract is omitted unless the request
+/// crossed the authenticated, exact-path gateway capability handshake and local readiness is true.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SliderAdminSnapshot {
     pub revision: i64,
     pub sliders: Vec<SliderAdminItem>,
     pub limits: SliderLimits,
+    #[serde(rename = "mutationContract", skip_serializing_if = "Option::is_none")]
+    pub mutation_contract: Option<String>,
 }
 
 /// Load the global slider revision.  A missing metadata document is the initial revision zero.
@@ -162,6 +178,119 @@ pub fn slider_etag(revision: i64) -> String {
     format!("\"sliders-{revision}\"")
 }
 
+/// Build the exact UTF-8 capability MAC input shared by the Node gateway and Rust API.
+/// There are four ASCII LF separators and no trailing LF.
+pub fn slider_capability_mac_input(
+    method: &Method,
+    path: &str,
+    timestamp: &str,
+    correlation_id: &str,
+) -> String {
+    [
+        SLIDER_CAPABILITY_INPUT_VERSION,
+        method.as_str(),
+        path,
+        timestamp,
+        correlation_id,
+    ]
+    .join("\n")
+}
+
+fn slider_capability_assertion(secret: &str, input: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts keys of every length");
+    mac.update(input.as_bytes());
+    let digest = mac.finalize().into_bytes();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("String write cannot fail");
+    }
+    encoded
+}
+
+fn trusted_gateway_correlation_id(headers: &HeaderMap) -> Option<&str> {
+    let value = headers
+        .get(crate::services::correlation::GATEWAY_CORRELATION_HEADER)?
+        .to_str()
+        .ok()?;
+    // Correlation IDs are selected and lower-case at Node's trusted boundary. Do not trim or
+    // normalize here: the signed value must be byte-identical to the trusted request header.
+    if validate_trace_id(value) && value.bytes().all(|byte| !byte.is_ascii_uppercase()) {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn valid_decimal_timestamp(value: &str) -> Option<i128> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse::<i128>().ok()
+}
+
+fn timestamp_is_fresh(timestamp: &str) -> bool {
+    let Some(timestamp) = valid_decimal_timestamp(timestamp) else {
+        return false;
+    };
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return false;
+    };
+    let now = now.as_millis() as i128;
+    (timestamp - now).abs() <= SLIDER_CAPABILITY_MAX_CLOCK_SKEW_MS
+}
+
+/// Validate a Node-issued capability assertion after the normal proxy and permission boundary.
+/// This function never trusts or parses a browser capability header as authorization on its own.
+pub fn slider_capability_marker(
+    headers: &HeaderMap,
+    state: &AppState,
+    method: &Method,
+    uri: &Uri,
+) -> bool {
+    if !state.slider_mutation_readiness.mutation_ready
+        || method != Method::GET
+        || uri.query().is_some()
+        || !matches!(uri.path(), "/v2/sliders/admin/all" | "/v2/sliders/admin/archived")
+        || require_proxy_context(headers, state).is_err()
+    {
+        return false;
+    }
+    let Some(version) = headers
+        .get(SLIDER_CAPABILITY_VERSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    if version != SLIDER_MUTATION_CONTRACT {
+        return false;
+    }
+    let Some(timestamp) = headers
+        .get(SLIDER_CAPABILITY_TIMESTAMP_HEADER)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    if !timestamp_is_fresh(timestamp) {
+        return false;
+    }
+    let Some(assertion) = headers
+        .get(SLIDER_CAPABILITY_ASSERTION_HEADER)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    if assertion.len() != 64 || !assertion.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) {
+        return false;
+    }
+    let Some(correlation_id) = trusted_gateway_correlation_id(headers) else {
+        return false;
+    };
+    let input = slider_capability_mac_input(method, uri.path(), timestamp, correlation_id);
+    let expected = slider_capability_assertion(&state.proxy_secret, &input);
+    expected.as_bytes().ct_eq(assertion.as_bytes()).into()
+}
+
 /// Match an exact strong member of an HTTP `If-None-Match` entity-tag list.
 ///
 /// Weak tags, wildcard, unquoted values, malformed members, and zero-padded revisions are never
@@ -233,6 +362,7 @@ async fn load_admin_snapshot(
                 revision: before,
                 sliders: documents.iter().map(admin_item_from_document).collect(),
                 limits: limits_from_documents(&current_documents),
+                mutation_contract: None,
             });
         }
     }
@@ -300,6 +430,7 @@ pub(crate) fn admin_snapshot_from_documents(
         revision,
         sliders: documents.iter().map(admin_item_from_document).collect(),
         limits: limits_from_documents(documents),
+        mutation_contract: None,
     }
 }
 
@@ -438,11 +569,89 @@ mod tests {
     }
 
     #[test]
+    fn slider_capability_marker_requires_exact_new_new_ready_handshake() {
+        let secret = "slider-capability-test-secret-at-least-32-chars";
+        let state = crate::security::test_app_state_with_proxy_secret(secret);
+        let mut state = match std::sync::Arc::try_unwrap(state) { Ok(value) => value, Err(_) => panic!("unique test state") };
+        state.slider_mutation_readiness = crate::services::slider_readiness::SliderMutationReadiness {
+            transaction_capable: true,
+            exact_indexes_ready: true,
+            registry_ready: true,
+            readiness_clean: true,
+            mutation_ready: true,
+        };
+        let state = std::sync::Arc::new(state);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .to_string();
+        let correlation = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let path = "/v2/sliders/admin/all";
+        let input = slider_capability_mac_input(&Method::GET, path, &timestamp, correlation);
+        let assertion = slider_capability_assertion(secret, &input);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-v2-proxy-secret", HeaderValue::from_str(secret).unwrap());
+        headers.insert("x-webtopup-correlation-id", HeaderValue::from_static(correlation));
+        headers.insert(SLIDER_CAPABILITY_VERSION_HEADER, HeaderValue::from_static(SLIDER_MUTATION_CONTRACT));
+        headers.insert(SLIDER_CAPABILITY_TIMESTAMP_HEADER, HeaderValue::from_str(&timestamp).unwrap());
+        headers.insert(SLIDER_CAPABILITY_ASSERTION_HEADER, HeaderValue::from_str(&assertion).unwrap());
+        assert!(slider_capability_marker(
+            &headers,
+            &state,
+            &Method::GET,
+            &Uri::from_static(path),
+        ));
+
+        let mut forged = headers.clone();
+        forged.insert(SLIDER_CAPABILITY_ASSERTION_HEADER, HeaderValue::from_static("00"));
+        assert!(!slider_capability_marker(&forged, &state, &Method::GET, &Uri::from_static(path)));
+
+        let mut not_ready = (*state).clone();
+        not_ready.slider_mutation_readiness = Default::default();
+        let not_ready = std::sync::Arc::new(not_ready);
+        assert!(!slider_capability_marker(&headers, &not_ready, &Method::GET, &Uri::from_static(path)));
+    }
+
+    #[test]
+    fn slider_capability_marker_rejects_expiry_wrong_method_path_and_cross_path_assertions() {
+        let secret = "slider-capability-test-secret-at-least-32-chars";
+        let state = crate::security::test_app_state_with_proxy_secret(secret);
+        let mut state = match std::sync::Arc::try_unwrap(state) { Ok(value) => value, Err(_) => panic!("unique test state") };
+        state.slider_mutation_readiness = crate::services::slider_readiness::SliderMutationReadiness {
+            transaction_capable: true,
+            exact_indexes_ready: true,
+            registry_ready: true,
+            readiness_clean: true,
+            mutation_ready: true,
+        };
+        let state = std::sync::Arc::new(state);
+        let correlation = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let timestamp = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() - 31_000).to_string();
+        let signed_path = "/v2/sliders/admin/all";
+        let actual_path = "/v2/sliders/admin/archived";
+        let assertion = slider_capability_assertion(
+            secret,
+            &slider_capability_mac_input(&Method::GET, signed_path, &timestamp, correlation),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-v2-proxy-secret", HeaderValue::from_str(secret).unwrap());
+        headers.insert("x-webtopup-correlation-id", HeaderValue::from_static(correlation));
+        headers.insert(SLIDER_CAPABILITY_VERSION_HEADER, HeaderValue::from_static(SLIDER_MUTATION_CONTRACT));
+        headers.insert(SLIDER_CAPABILITY_TIMESTAMP_HEADER, HeaderValue::from_str(&timestamp).unwrap());
+        headers.insert(SLIDER_CAPABILITY_ASSERTION_HEADER, HeaderValue::from_str(&assertion).unwrap());
+        assert!(!slider_capability_marker(&headers, &state, &Method::GET, &Uri::from_static(actual_path)));
+        assert!(!slider_capability_marker(&headers, &state, &Method::POST, &Uri::from_static(signed_path)));
+        assert!(!slider_capability_marker(&headers, &state, &Method::GET, &Uri::from_static("/v2/sliders/admin/all?path=/v2/sliders/admin/archived")));
+    }
+
+    #[test]
     fn admin_snapshot_is_read_only_until_capability_gates_are_complete() {
         let snapshot = SliderAdminSnapshot {
             revision: 3,
             sliders: Vec::new(),
             limits: limits_from_documents(&[]),
+            mutation_contract: None,
         };
         let json = serde_json::to_value(snapshot).unwrap();
         assert!(!json

@@ -2,7 +2,7 @@ use std::{collections::HashSet, sync::Arc};
 
 use axum::{
     extract::{Path, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
     Json,
 };
@@ -23,8 +23,8 @@ use crate::{
 
 use super::{
     date_string, document_to_json, i64_value, internal_error, load_archived_snapshot,
-    load_current_snapshot, load_public_snapshot, matches_slider_etag, not_found, slider_etag,
-    status_message, text_value, text_value_or_current, unavailable, MessageResponse,
+    load_current_snapshot, load_public_snapshot, matches_slider_etag, not_found, slider_capability_marker,
+    slider_etag, status_message, text_value, text_value_or_current, unavailable, MessageResponse,
     NormalizedSliderPayload, SliderItem, SliderPayload, SliderResponse, SliderSortOrderPayload,
     SliderSnapshotError,
 };
@@ -47,7 +47,9 @@ fn slider_snapshot_error_response(error: SliderSnapshotError) -> Response {
 }
 
 pub async fn sliders_admin_all(
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
     State(state): State<Arc<AppState>>,
 ) -> Response {
     if let Err(response) = require_permission(&headers, &state, "manageSettings").await {
@@ -57,13 +59,20 @@ pub async fn sliders_admin_all(
         return unavailable();
     };
     match load_current_snapshot(client, &state.mongo_db).await {
-        Ok(snapshot) => Json(snapshot).into_response(),
+        Ok(mut snapshot) => {
+            if slider_capability_marker(&headers, &state, &method, &uri) {
+                snapshot.mutation_contract = Some(super::SLIDER_MUTATION_CONTRACT.to_string());
+            }
+            Json(snapshot).into_response()
+        }
         Err(error) => slider_snapshot_error_response(error),
     }
 }
 
 pub async fn sliders_admin_archived(
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
     State(state): State<Arc<AppState>>,
 ) -> Response {
     if let Err(response) = require_permission(&headers, &state, "manageSettings").await {
@@ -73,7 +82,12 @@ pub async fn sliders_admin_archived(
         return unavailable();
     };
     match load_archived_snapshot(client, &state.mongo_db).await {
-        Ok(snapshot) => Json(snapshot).into_response(),
+        Ok(mut snapshot) => {
+            if slider_capability_marker(&headers, &state, &method, &uri) {
+                snapshot.mutation_contract = Some(super::SLIDER_MUTATION_CONTRACT.to_string());
+            }
+            Json(snapshot).into_response()
+        }
         Err(error) => slider_snapshot_error_response(error),
     }
 }

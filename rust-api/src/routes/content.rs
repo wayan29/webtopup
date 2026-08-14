@@ -56,8 +56,8 @@ pub use slider_idempotency::{
 };
 pub use slider_snapshot::{
     load_archived_snapshot, load_current_snapshot, load_public_snapshot, load_slider_revision,
-    matches_slider_etag, slider_etag, SliderAdminItem, SliderAdminSnapshot, SliderLimits,
-    SliderSnapshotError, SLIDER_METADATA_COLLECTION,
+    matches_slider_etag, slider_capability_marker, slider_etag, SliderAdminItem, SliderAdminSnapshot,
+    SliderLimits, SliderSnapshotError, SLIDER_METADATA_COLLECTION,
 };
 pub use slider_policy::{
     canonical_slider_claim_digest, canonical_slider_claim_input, effective_requires_step_up,

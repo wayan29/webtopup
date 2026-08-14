@@ -1,4 +1,4 @@
-import { createHash } from 'crypto';
+import { createHash, createHmac } from 'crypto';
 import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { context, propagation, SpanKind, SpanStatusCode, trace } from '@opentelemetry/api';
 import {
@@ -50,6 +50,40 @@ import qrcode from 'qrcode';
 
 type UploadFolder = 'icons' | 'covers' | 'popups' | 'instructions';
 type UploadPermission = 'manageProducts' | 'managePayment' | 'manageSettings';
+
+export const SLIDER_CONTRACT_VERSION_HEADER = 'x-webtopup-slider-contract-version';
+export const SLIDER_CONTRACT_TIMESTAMP_HEADER = 'x-webtopup-slider-contract-timestamp';
+export const SLIDER_CONTRACT_ASSERTION_HEADER = 'x-webtopup-slider-contract-assertion';
+export const SLIDER_CONTRACT_VERSION = 'slider-revision-v1';
+const SLIDER_CAPABILITY_INPUT_VERSION = 'slider-contract-capability/v1';
+const SLIDER_ADMIN_UPSTREAM_PATHS = new Set(['/v2/sliders/admin/all', '/v2/sliders/admin/archived']);
+const SLIDER_CAPABILITY_HEADER_NAMES = new Set([
+    SLIDER_CONTRACT_VERSION_HEADER,
+    SLIDER_CONTRACT_TIMESTAMP_HEADER,
+    SLIDER_CONTRACT_ASSERTION_HEADER,
+]);
+
+export const buildSliderCapabilityMacInput = (
+    method: string,
+    upstreamPath: string,
+    timestamp: string,
+    gatewayCorrelationId: string,
+): string => {
+    if (method !== 'GET' || !SLIDER_ADMIN_UPSTREAM_PATHS.has(upstreamPath)) {
+        throw new Error('Invalid slider capability path');
+    }
+    return [SLIDER_CAPABILITY_INPUT_VERSION, method, upstreamPath, timestamp, gatewayCorrelationId].join('\n');
+};
+
+export const createSliderCapabilityAssertion = (
+    proxySecret: string,
+    method: string,
+    upstreamPath: string,
+    timestamp: string,
+    gatewayCorrelationId: string,
+): string => createHmac('sha256', proxySecret)
+    .update(buildSliderCapabilityMacInput(method, upstreamPath, timestamp, gatewayCorrelationId), 'utf8')
+    .digest('hex');
 
 const DEFAULT_API_V2_UPSTREAM = 'http://127.0.0.1:9010';
 const TRACE_RESPONSE_HEADER = GATEWAY_TRACE_RESPONSE_HEADER;
@@ -116,6 +150,10 @@ const UNTRUSTED_UPSTREAM_HEADER_NAMES = new Set([
     // Login audience is selected only by the fixed gateway/Rust route pair.
     // A browser-provided value must never cross the proxy trust boundary.
     'x-webtopup-login-audience',
+    // Slider capability is an internal Node↔Rust handshake. Browser values are never trusted.
+    SLIDER_CONTRACT_VERSION_HEADER,
+    SLIDER_CONTRACT_TIMESTAMP_HEADER,
+    SLIDER_CONTRACT_ASSERTION_HEADER,
 ]);
 
 const isWbtopupUserHeader = (name: string) => name.toLowerCase().startsWith('x-webtopup-user-');
@@ -223,6 +261,21 @@ export const requireSiteConfigIdempotencyKey = async (request: FastifyRequest, r
             },
         });
     }
+    (request.headers as Record<string, unknown>)['idempotency-key'] = normalized;
+};
+
+export const requireSliderIdempotencyKey = async (request: FastifyRequest, reply: FastifyReply) => {
+    const normalized = normalizeGatewayIdempotencyKey(readIdempotencyKeyHeader(request));
+    if (!normalized) {
+        return reply.status(400).send({
+            message: 'Header Idempotency-Key wajib untuk mutasi slider',
+            error: {
+                code: 'IDEMPOTENCY_KEY_REQUIRED',
+                message: 'Header Idempotency-Key wajib untuk mutasi slider',
+            },
+        });
+    }
+    // Preserve this normalized value through authentication retries and proxy forwarding.
     (request.headers as Record<string, unknown>)['idempotency-key'] = normalized;
 };
 
@@ -430,7 +483,11 @@ const filterUpstreamResponseHeaders = (upstreamResponse: Response): Record<strin
     const headers: Record<string, string> = {};
     upstreamResponse.headers.forEach((value, name) => {
         const normalizedName = name.toLowerCase();
-        if (HOP_BY_HOP_HEADERS.has(normalizedName) || isUpstreamResponseHeaderDenied(normalizedName)) {
+        if (
+            HOP_BY_HOP_HEADERS.has(normalizedName)
+            || isUpstreamResponseHeaderDenied(normalizedName)
+            || SLIDER_CAPABILITY_HEADER_NAMES.has(normalizedName)
+        ) {
             return;
         }
         headers[name] = value;
@@ -1090,6 +1147,99 @@ const proxyUnlock = async (request: AuthRequest, reply: FastifyReply) => {
         }
     };
 
+    const proxySliderAdminReadRequest = async (
+        request: AuthRequest,
+        reply: FastifyReply,
+        upstreamPath: '/v2/sliders/admin/all' | '/v2/sliders/admin/archived',
+    ) => {
+        const upstreamUrl = `${getApiV2UpstreamUrl()}${upstreamPath}`;
+        try {
+            const { result: upstreamResponse, responseTraceId } = await runWithProxySpan(
+                deps,
+                request,
+                reply,
+                upstreamUrl,
+                async (gatewayCorrelationId) => {
+                    // `forwardHeadersWithTrace` strips every browser capability value first;
+                    // these values are then overwritten with a fresh server-side assertion.
+                    const timestamp = Date.now().toString(10);
+                    const headers = forwardHeadersWithTrace(request, proxySecret, gatewayCorrelationId);
+                    const ifNoneMatch = request.headers['if-none-match'];
+                    if (ifNoneMatch !== undefined) {
+                        headers.set('if-none-match', Array.isArray(ifNoneMatch) ? ifNoneMatch.join(',') : String(ifNoneMatch));
+                    }
+                    headers.set(SLIDER_CONTRACT_VERSION_HEADER, SLIDER_CONTRACT_VERSION);
+                    headers.set(SLIDER_CONTRACT_TIMESTAMP_HEADER, timestamp);
+                    headers.set(
+                        SLIDER_CONTRACT_ASSERTION_HEADER,
+                        createSliderCapabilityAssertion(
+                            proxySecret,
+                            'GET',
+                            upstreamPath,
+                            timestamp,
+                            gatewayCorrelationId,
+                        ),
+                    );
+                    return fetch(upstreamUrl, {
+                        method: 'GET',
+                        headers,
+                        redirect: 'manual',
+                    });
+                },
+            );
+            const headers = filterUpstreamResponseHeaders(upstreamResponse);
+            applyFilteredUpstreamHeadersToReply(headers, reply);
+            if (!headers['cache-control'] && !headers['Cache-Control']) {
+                reply.header('cache-control', 'no-cache');
+            }
+            reply.header(TRACE_RESPONSE_HEADER, responseTraceId);
+            if (upstreamResponse.status === 304) {
+                return reply.status(304).send();
+            }
+            return reply.status(upstreamResponse.status).send(Buffer.from(await upstreamResponse.arrayBuffer()));
+        } catch (error) {
+            request.log.error({ error, upstreamUrl }, 'API v2 slider admin read upstream request failed');
+            return reply.status(502).send({ message: 'API v2 upstream unavailable' });
+        }
+    };
+
+    const proxyPublicSliderRequest = async (request: AuthRequest, reply: FastifyReply) => {
+        const upstreamUrl = `${getApiV2UpstreamUrl()}${toUpstreamPath(request.url)}`;
+        try {
+            const { result: upstreamResponse, responseTraceId } = await runWithProxySpan(
+                deps,
+                request,
+                reply,
+                upstreamUrl,
+                async (gatewayCorrelationId) => {
+                    const headers = forwardHeadersWithTrace(request, proxySecret, gatewayCorrelationId);
+                    const ifNoneMatch = request.headers['if-none-match'];
+                    if (ifNoneMatch !== undefined) {
+                        headers.set('if-none-match', Array.isArray(ifNoneMatch) ? ifNoneMatch.join(',') : String(ifNoneMatch));
+                    }
+                    return fetch(upstreamUrl, {
+                        method: request.method,
+                        headers,
+                        redirect: 'manual',
+                    });
+                },
+            );
+            const headers = filterUpstreamResponseHeaders(upstreamResponse);
+            applyFilteredUpstreamHeadersToReply(headers, reply);
+            if (!headers['cache-control'] && !headers['Cache-Control']) {
+                reply.header('cache-control', 'no-cache');
+            }
+            reply.header(TRACE_RESPONSE_HEADER, responseTraceId);
+            if (upstreamResponse.status === 304) {
+                return reply.status(304).send();
+            }
+            return reply.status(upstreamResponse.status).send(Buffer.from(await upstreamResponse.arrayBuffer()));
+        } catch (error) {
+            request.log.error({ error, upstreamUrl }, 'API v2 public slider upstream request failed');
+            return reply.status(502).send({ message: 'API v2 upstream unavailable' });
+        }
+    };
+
     const proxyPublicSettingsRequest = async (request: AuthRequest, reply: FastifyReply) => {
         // Public settings must revalidate against the authoritative revision. No response-body cache.
         const upstreamUrl = `${getApiV2UpstreamUrl()}${toUpstreamPath(request.url)}`;
@@ -1351,7 +1501,7 @@ const proxyUnlock = async (request: AuthRequest, reply: FastifyReply) => {
     app.get('/payment-categories', proxyRequest);
     app.get('/payment-categories/active', { preHandler: [authenticate] }, proxyRequest);
     app.get('/settings/public', proxyPublicSettingsRequest);
-    app.get('/sliders', proxyRequest);
+    app.get('/sliders', proxyPublicSliderRequest);
     app.get('/flash-sales/active', proxyRequest);
     app.get('/flash-sales/price/:productId', proxyRequest);
     app.get('/guest-transactions/check/:invoiceNumber', { preHandler: [guestTransactionRateLimit] }, proxyRequest);
@@ -1454,11 +1604,15 @@ const proxyUnlock = async (request: AuthRequest, reply: FastifyReply) => {
             },
         });
     });
-    app.get('/sliders/admin/all', { preHandler: [authenticate, hasPermission('manageSettings')] }, proxyRequest);
-    app.post('/sliders/admin/create', { preHandler: [authenticate, hasPermission('manageSettings')] }, proxyRequest);
-    app.put('/sliders/admin/sort-order', { preHandler: [authenticate, hasPermission('manageSettings')] }, proxyRequest);
-    app.put('/sliders/admin/:id', { preHandler: [authenticate, hasPermission('manageSettings')] }, proxyRequest);
-    app.delete('/sliders/admin/:id', { preHandler: [authenticate, hasPermission('manageSettings')] }, proxyRequest);
+    app.get('/sliders/admin/all', { preHandler: [authenticate, hasPermission('manageSettings')] }, (request, reply) => proxySliderAdminReadRequest(request, reply, '/v2/sliders/admin/all'));
+    app.get('/sliders/admin/archived', { preHandler: [authenticate, hasPermission('manageSettings')] }, (request, reply) => proxySliderAdminReadRequest(request, reply, '/v2/sliders/admin/archived'));
+    app.post('/sliders/admin/create', { bodyLimit: 64 * 1024, preHandler: [authenticate, hasPermission('manageSettings'), requireSliderIdempotencyKey, acceptOptionalStepUp('settings.sensitive')] }, proxyRequest);
+    app.post('/sliders/admin/:id/archive', { bodyLimit: 64 * 1024, preHandler: [authenticate, hasPermission('manageSettings'), requireSliderIdempotencyKey, acceptOptionalStepUp('settings.sensitive')] }, proxyRequest);
+    app.post('/sliders/admin/:id/restore', { bodyLimit: 64 * 1024, preHandler: [authenticate, hasPermission('manageSettings'), requireSliderIdempotencyKey, acceptOptionalStepUp('settings.sensitive')] }, proxyRequest);
+    app.put('/sliders/admin/sort-order', { preHandler: [authenticate, hasPermission('manageSettings')] }, async (_request, reply) => reply.status(405).send({ message: 'Urutan slider lama tidak tersedia', error: { code: 'SLIDER_LEGACY_REORDER_DISABLED', message: 'Urutan slider lama tidak tersedia' } }));
+    app.put('/sliders/admin/reorder', { bodyLimit: 64 * 1024, preHandler: [authenticate, hasPermission('manageSettings'), requireSliderIdempotencyKey, acceptOptionalStepUp('settings.sensitive')] }, proxyRequest);
+    app.put('/sliders/admin/:id', { bodyLimit: 64 * 1024, preHandler: [authenticate, hasPermission('manageSettings'), requireSliderIdempotencyKey, acceptOptionalStepUp('settings.sensitive')] }, proxyRequest);
+    app.delete('/sliders/admin/:id', { preHandler: [authenticate, hasPermission('manageSettings')] }, async (_request, reply) => reply.status(405).send({ message: 'Penghapusan permanen slider tidak tersedia', error: { code: 'SLIDER_HARD_DELETE_DISABLED', message: 'Penghapusan permanen slider tidak tersedia' } }));
     app.all('/transactions/manual', { preHandler: [authenticate, hasPermission('processManualTransaction')] }, proxyRequest);
     app.post('/transactions/:id/refund', { preHandler: [authenticate, hasPermission('processManualTransaction'), requireStepUp('finance.refund'), requireCriticalIdempotencyKey] }, proxyRequest);
     app.post('/transactions/:id/recheck', { preHandler: [authenticate, hasPermission('processManualTransaction')] }, proxyRequest);

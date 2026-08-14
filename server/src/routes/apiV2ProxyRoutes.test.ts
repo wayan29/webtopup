@@ -191,3 +191,76 @@ test('catalog mutations use explicit methods and manageProducts', () => {
     assert.doesNotMatch(source, /app\.all\('\/(?:categories|operators|product-types)\/admin\/sort-order'/);
     assert.doesNotMatch(source, /app\.all\('\/products\/admin\/sort-(?:order|by-price)'/);
 });
+
+test('slider gateway inventory keeps every new mutation behind the complete gateway gate', () => {
+    const sourcePath = join(__dirname, '..', '..', 'src', 'routes', 'apiV2ProxyRoutes.ts');
+    const source = readFileSync(sourcePath, 'utf8');
+    const mutationRoutes = [
+        ['post', '/sliders/admin/create'],
+        ['put', '/sliders/admin/:id'],
+        ['post', '/sliders/admin/:id/archive'],
+        ['post', '/sliders/admin/:id/restore'],
+        ['put', '/sliders/admin/reorder'],
+    ] as const;
+
+    for (const [method, path] of mutationRoutes) {
+        const route = `app.${method}('${path}'`;
+        const position = source.indexOf(route);
+        assert.ok(position >= 0, `${route} route is missing`);
+        const nextRoute = source.indexOf('\n    app.', position + route.length);
+        const block = source.slice(position, nextRoute < 0 ? source.length : nextRoute);
+        assert.match(block, /authenticate/, `${route} must authenticate`);
+        assert.match(block, /hasPermission\('manageSettings'\)/, `${route} must manage settings`);
+        assert.match(block, /requireSliderIdempotencyKey/, `${route} must require slider idempotency`);
+        assert.match(block, /acceptOptionalStepUp\('settings\.sensitive'\)/, `${route} must accept exact optional step-up`);
+        assert.match(block, /bodyLimit:\s*64\s*\*\s*1024/, `${route} must cap JSON at 64 KiB`);
+        assert.match(block, /proxyRequest/, `${route} must forward after gates`);
+    }
+
+    const archive = source.indexOf("app.post('/sliders/admin/:id/archive'");
+    const restore = source.indexOf("app.post('/sliders/admin/:id/restore'");
+    const update = source.indexOf("app.put('/sliders/admin/:id'");
+    assert.ok(archive < update, 'archive route must precede the dynamic update route');
+    assert.ok(restore < update, 'restore route must precede the dynamic update route');
+    assert.match(source.slice(source.indexOf("app.put('/sliders/admin/sort-order'"), update), /405/);
+    assert.match(source.slice(source.indexOf("app.delete('/sliders/admin/:id'"), source.length), /405/);
+});
+
+test('slider gateway strips browser capability headers and signs only the two canonical admin reads', () => {
+    const sourcePath = join(__dirname, '..', '..', 'src', 'routes', 'apiV2ProxyRoutes.ts');
+    const source = readFileSync(sourcePath, 'utf8');
+    for (const header of [
+        'x-webtopup-slider-contract-version',
+        'x-webtopup-slider-contract-timestamp',
+        'x-webtopup-slider-contract-assertion',
+    ]) {
+        assert.match(source, new RegExp(`['\\"]${header}['\\"]`), `${header} must be named explicitly`);
+    }
+    assert.match(source, /createHmac\(['"]sha256['"]/);
+    assert.match(source, /slider-contract-capability\/v1/);
+    assert.match(source, /join\(['"]\\n['"]\)/);
+    assert.match(source, /\/v2\/sliders\/admin\/all/);
+    assert.match(source, /\/v2\/sliders\/admin\/archived/);
+    assert.match(source, /filterUpstreamResponseHeaders[\s\S]*SLIDER_CAPABILITY/);
+});
+
+test('public sliders forward validators and never cache a response body, while app exposes ETag', () => {
+    const routePath = join(__dirname, '..', '..', 'src', 'routes', 'apiV2ProxyRoutes.ts');
+    const appPath = join(__dirname, '..', '..', 'src', 'app.ts');
+    const source = readFileSync(routePath, 'utf8');
+    const appSource = readFileSync(appPath, 'utf8');
+    const routeStart = source.indexOf("app.get('/sliders'");
+    assert.ok(routeStart >= 0);
+    const routeEnd = source.indexOf("const proxyPublicSettingsRequest", routeStart);
+    const route = source.slice(source.indexOf('const proxyPublicSliderRequest'), routeEnd);
+    assert.match(route, /proxyPublicSliderRequest/);
+    assert.match(source, /if-none-match/);
+    assert.match(route, /304/);
+    assert.match(route, /no-cache/);
+    assert.match(appSource, /exposedHeaders:[\s\S]*['"]ETag['"]/);
+});
+
+test('legacy slider controller is not registered in the gateway app', () => {
+    const appSource = readFileSync(join(__dirname, '..', '..', 'src', 'app.ts'), 'utf8');
+    assert.doesNotMatch(appSource, /sliderRoutes/);
+});
