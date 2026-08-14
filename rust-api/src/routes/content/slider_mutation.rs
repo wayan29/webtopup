@@ -33,10 +33,10 @@ use super::{
     effective_requires_step_up,
     mark_slider_commit_unknown_conditionally, mark_slider_transaction_started,
     normalize_create, normalize_update, normalize_slider_claim_binding, preallocate_slider_recovery_ids,
-    store_recovery_identifiers, SliderAction,
-    SliderClaimBegin, SliderClaimBinding, SliderClaimError,
-    SliderCreateRequest, SliderSnapshotItem, SliderUpdateRequest, SLIDER_MUTATION_CONTRACT,
-    SLIDER_METADATA_COLLECTION, MAX_CURRENT_SLIDERS, MAX_PUBLIC_SLIDERS,
+    recover_slider_commit, store_recovery_identifiers, verify_slider_claim_fence_in_session,
+    SliderAction, SliderClaimBegin, SliderClaimBinding, SliderClaimError, SliderCommitRecovery,
+    SliderCreateRequest, SliderSnapshotItem, SliderUpdateRequest, SliderAdminSnapshot,
+    SLIDER_MUTATION_CONTRACT, SLIDER_METADATA_COLLECTION, MAX_CURRENT_SLIDERS, MAX_PUBLIC_SLIDERS,
 };
 
 const DOMAIN_AUDITS_COLLECTION: &str = "slideraudits";
@@ -170,16 +170,16 @@ pub async fn execute_slider_mutation(
         return mutation_error(StatusCode::SERVICE_UNAVAILABLE, "SLIDER_CLAIM_FENCE_LOST", "Klaim mutasi slider tidak dapat diamankan");
     }
     let started_at = match db.collection::<Document>(super::SLIDER_IDEMPOTENCY_CLAIMS_COLLECTION).find_one(doc! {"_id": claim_id}).await {
-        Ok(Some(claim)) => match claim.get_datetime("transactionStartedAt") { Ok(value) => *value, Err(_) => return internal_mutation_error() },
-        _ => return internal_mutation_error(),
+        Ok(Some(claim)) => match claim.get_datetime("transactionStartedAt") { Ok(value) => *value, Err(_) => return recover_or_commit_unknown_from_claim(&db, claim_id, &claim_token, &binding, lease_generation, &recovery_ids).await },
+        _ => return recover_or_commit_unknown_from_claim(&db, claim_id, &claim_token, &binding, lease_generation, &recovery_ids).await,
     };
 
     let mut session = match client.start_session().await {
         Ok(session) => session,
-        Err(_) => return commit_unknown_response(&db, claim_id, &claim_token, &binding, lease_generation, started_at).await,
+        Err(_) => return recover_or_commit_unknown(&db, claim_id, &claim_token, &binding, lease_generation, started_at, &recovery_ids).await,
     };
     if session.start_transaction().await.is_err() {
-        return commit_unknown_response(&db, claim_id, &claim_token, &binding, lease_generation, started_at).await;
+        return recover_or_commit_unknown(&db, claim_id, &claim_token, &binding, lease_generation, started_at, &recovery_ids).await;
     }
     let result = write_transaction(
         &mut session,
@@ -198,20 +198,22 @@ pub async fn execute_slider_mutation(
     ).await;
     let (status, body) = match result {
         Ok(value) => value,
-        Err(response) => {
+        Err(_) => {
+            // Once transactionStartedAt is durable, even an acknowledged abort is not a
+            // pre-transaction retry signal. Keep the claim permanently conservative.
             let _ = session.abort_transaction().await;
-            return response;
+            return recover_or_commit_unknown(&db, claim_id, &claim_token, &binding, lease_generation, started_at, &recovery_ids).await;
         }
     };
     match commit_mongo_transaction_with_unknown_retry(&mut session).await {
         TransactionCommitOutcome::Committed => {
             if consume_slider_response_loss_fault().await {
-                return mutation_error(StatusCode::SERVICE_UNAVAILABLE, "SLIDER_COMMIT_UNKNOWN", "Status mutasi slider belum dapat dipastikan");
+                return recover_or_commit_unknown(&db, claim_id, &claim_token, &binding, lease_generation, started_at, &recovery_ids).await;
             }
             (status, Json(body)).into_response()
         }
         TransactionCommitOutcome::Ambiguous | TransactionCommitOutcome::FailedDefinitely => {
-            commit_unknown_response(&db, claim_id, &claim_token, &binding, lease_generation, started_at).await
+            recover_or_commit_unknown(&db, claim_id, &claim_token, &binding, lease_generation, started_at, &recovery_ids).await
         }
     }
 }
@@ -286,9 +288,16 @@ async fn authoritative_preflight(db: &Database, action: SliderAction, target: Op
 }
 
 async fn write_transaction(session: &mut ClientSession, db: &Database, operator: &AuthenticatedProxyUser, action: SliderAction, target: Option<ObjectId>, input: &MutationInput, binding: &SliderClaimBinding, claim_id: ObjectId, claim_token: &str, generation: u64, started_at: DateTime, ids: &super::SliderRecoveryIdentifiers, preflight: Preflight) -> Result<(StatusCode, Value), Response> {
+    // This is the first operation in the write transaction. No domain, reference, metadata,
+    // audit, or claim-result write is allowed before the exact same-session fence succeeds.
+    verify_slider_claim_fence_in_session(db, session, claim_id, claim_token, binding, generation, started_at, ids)
+        .await
+        .map_err(claim_error_response)?;
     let revision = load_revision_in_session(db, session).await.map_err(|_| transaction_unavailable())?;
     if revision != input.expected_revision {
-        let body = json!({"error":{"code":"SLIDER_VERSION_CONFLICT","message":"Daftar slider telah berubah","currentRevision":revision},"replayed":false});
+        let documents = load_current_documents_in_session(db, session).await.map_err(|_| transaction_unavailable())?;
+        let snapshot = super::slider_snapshot::admin_snapshot_from_documents(revision, &documents);
+        let body = version_conflict_body(input.expected_revision, revision, snapshot)?;
         complete_slider_claim_in_session(db, session, claim_id, claim_token, binding, generation, started_at, 409, &body, revision, ids.audit_event_id).await.map_err(claim_error_response)?;
         return Ok((StatusCode::CONFLICT, body));
     }
@@ -335,6 +344,19 @@ async fn write_transaction(session: &mut ClientSession, db: &Database, operator:
     Ok((if action==SliderAction::Create {StatusCode::CREATED} else {StatusCode::OK}, body))
 }
 
+fn version_conflict_body(expected_revision: i64, current_revision: i64, snapshot: SliderAdminSnapshot) -> Result<Value, Response> {
+    Ok(json!({
+        "error": {
+            "code": "SLIDER_VERSION_CONFLICT",
+            "message": "Daftar slider telah berubah",
+            "expectedRevision": expected_revision,
+            "currentRevision": current_revision,
+            "currentSnapshot": serde_json::to_value(snapshot).map_err(|_| internal_mutation_error())?,
+        },
+        "replayed": false,
+    }))
+}
+
 fn snapshot_after(action: SliderAction, target: Option<ObjectId>, input: &MutationInput, before: Option<&SliderSnapshotItem>) -> Option<SliderSnapshotItem> {
     Some(SliderSnapshotItem { id: target.unwrap_or_else(ObjectId::new), name: input.name.clone(), image: input.image.clone(), link: input.link.clone(), sort_order: before.map(|v|v.sort_order).unwrap_or(0), status: input.status, lifecycle: "active".to_string() }).filter(|_| matches!(action, SliderAction::Create | SliderAction::Update))
 }
@@ -346,6 +368,57 @@ fn snapshot_from_document(document: &Document, id: ObjectId) -> Result<SliderSna
 fn snapshot_document(value: &SliderSnapshotItem) -> Document { doc! {"id":value.id,"name":&value.name,"image":&value.image,"link":&value.link,"sortOrder":value.sort_order,"status":value.status,"lifecycle":&value.lifecycle} }
 fn integer(document: &Document, key: &str) -> Option<i64> { match document.get(key) { Some(Bson::Int32(v))=>Some(*v as i64),Some(Bson::Int64(v))=>Some(*v),Some(Bson::Double(v)) if v.is_finite()&&v.fract()==0.0=>Some(*v as i64),_=>None } }
 async fn load_revision_in_session(db: &Database, session: &mut ClientSession) -> Result<i64, mongodb::error::Error> { Ok(db.collection::<Document>(SLIDER_METADATA_COLLECTION).find_one(doc!{"_id":"global"}).session(&mut *session).await?.and_then(|d|integer(&d,"revision")).unwrap_or(0)) }
+
+async fn load_current_documents_in_session(db: &Database, session: &mut ClientSession) -> Result<Vec<Document>, mongodb::error::Error> {
+    let mut cursor = db.collection::<Document>("sliders")
+        .find(doc! { "lifecycle": { "$ne": "archived" } })
+        .sort(doc! { "sortOrder": 1, "_id": 1 })
+        .session(&mut *session)
+        .await?;
+    let mut documents = Vec::new();
+    while cursor.advance(session).await? {
+        documents.push(cursor.deserialize_current()?);
+    }
+    Ok(documents)
+}
+
+async fn recover_or_commit_unknown_from_claim(
+    db: &Database,
+    claim_id: ObjectId,
+    token: &str,
+    binding: &SliderClaimBinding,
+    generation: u64,
+    ids: &super::SliderRecoveryIdentifiers,
+) -> Response {
+    if let Ok(SliderCommitRecovery::Completed { status, body, .. }) = recover_slider_commit(
+        db, claim_id, token, binding, generation, ids,
+    )
+    .await
+    {
+        return (StatusCode::from_u16(status).unwrap_or(StatusCode::OK), Json(body)).into_response();
+    }
+    mutation_error(StatusCode::SERVICE_UNAVAILABLE, "SLIDER_CLAIM_FENCE_LOST", "Klaim mutasi slider tidak dapat diamankan")
+}
+
+async fn recover_or_commit_unknown(
+    db: &Database,
+    claim_id: ObjectId,
+    token: &str,
+    binding: &SliderClaimBinding,
+    generation: u64,
+    started_at: DateTime,
+    ids: &super::SliderRecoveryIdentifiers,
+) -> Response {
+    if let Ok(SliderCommitRecovery::Completed { status, body, .. }) = recover_slider_commit(
+        db, claim_id, token, binding, generation, ids,
+    )
+    .await
+    {
+        return (StatusCode::from_u16(status).unwrap_or(StatusCode::OK), Json(body)).into_response();
+    }
+    commit_unknown_response(db, claim_id, token, binding, generation, started_at).await
+}
+
 fn is_existing_image(before: Option<&str>, image: &str) -> bool { before == Some(image) }
 fn ensure_cover_file(image: &str) -> Result<(), Response> { let Some((folder,file))=crate::services::managed_asset_registry::canonical_managed_path(image).ok() else { return Err(registry_error_response(RegistryError::PathInvalid)); }; if folder!="covers" || !Path::new(&crate::routes::uploads::upload_root()).join(folder).join(file).is_file() { return Err(registry_error_response(RegistryError::Unavailable)); } Ok(()) }
 async fn is_registered_asset(db:&Database, session:&mut ClientSession, path:&str, _unused:bool)->Result<bool,Response>{ Ok(db.collection::<Document>(MANAGED_ASSETS_COLLECTION).find_one(doc!{"canonicalPath":path,"folder":"covers"}).session(&mut *session).await.map_err(|_|registry_error_response(RegistryError::Storage))?.is_some()) }
@@ -374,5 +447,16 @@ mod tests {
         assert!(effective_requires_step_up(SliderAction::Update,Some(&before),snapshot_after(SliderAction::Update,Some(before.id),&input,Some(&before)).as_ref(),&[],&[]));
         input.status=false; input.name=before.name.clone();
         assert!(!effective_requires_step_up(SliderAction::Update,Some(&before),snapshot_after(SliderAction::Update,Some(before.id),&input,Some(&before)).as_ref(),&[],&[]));
+    }
+
+    #[test]
+    fn stale_revision_body_contains_latest_admin_snapshot() {
+        let latest = super::super::slider_snapshot::admin_snapshot_from_documents(15, &[]);
+        let body = version_conflict_body(14, 15, latest).unwrap();
+        assert_eq!(body["error"]["code"], "SLIDER_VERSION_CONFLICT");
+        assert_eq!(body["error"]["currentRevision"], 15);
+        assert_eq!(body["error"]["currentSnapshot"]["revision"], 15);
+        assert!(body["error"]["currentSnapshot"]["sliders"].is_array());
+        assert!(body["error"]["currentSnapshot"]["limits"].is_object());
     }
 }

@@ -44,9 +44,9 @@ pub use slider_idempotency::{
     complete_slider_claim_in_session, mark_slider_commit_unknown_conditionally,
     mark_slider_transaction_started, normalize_slider_claim_binding,
     normalize_slider_idempotency_key, preallocate_slider_recovery_ids,
-    store_recovery_identifiers, SliderClaimBegin, SliderClaimBinding, SliderClaimError,
-    SliderCommitRecovery, SliderRecoveryIdentifiers, SLIDER_IDEMPOTENCY_CLAIMS_COLLECTION,
-    slider_idempotency_index_models,
+    recover_slider_commit, store_recovery_identifiers, verify_slider_claim_fence_in_session,
+    SliderClaimBegin, SliderClaimBinding, SliderClaimError, SliderCommitRecovery,
+    SliderRecoveryIdentifiers, SLIDER_IDEMPOTENCY_CLAIMS_COLLECTION, slider_idempotency_index_models,
 };
 pub use slider_snapshot::{
     load_archived_snapshot, load_current_snapshot, load_public_snapshot, load_slider_revision,

@@ -388,6 +388,61 @@ pub fn slider_claim_fence_filter(
     }
 }
 
+/// Build the complete write-side fence predicate. Every identity and recovery field is matched
+/// inside the transaction so a stale executor cannot perform a domain/reference/revision/audit
+/// write after a lease takeover or claim completion.
+pub fn slider_claim_fence_filter_with_recovery(
+    claim_id: ObjectId,
+    claim_token: &str,
+    binding: &SliderClaimBinding,
+    lease_generation: u64,
+    transaction_started_at: DateTime,
+    identifiers: &SliderRecoveryIdentifiers,
+) -> Document {
+    let mut filter = slider_claim_fence_filter(claim_id, claim_token, binding, lease_generation);
+    filter.extend(doc! {
+        "state": SLIDER_CLAIM_STATE_IN_PROGRESS,
+        "commitUnknown": { "$ne": true },
+        "transactionStartedAt": transaction_started_at,
+        "responseBodyJson": { "$exists": false },
+    });
+    filter.extend(recovery_identifier_filter(identifiers));
+    filter
+}
+
+/// Revalidate the durable claim fence using the same MongoDB session as the mutation writes.
+/// A missing row is a fence loss, never permission to continue or to reclaim/re-execute.
+pub async fn verify_slider_claim_fence_in_session(
+    db: &Database,
+    session: &mut ClientSession,
+    claim_id: ObjectId,
+    claim_token: &str,
+    binding: &SliderClaimBinding,
+    lease_generation: u64,
+    transaction_started_at: DateTime,
+    identifiers: &SliderRecoveryIdentifiers,
+) -> Result<(), SliderClaimError> {
+    let filter = slider_claim_fence_filter_with_recovery(
+        claim_id,
+        claim_token,
+        binding,
+        lease_generation,
+        transaction_started_at,
+        identifiers,
+    );
+    let claim = db
+        .collection::<Document>(SLIDER_IDEMPOTENCY_CLAIMS_COLLECTION)
+        .find_one(filter)
+        .session(&mut *session)
+        .await
+        .map_err(|_| SliderClaimError::Storage)?;
+    if claim.is_some() {
+        Ok(())
+    } else {
+        Err(SliderClaimError::Fenced)
+    }
+}
+
 pub fn commit_unknown_filter(
     claim_id: ObjectId,
     claim_token: &str,
@@ -1095,6 +1150,34 @@ mod tests {
     }
 
     #[test]
+    fn write_fence_filter_revalidates_every_execution_identity_field() {
+        let value = binding();
+        let ids = SliderRecoveryIdentifiers {
+            candidate_slider_id: Some(ObjectId::new()),
+            audit_event_id: ObjectId::new(),
+            candidate_result_revision: 8,
+        };
+        let started_at = DateTime::from_millis(10);
+        let filter = slider_claim_fence_filter_with_recovery(
+            ObjectId::new(),
+            "token-1",
+            &value,
+            4,
+            started_at,
+            &ids,
+        );
+        assert_eq!(filter.get_str("claimToken"), Ok("token-1"));
+        assert_eq!(filter.get_i64("leaseGeneration"), Ok(4));
+        assert_eq!(filter.get_datetime("transactionStartedAt"), Ok(&started_at));
+        assert_eq!(filter.get_object_id("auditEventId"), Ok(ids.audit_event_id));
+        assert_eq!(filter.get_i64("candidateResultRevision"), Ok(8));
+        assert_eq!(filter.get_object_id("candidateSliderId"), Ok(ids.candidate_slider_id.unwrap()));
+        assert_eq!(filter.get_str("state"), Ok(SLIDER_CLAIM_STATE_IN_PROGRESS));
+        assert!(filter.get_document("responseBodyJson").is_ok());
+        assert!(filter.get_document("commitUnknown").is_ok());
+    }
+
+    #[test]
     fn completed_claim_cannot_be_overwritten_by_commit_unknown() {
         let value = binding();
         let mut completed = fixture_claim_for(&value, doc! {
@@ -1118,6 +1201,25 @@ mod tests {
     #[test]
     fn ambiguous_recovery_is_conservative_without_complete_proof() {
         let outcome = recover_slider_commit_from_evidence(&binding(), &SliderRecoveryEvidence::default());
+        assert_eq!(outcome, SliderCommitRecovery::CommitUnknown);
+    }
+
+    #[test]
+    fn unresolved_recovery_stays_unknown_even_with_domain_and_audit_evidence() {
+        let value = binding();
+        let claim = fixture_claim_for(&value, doc! {
+            "transactionStartedAt": DateTime::now(),
+        });
+        let outcome = recover_slider_commit_from_evidence(
+            &value,
+            &SliderRecoveryEvidence {
+                claim: Some(claim),
+                domain: Some(doc! {"_id": ObjectId::new()}),
+                audit: Some(doc! {"_id": ObjectId::new()}),
+                current_revision: Some(8),
+                ..Default::default()
+            },
+        );
         assert_eq!(outcome, SliderCommitRecovery::CommitUnknown);
     }
 }

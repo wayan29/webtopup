@@ -289,6 +289,20 @@ fn limits_from_documents(documents: &[Document]) -> SliderLimits {
     }
 }
 
+/// Build the same admin snapshot shape used by the read endpoint from an already-consistent
+/// transaction snapshot. Mutation conflicts use this helper so their frozen body contains the
+/// latest sliders and capacity metadata, not just the scalar revision.
+pub(crate) fn admin_snapshot_from_documents(
+    revision: i64,
+    documents: &[Document],
+) -> SliderAdminSnapshot {
+    SliderAdminSnapshot {
+        revision,
+        sliders: documents.iter().map(admin_item_from_document).collect(),
+        limits: limits_from_documents(documents),
+    }
+}
+
 fn admin_item_from_document(document: &Document) -> SliderAdminItem {
     SliderAdminItem {
         id: document

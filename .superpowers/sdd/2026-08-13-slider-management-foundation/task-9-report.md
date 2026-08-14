@@ -22,3 +22,27 @@ The write closure revalidates the revision and limits, acquires and swaps manage
 ## Residual risks
 
 Live Mongo transaction races, registry swaps, ambiguous commit recovery, and filesystem fault integration were not exercised because no services were started. The task preserves the existing legacy handlers in source for compatibility, while the registered create/update paths now point to the transaction orchestrator. Rust formatting remains unavailable as documented by prior tasks.
+
+## Fix round 1
+
+### RED evidence
+
+Focused pure tests were added for the complete same-session write fence, unresolved recovery remaining `CommitUnknown` even when domain/audit evidence exists, and stale conflict response snapshots. The fence test initially failed to compile because `slider_claim_fence_filter_with_recovery` and `verify_slider_claim_fence_in_session` were absent; the recovery/snapshot tests likewise preceded their helpers. These were the intended RED seams before the production changes.
+
+### GREEN implementation
+
+- F1: added reusable `slider_claim_fence_filter_with_recovery` plus `verify_slider_claim_fence_in_session`; `write_transaction` performs this exact token/binding/generation/recovery-ID/start-time/incomplete/no-frozen-response check as its first session operation.
+- F2: post-fence failures, session/start failures, operation failures, and response loss now use bounded recovery/conditional commit-unknown handling; durable fences are never converted to retryable execution or re-executed after abort.
+- F3: stale revision frozen conflicts now include `expectedRevision`, `currentRevision`, and the latest current admin snapshot with sliders and limits; pure coverage asserts the shape.
+- F4: ambiguous/response-loss paths perform majority recovery first; completed frozen results replay with `replayed: true`, otherwise the claim is conditionally marked commit unknown. Added completed replay and unresolved-unknown evidence tests.
+
+### Fix-round validation
+
+- `cd rust-api && cargo test slider_mutation_create -- --nocapture`: passed (1 test).
+- `cd rust-api && cargo test slider_mutation_update -- --nocapture`: passed (1 test).
+- `cd rust-api && cargo test slider_idempotency -- --nocapture`: passed (13 tests, including completed replay/unresolved unknown/fence tests).
+- `cd rust-api && cargo test managed_asset_registry -- --nocapture`: passed (9 tests).
+- `cd rust-api && cargo check --bin webtopup-rust-api`: passed.
+- `git diff --check`: passed.
+
+Residual live Mongo risks remain: same-session fence races, majority recovery under replica-set failover, ambiguous commit classification, registry swaps, and deliberate response-loss behavior were not exercised against live services; no services were started.
