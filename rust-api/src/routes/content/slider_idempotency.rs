@@ -8,8 +8,8 @@
 use mongodb::{
     bson::{doc, oid::ObjectId, Bson, DateTime, Document},
     options::{
-        IndexOptions, InsertOneOptions, ReturnDocument, UpdateModifications, UpdateOptions,
-        WriteConcern,
+        FindOneOptions, IndexOptions, InsertOneOptions, ReadConcern, UpdateModifications,
+        UpdateOptions, WriteConcern,
     },
     ClientSession, Database, IndexModel,
 };
@@ -252,6 +252,19 @@ pub fn normalize_slider_idempotency_key(raw: &str) -> Result<String, SliderClaim
     Ok(key.to_string())
 }
 
+pub fn normalize_slider_claim_binding(
+    binding: &SliderClaimBinding,
+) -> Result<SliderClaimBinding, SliderClaimError> {
+    Ok(SliderClaimBinding {
+        key: normalize_slider_idempotency_key(&binding.key)?,
+        ..binding.clone()
+    })
+}
+
+pub fn recovery_read_concern() -> ReadConcern {
+    ReadConcern::majority()
+}
+
 pub fn generate_slider_claim_token() -> String {
     rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -443,13 +456,13 @@ pub async fn begin_slider_claim(
     db: &Database,
     binding: &SliderClaimBinding,
 ) -> Result<SliderClaimBegin, SliderClaimError> {
-    let key = normalize_slider_idempotency_key(&binding.key)?;
+    let binding = normalize_slider_claim_binding(binding)?;
     let now = DateTime::now();
     let claim_id = ObjectId::new();
     let claim_token = generate_slider_claim_token();
     let document = slider_claim_document(
         claim_id,
-        &SliderClaimBinding { key, ..binding.clone() },
+        &binding,
         &claim_token,
         1,
         now,
@@ -475,7 +488,7 @@ pub async fn begin_slider_claim(
                 .await
                 .map_err(|_| SliderClaimError::Storage)?
                 .ok_or(SliderClaimError::Storage)?;
-            classify_existing_claim(&claims, existing, binding, now).await
+            classify_existing_claim(&claims, existing, &binding, now).await
         }
         Err(_) => Err(SliderClaimError::Storage),
     }
@@ -746,7 +759,18 @@ pub fn recover_slider_commit_from_evidence(
         return SliderCommitRecovery::CommitUnknown;
     }
     if claim.get_str("state").ok() == Some(SLIDER_CLAIM_STATE_COMPLETED) {
-        return completed_recovery_from_document(claim);
+        return match completed_recovery_from_document(claim) {
+            SliderCommitRecovery::Completed {
+                status,
+                body,
+                result_revision,
+            } => SliderCommitRecovery::Completed {
+                status,
+                body: replay_slider_response(&body),
+                result_revision,
+            },
+            SliderCommitRecovery::CommitUnknown => SliderCommitRecovery::CommitUnknown,
+        };
     }
     // A durable fence plus incomplete proof is permanently ambiguous.  Even a proven absence of
     // domain rows is not permission to execute the same key again.
@@ -764,6 +788,9 @@ pub async fn recover_slider_commit(
     identifiers: &SliderRecoveryIdentifiers,
 ) -> Result<SliderCommitRecovery, SliderClaimError> {
     let claims = db.collection::<Document>(SLIDER_IDEMPOTENCY_CLAIMS_COLLECTION);
+    let recovery_options = FindOneOptions::builder()
+        .read_concern(recovery_read_concern())
+        .build();
     let Some(claim) = claims
         .find_one(slider_claim_fence_filter(
             claim_id,
@@ -771,6 +798,7 @@ pub async fn recover_slider_commit(
             binding,
             lease_generation,
         ))
+        .with_options(recovery_options.clone())
         .await
         .map_err(|_| SliderClaimError::Storage)?
     else {
@@ -794,17 +822,24 @@ pub async fn recover_slider_commit(
     // supporting evidence only; without a frozen response the result remains unknown.
     let sliders = db.collection::<Document>("sliders");
     if let Some(candidate) = identifiers.candidate_slider_id {
-        evidence.domain = sliders.find_one(doc! { "_id": candidate }).await.ok().flatten();
+        evidence.domain = sliders
+            .find_one(doc! { "_id": candidate })
+            .with_options(recovery_options.clone())
+            .await
+            .ok()
+            .flatten();
     }
     let audits = db.collection::<Document>("slideraudits");
     evidence.audit = audits
         .find_one(doc! { "_id": identifiers.audit_event_id })
+        .with_options(recovery_options.clone())
         .await
         .ok()
         .flatten();
     let metadata = db.collection::<Document>("slidermetadata");
     evidence.current_revision = metadata
         .find_one(doc! { "_id": "global" })
+        .with_options(recovery_options)
         .await
         .ok()
         .flatten()
@@ -932,6 +967,46 @@ mod tests {
             claim.insert(key, value);
         }
         claim
+    }
+
+    #[test]
+    fn normalized_binding_trims_key_before_claim_lookup() {
+        let mut value = binding();
+        value.key = "  slider_test_key_01  ".to_string();
+        let normalized = normalize_slider_claim_binding(&value).unwrap();
+        assert_eq!(normalized.key, "slider_test_key_01");
+        assert_eq!(normalized.operator_id, value.operator_id);
+        assert_eq!(normalized.target_id, value.target_id);
+    }
+
+    #[test]
+    fn recovery_reads_require_majority_concern() {
+        assert_eq!(recovery_read_concern(), ReadConcern::majority());
+    }
+
+    #[test]
+    fn evidence_recovery_marks_completed_response_as_replayed() {
+        let value = binding();
+        let claim = fixture_claim_for(&value, doc! {
+            "state": SLIDER_CLAIM_STATE_COMPLETED,
+            "responseStatus": 200_i32,
+            "responseBodyJson": "{\"ok\":true,\"replayed\":false}",
+            "resultRevision": 8_i64,
+            "transactionStartedAt": DateTime::now(),
+        });
+        let outcome = recover_slider_commit_from_evidence(
+            &value,
+            &SliderRecoveryEvidence {
+                claim: Some(claim),
+                claim_token: Some("token-1".to_string()),
+                lease_generation: Some(1),
+                ..Default::default()
+            },
+        );
+        let SliderCommitRecovery::Completed { body, .. } = outcome else {
+            panic!("expected completed recovery");
+        };
+        assert_eq!(body["replayed"], true);
     }
 
     #[test]

@@ -59,3 +59,13 @@ Result: passed.
 ## Residual risks
 
 Mongo-backed claim races and ambiguous-commit behavior were not exercised against a live database because services were not started. Task 9 must wire these pure/session primitives into the transaction orchestration and preserve their conservative recovery semantics. `cargo fmt --check` remains unavailable because `rustfmt` is not installed, per the brief.
+
+## Review fix round
+
+A focused independent review confirmed three real issues and they were fixed with RED/GREEN tests:
+
+- `begin_slider_claim` now normalizes the binding once before insert, duplicate lookup, and classification, so padded equivalent keys cannot bypass the permanent claim.
+- `recover_slider_commit` now applies majority read concern to the claim, bounded domain/audit, and revision reads after ambiguous commit.
+- Completed evidence recovery now returns the frozen body with derived `replayed: true`, matching ordinary same-key replay semantics.
+
+RED: each new focused test initially failed because its helper was absent. GREEN: all three passed. Final focused claim suite passed 11/11; managed registry 9/9; API cargo check and diff check passed. Live Mongo recovery races remain unverified.
