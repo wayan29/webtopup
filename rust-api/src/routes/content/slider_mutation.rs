@@ -21,7 +21,7 @@ use crate::{
     routes::auth::require_trusted_step_up_group,
     security::{require_permission, AuthenticatedProxyUser},
     services::{
-        audit_sanitize::sanitize_audit_document,
+        audit_sanitize::{sanitize_audit_document, sanitize_slider_audit_document},
         idempotency::{sha256_hex, commit_mongo_transaction_with_unknown_retry, TransactionCommitOutcome},
         local_fault::consume_slider_response_loss_fault,
         managed_asset_registry::{
@@ -1555,7 +1555,7 @@ fn build_slider_domain_audit_document_with_order(
     audit.insert("managedReferences", references);
     audit.insert("managedReferenceReleased", managed_reference_released);
     audit.insert("referenceClassification", reference_classification);
-    sanitize_audit_document(&audit)
+    sanitize_slider_audit_document(&audit)
 }
 
 /// Construct the complete sanitized domain-audit shape. This pure seam deliberately accepts only

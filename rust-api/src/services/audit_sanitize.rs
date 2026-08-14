@@ -5,6 +5,7 @@ const MAX_AUDIT_DEPTH: usize = 8;
 const MAX_ARRAY_ENTRIES: usize = 50;
 const MAX_OBJECT_ENTRIES: usize = 100;
 const MAX_STRING_CHARS: usize = 500;
+const SLIDER_ORDERING_EVIDENCE_KEYS: &[&str] = &["oldDigest", "newDigest", "digest"];
 
 const EXACT_SENSITIVE_AUDIT_KEYS: &[&str] = &[
     "password",
@@ -70,13 +71,46 @@ fn regex_like_sensitive(normalized: &str) -> bool {
 }
 
 pub fn sanitize_audit_document(document: &Document) -> Document {
-    match sanitize_audit_bson(&Bson::Document(document.clone()), 0) {
+    sanitize_document_with_context(document, AuditSanitizeContext::Default)
+}
+
+/// Sanitize a slider domain audit while retaining the nonsecret full-order integrity evidence.
+/// The exception is deliberately scoped to the exact top-level `ordering` object and its three
+/// required evidence keys; arbitrary digest-like authorization fields remain redacted.
+pub fn sanitize_slider_audit_document(document: &Document) -> Document {
+    sanitize_document_with_context(document, AuditSanitizeContext::SliderRoot)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuditSanitizeContext {
+    Default,
+    SliderRoot,
+    SliderOrdering,
+}
+
+fn sanitize_document_with_context(
+    document: &Document,
+    context: AuditSanitizeContext,
+) -> Document {
+    match sanitize_audit_bson_with_context(
+        &Bson::Document(document.clone()),
+        0,
+        context,
+    ) {
         Bson::Document(sanitized) => sanitized,
         other => doc_with_single_value("value", other),
     }
 }
 
 pub fn sanitize_audit_bson(value: &Bson, depth: usize) -> Bson {
+    sanitize_audit_bson_with_context(value, depth, AuditSanitizeContext::Default)
+}
+
+fn sanitize_audit_bson_with_context(
+    value: &Bson,
+    depth: usize,
+    context: AuditSanitizeContext,
+) -> Bson {
     if depth >= MAX_AUDIT_DEPTH {
         return Bson::String("[depth-limited]".to_string());
     }
@@ -88,10 +122,22 @@ pub fn sanitize_audit_bson(value: &Bson, depth: usize) -> Bson {
                 if index >= MAX_OBJECT_ENTRIES {
                     break;
                 }
-                if is_sensitive_audit_metadata_key(key) {
+                let ordering_evidence = context == AuditSanitizeContext::SliderOrdering
+                    && SLIDER_ORDERING_EVIDENCE_KEYS.contains(&key.as_str());
+                if is_sensitive_audit_metadata_key(key) && !ordering_evidence {
                     sanitized.insert(key, Bson::String(AUDIT_REDACTION.to_string()));
                 } else {
-                    sanitized.insert(key, sanitize_audit_bson(entry, depth + 1));
+                    let child_context = if context == AuditSanitizeContext::SliderRoot
+                        && key == "ordering"
+                    {
+                        AuditSanitizeContext::SliderOrdering
+                    } else {
+                        AuditSanitizeContext::Default
+                    };
+                    sanitized.insert(
+                        key,
+                        sanitize_audit_bson_with_context(entry, depth + 1, child_context),
+                    );
                 }
             }
             Bson::Document(sanitized)
@@ -100,7 +146,14 @@ pub fn sanitize_audit_bson(value: &Bson, depth: usize) -> Bson {
             entries
                 .iter()
                 .take(MAX_ARRAY_ENTRIES)
-                .map(|entry| sanitize_audit_bson(entry, depth + 1))
+                // Arrays cannot be the exact `ordering` object path, so reset context here.
+                .map(|entry| {
+                    sanitize_audit_bson_with_context(
+                        entry,
+                        depth + 1,
+                        AuditSanitizeContext::Default,
+                    )
+                })
                 .collect(),
         ),
         Bson::String(text) if text.chars().count() > MAX_STRING_CHARS => {
@@ -146,6 +199,45 @@ mod tests {
         assert!(!is_sensitive_audit_metadata_key("mapping"));
         assert!(!is_sensitive_audit_metadata_key("pinned"));
         assert!(!is_sensitive_audit_metadata_key("opinion"));
+    }
+
+    #[test]
+    fn slider_audit_sanitizer_preserves_ordering_evidence_without_widening_redaction() {
+        let input = doc! {
+            "ordering": {
+                "oldDigest": "old-order-integrity",
+                "newDigest": "new-order-integrity",
+                "digest": "order-transition-integrity",
+                "payloadDigest": "ordering-secret",
+            },
+            "result": { "evidence": "transaction_committed" },
+            "authorizationDigest": "authorization-secret",
+            "payloadDigest": "payload-secret",
+            "digest": "generic-secret",
+        };
+
+        let output = sanitize_slider_audit_document(&input);
+        let ordering = output.get_document("ordering").unwrap();
+        assert_eq!(ordering.get_str("oldDigest"), Ok("old-order-integrity"));
+        assert_eq!(ordering.get_str("newDigest"), Ok("new-order-integrity"));
+        assert_eq!(ordering.get_str("digest"), Ok("order-transition-integrity"));
+        assert_eq!(
+            output.get_document("result").unwrap().get_str("evidence"),
+            Ok("transaction_committed")
+        );
+        assert_eq!(ordering.get_str("payloadDigest"), Ok(AUDIT_REDACTION));
+        assert_eq!(output.get_str("authorizationDigest"), Ok(AUDIT_REDACTION));
+        assert_eq!(output.get_str("payloadDigest"), Ok(AUDIT_REDACTION));
+        assert_eq!(output.get_str("digest"), Ok(AUDIT_REDACTION));
+
+        // The shared sanitizer remains strict for arbitrary digest-like keys.
+        let generic = sanitize_audit_document(&doc! {
+            "ordering": { "digest": "not-slider-context" },
+        });
+        assert_eq!(
+            generic.get_document("ordering").unwrap().get_str("digest"),
+            Ok(AUDIT_REDACTION)
+        );
     }
 
     #[test]
