@@ -48,6 +48,7 @@ pub enum SliderPolicyError {
     InvalidLink,
     InvalidRevision,
     EmptyChanges,
+    InvalidOrder,
 }
 
 impl SliderPolicyError {
@@ -58,6 +59,7 @@ impl SliderPolicyError {
             Self::InvalidLink => "SLIDER_LINK_INVALID",
             Self::InvalidRevision => "SLIDER_REVISION_INVALID",
             Self::EmptyChanges => "SLIDER_CHANGES_EMPTY",
+            Self::InvalidOrder => "SLIDER_ORDER_INVALID",
         }
     }
 
@@ -68,8 +70,30 @@ impl SliderPolicyError {
             Self::InvalidLink => "Link slider tidak valid",
             Self::InvalidRevision => "expectedRevision harus bilangan bulat non-negatif",
             Self::EmptyChanges => "changes wajib berisi setidaknya satu field",
+            Self::InvalidOrder => "Urutan slider harus mencakup semua ID tepat sekali dengan sortOrder 0..n-1",
         }
     }
+}
+
+/// Validate a reorder payload independently of the authoritative current list.
+/// Callers must still compare IDs with every current/non-archived slider in the write transaction.
+pub fn validate_slider_order_entries(
+    entries: &[(ObjectId, i64)],
+) -> Result<(), SliderPolicyError> {
+    if entries.is_empty() {
+        return Err(SliderPolicyError::InvalidOrder);
+    }
+    let mut ids = std::collections::HashSet::with_capacity(entries.len());
+    let mut orders = std::collections::HashSet::with_capacity(entries.len());
+    for (id, order) in entries {
+        if *order < 0 || !ids.insert(*id) || !orders.insert(*order) {
+            return Err(SliderPolicyError::InvalidOrder);
+        }
+    }
+    if (0..entries.len() as i64).any(|order| !orders.contains(&order)) {
+        return Err(SliderPolicyError::InvalidOrder);
+    }
+    Ok(())
 }
 
 pub fn trim_nfc(raw: &str) -> String {

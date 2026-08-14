@@ -38,6 +38,9 @@ pub use slider_mutation::{
     execute_slider_mutation,
     slider_create as slider_mutation_create,
     slider_update as slider_mutation_update,
+    slider_archive as slider_mutation_archive,
+    slider_restore as slider_mutation_restore,
+    slider_reorder as slider_mutation_reorder,
 };
 pub use slider_idempotency::{
     begin_slider_claim,
@@ -59,13 +62,15 @@ pub use slider_snapshot::{
 pub use slider_policy::{
     canonical_slider_claim_digest, canonical_slider_claim_input, effective_requires_step_up,
     normalize_create, normalize_slider_image, normalize_slider_link, normalize_slider_name,
-    normalize_update, public_slider_from_document, trim_nfc, SliderAction, SliderPolicyError,
+    normalize_update, public_slider_from_document, trim_nfc, validate_slider_order_entries,
+    SliderAction, SliderPolicyError,
     MAX_CURRENT_SLIDERS,
     MAX_PUBLIC_SLIDERS, MAX_SLIDER_JSON_BYTES, SLIDER_MUTATION_CONTRACT,
 };
 pub use slider_types::{
     NormalizedSliderChanges, PublicSliderItem, SliderCreateFields, SliderCreateRequest,
-    SliderSnapshotItem, SliderUpdateChanges, SliderUpdateRequest,
+    SliderLifecycleRequest, SliderOrderItem, SliderReorderRequest, SliderSnapshotItem,
+    SliderUpdateChanges, SliderUpdateRequest,
 };
 use types::*;
 use utils::*;

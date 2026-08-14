@@ -324,8 +324,23 @@ pub fn app(state: Arc<AppState>) -> Router {
             axum::routing::put(content::sliders_update_sort_order),
         )
         .route(
+            "/v2/sliders/admin/reorder",
+            axum::routing::put(content::slider_mutation_reorder)
+                .layer(DefaultBodyLimit::max(MAX_SLIDER_JSON_BYTES)),
+        )
+        .route(
             "/v2/sliders/admin/create",
             axum::routing::post(content::slider_mutation_create)
+                .layer(DefaultBodyLimit::max(MAX_SLIDER_JSON_BYTES)),
+        )
+        .route(
+            "/v2/sliders/admin/{id}/archive",
+            axum::routing::post(content::slider_mutation_archive)
+                .layer(DefaultBodyLimit::max(MAX_SLIDER_JSON_BYTES)),
+        )
+        .route(
+            "/v2/sliders/admin/{id}/restore",
+            axum::routing::post(content::slider_mutation_restore)
                 .layer(DefaultBodyLimit::max(MAX_SLIDER_JSON_BYTES)),
         )
         .route(

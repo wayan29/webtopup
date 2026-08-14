@@ -228,6 +228,19 @@ pub async fn slider_update(
 }
 
 pub async fn slider_delete(
+    _headers: axum::http::HeaderMap,
+    _state: State<Arc<AppState>>,
+    _id: Path<String>,
+) -> Response {
+    legacy_slider_method_not_allowed("SLIDER_HARD_DELETE_DISABLED", "Penghapusan permanen slider tidak tersedia")
+}
+
+pub fn legacy_slider_method_not_allowed(code: &'static str, message: &'static str) -> Response {
+    (StatusCode::METHOD_NOT_ALLOWED, Json(serde_json::json!({"error":{"code":code,"message":message}}))).into_response()
+}
+
+#[allow(dead_code)]
+async fn slider_delete_legacy_impl(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -264,6 +277,15 @@ pub async fn slider_delete(
 }
 
 pub async fn sliders_update_sort_order(
+    _headers: axum::http::HeaderMap,
+    _state: State<Arc<AppState>>,
+    _payload: Json<SliderSortOrderPayload>,
+) -> Response {
+    legacy_slider_method_not_allowed("SLIDER_LEGACY_REORDER_DISABLED", "Urutan slider lama tidak tersedia")
+}
+
+#[allow(dead_code)]
+async fn sliders_update_sort_order_legacy_impl(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<SliderSortOrderPayload>,

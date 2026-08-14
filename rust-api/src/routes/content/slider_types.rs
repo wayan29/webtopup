@@ -31,6 +31,26 @@ pub struct SliderUpdateRequest {
     pub changes: SliderUpdateChanges,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SliderLifecycleRequest {
+    pub expected_revision: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SliderReorderRequest {
+    pub expected_revision: i64,
+    pub orders: Vec<SliderOrderItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SliderOrderItem {
+    pub id: String,
+    pub sort_order: i64,
+}
+
 /// An update contains only explicitly changed fields. `Option<bool>` is deliberate: JSON
 /// strings/numbers must not be coerced into a boolean by the request boundary.
 #[derive(Debug, Clone, Default, Deserialize)]
