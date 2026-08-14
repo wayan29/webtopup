@@ -742,6 +742,54 @@ pub async fn mark_slider_step_up_required(
     Ok(result.matched_count == 1)
 }
 
+/// Build the permanent conservative update used when a start-fence acknowledgement remains
+/// ambiguous. The explicit marker lets readiness distinguish this sealed pre-start outcome from
+/// an ordinary retryable claim, while deliberately not fabricating transactionStartedAt.
+pub fn ambiguous_start_seal_update(now: DateTime) -> Document {
+    doc! {
+        "$set": {
+            "commitUnknown": true,
+            "startFenceUnknown": true,
+            "updatedAt": now,
+        },
+        "$unset": { "leaseExpiresAt": "" },
+    }
+}
+
+/// Seal an ambiguous start-fence attempt without making the claim retryable.  This fallback is
+/// only used after bounded majority recovery cannot prove a completed result or a typed start
+/// timestamp; it intentionally does not claim that `transactionStartedAt` was written.
+pub async fn seal_slider_claim_after_ambiguous_start(
+    db: &Database,
+    claim_id: ObjectId,
+    claim_token: &str,
+    binding: &SliderClaimBinding,
+    lease_generation: u64,
+) -> Result<bool, SliderClaimError> {
+    let result = db
+        .collection::<Document>(SLIDER_IDEMPOTENCY_CLAIMS_COLLECTION)
+        .update_one(
+            {
+                let mut filter = slider_claim_fence_filter(claim_id, claim_token, binding, lease_generation);
+                filter.extend(doc! {
+                    "state": SLIDER_CLAIM_STATE_IN_PROGRESS,
+                    "commitUnknown": { "$ne": true },
+                    "responseBodyJson": { "$exists": false },
+                });
+                filter
+            },
+            ambiguous_start_seal_update(DateTime::now()),
+        )
+        .with_options(
+            UpdateOptions::builder()
+                .write_concern(WriteConcern::majority())
+                .build(),
+        )
+        .await
+        .map_err(|_| SliderClaimError::Storage)?;
+    Ok(result.matched_count == 1)
+}
+
 pub async fn mark_slider_transaction_started(
     db: &Database,
     claim_id: ObjectId,
@@ -796,6 +844,66 @@ pub fn completion_filter(
         "responseBodyJson": { "$exists": false },
     });
     filter
+}
+
+/// Build the conditional filter used to freeze a known pre-transaction conflict.  The absence
+/// of `transactionStartedAt` is part of the predicate: a stale conflict must never acquire a
+/// write-transaction fence merely to store its frozen response.
+pub fn pre_transaction_completion_filter(
+    claim_id: ObjectId,
+    claim_token: &str,
+    binding: &SliderClaimBinding,
+    lease_generation: u64,
+) -> Document {
+    let mut filter = slider_claim_fence_filter(claim_id, claim_token, binding, lease_generation);
+    filter.extend(doc! {
+        "state": SLIDER_CLAIM_STATE_IN_PROGRESS,
+        "commitUnknown": { "$ne": true },
+        "transactionStartedAt": { "$exists": false },
+        "responseBodyJson": { "$exists": false },
+    });
+    filter
+}
+
+/// Freeze a conflict discovered by the authoritative read-only preflight.  This is deliberately
+/// outside a Mongo session and majority acknowledged; only the permanent claim is written, with
+/// no domain, metadata/revision, audit, or managed-reference side effects.
+pub async fn complete_slider_claim_before_transaction(
+    db: &Database,
+    claim_id: ObjectId,
+    claim_token: &str,
+    binding: &SliderClaimBinding,
+    lease_generation: u64,
+    response_status: u16,
+    response_body: &Value,
+    result_revision: i64,
+) -> Result<bool, SliderClaimError> {
+    let body = frozen_slider_response(response_body)?;
+    let result = db
+        .collection::<Document>(SLIDER_IDEMPOTENCY_CLAIMS_COLLECTION)
+        .update_one(
+            pre_transaction_completion_filter(claim_id, claim_token, binding, lease_generation),
+            doc! {
+                "$set": {
+                    "state": SLIDER_CLAIM_STATE_COMPLETED,
+                    "responseStatus": i32::from(response_status),
+                    "responseBodyJson": body,
+                    "resultRevision": result_revision,
+                    "completedAt": DateTime::now(),
+                    "updatedAt": DateTime::now(),
+                    "commitUnknown": false,
+                },
+                "$unset": { "leaseExpiresAt": "" },
+            },
+        )
+        .with_options(
+            UpdateOptions::builder()
+                .write_concern(WriteConcern::majority())
+                .build(),
+        )
+        .await
+        .map_err(|_| SliderClaimError::Storage)?;
+    Ok(result.matched_count == 1)
 }
 
 pub async fn complete_slider_claim_in_session(
@@ -1248,6 +1356,36 @@ mod tests {
         assert!(filter.get("transactionStartedAt").is_some());
         assert!(filter.get_document("responseBodyJson").is_ok());
         assert!(filter.get("state").is_some());
+    }
+
+    #[test]
+    fn pre_transaction_conflict_filter_has_no_start_fence_or_frozen_result() {
+        let value = binding();
+        let filter = pre_transaction_completion_filter(ObjectId::new(), "token-1", &value, 4);
+        assert_eq!(filter.get_str("claimToken"), Ok("token-1"));
+        assert_eq!(filter.get_i64("leaseGeneration"), Ok(4_i64));
+        assert_eq!(filter.get_str("state"), Ok(SLIDER_CLAIM_STATE_IN_PROGRESS));
+        assert_eq!(filter.get_document("transactionStartedAt").unwrap().get_bool("$exists"), Ok(false));
+        assert_eq!(filter.get_document("responseBodyJson").unwrap().get_bool("$exists"), Ok(false));
+        assert!(filter.get_document("commitUnknown").is_ok());
+    }
+
+    #[test]
+    fn ambiguous_start_seal_uses_permanent_readiness_marker_without_fake_start() {
+        let update = ambiguous_start_seal_update(DateTime::from_millis(10));
+        let set = update.get_document("$set").unwrap();
+        assert_eq!(set.get_bool("commitUnknown"), Ok(true));
+        assert_eq!(set.get_bool("startFenceUnknown"), Ok(true));
+        assert!(!set.contains_key("transactionStartedAt"));
+        assert!(update.get_document("$unset").unwrap().contains_key("leaseExpiresAt"));
+
+        let value = binding();
+        let mut claim = fixture_claim_for(&value, doc! {
+            "commitUnknown": true,
+            "startFenceUnknown": true,
+        });
+        claim.insert("payloadDigest", "a".repeat(64));
+        assert!(crate::services::slider_readiness::valid_slider_claim_foundation(&claim));
     }
 
     #[test]

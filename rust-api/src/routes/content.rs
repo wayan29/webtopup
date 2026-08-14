@@ -41,12 +41,13 @@ pub use slider_mutation::{
 };
 pub use slider_idempotency::{
     begin_slider_claim,
-    complete_slider_claim_in_session, mark_slider_commit_unknown_conditionally,
-    mark_slider_step_up_required, mark_slider_transaction_started, normalize_slider_claim_binding,
-    pre_transaction_retry_filter,
+    complete_slider_claim_before_transaction, complete_slider_claim_in_session,
+    mark_slider_commit_unknown_conditionally, mark_slider_step_up_required,
+    mark_slider_transaction_started, normalize_slider_claim_binding, pre_transaction_retry_filter,
     normalize_slider_idempotency_key, preallocate_slider_recovery_ids,
-    read_slider_transaction_started_at, recover_slider_commit, store_recovery_identifiers,
-    verify_slider_claim_fence_in_session, SliderClaimBegin, SliderClaimBinding, SliderClaimError,
+    read_slider_transaction_started_at, recover_slider_commit, seal_slider_claim_after_ambiguous_start,
+    store_recovery_identifiers, verify_slider_claim_fence_in_session, SliderClaimBegin,
+    SliderClaimBinding, SliderClaimError,
     SliderCommitRecovery,
     SliderRecoveryIdentifiers, SLIDER_IDEMPOTENCY_CLAIMS_COLLECTION, slider_idempotency_index_models,
 };

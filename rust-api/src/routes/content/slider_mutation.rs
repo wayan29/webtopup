@@ -29,10 +29,11 @@ use crate::{
 };
 
 use super::{
-    complete_slider_claim_in_session, begin_slider_claim, canonical_slider_claim_digest,
-    effective_requires_step_up,
+    complete_slider_claim_before_transaction, complete_slider_claim_in_session,
+    begin_slider_claim, canonical_slider_claim_digest, effective_requires_step_up,
     mark_slider_commit_unknown_conditionally, mark_slider_step_up_required,
     mark_slider_transaction_started,
+    seal_slider_claim_after_ambiguous_start,
     normalize_create, normalize_update, normalize_slider_claim_binding, preallocate_slider_recovery_ids,
     read_slider_transaction_started_at, recover_slider_commit, store_recovery_identifiers,
     verify_slider_claim_fence_in_session,
@@ -161,6 +162,32 @@ pub async fn execute_slider_mutation(
         Ok(value) => value,
         Err(response) => return response,
     };
+    if let Some(body) = preflight.version_conflict.as_ref() {
+        match complete_slider_claim_before_transaction(
+            &db,
+            claim_id,
+            &claim_token,
+            &binding,
+            lease_generation,
+            409,
+            body,
+            preflight.current_revision,
+        )
+        .await
+        {
+            Ok(true) => {
+                return (StatusCode::CONFLICT, Json(body.clone())).into_response();
+            }
+            Ok(false) => {
+                return mutation_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "SLIDER_CLAIM_FENCE_LOST",
+                    "Klaim mutasi slider tidak dapat diamankan",
+                );
+            }
+            Err(error) => return claim_error_response(error),
+        }
+    }
     if preflight.requires_step_up {
         if let Err(response) = require_trusted_step_up_group(&headers, SENSITIVE_GROUP) {
             // Keep the permanent claim, but explicitly return it to an immediate pre-transaction
@@ -191,8 +218,31 @@ pub async fn execute_slider_mutation(
     if !store_recovery_identifiers(&db, claim_id, &claim_token, &binding, lease_generation, &recovery_ids).await.unwrap_or(false) {
         return mutation_error(StatusCode::SERVICE_UNAVAILABLE, "SLIDER_CLAIM_FENCE_LOST", "Klaim mutasi slider tidak dapat diamankan");
     }
-    if !mark_slider_transaction_started(&db, claim_id, &claim_token, &binding, lease_generation, &recovery_ids).await.unwrap_or(false) {
-        return mutation_error(StatusCode::SERVICE_UNAVAILABLE, "SLIDER_CLAIM_FENCE_LOST", "Klaim mutasi slider tidak dapat diamankan");
+    match mark_slider_transaction_started(
+        &db,
+        claim_id,
+        &claim_token,
+        &binding,
+        lease_generation,
+        &recovery_ids,
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) | Err(_) => {
+            // The conditional majority fence may have been acknowledged ambiguously. Never
+            // classify that outcome as a retryable/fence-loss response; recover the permanent
+            // claim and conservatively seal it when no start timestamp can be proven.
+            return recover_or_commit_unknown_from_claim(
+                &db,
+                claim_id,
+                &claim_token,
+                &binding,
+                lease_generation,
+                &recovery_ids,
+            )
+            .await;
+        }
     }
     let started_at = match read_slider_transaction_started_at(
         &db,
@@ -282,6 +332,7 @@ impl serde::Serialize for MutationInput {
 struct Preflight {
     current_revision: i64,
     requires_step_up: bool,
+    version_conflict: Option<Value>,
 }
 
 async fn load_initial_state(db: &Database, action: SliderAction, target: Option<ObjectId>) -> Result<Option<Document>, Response> {
@@ -347,12 +398,22 @@ async fn authoritative_preflight(db: &Database, action: SliderAction, target: Op
     let active_count = db.collection::<Document>("sliders").count_documents(doc! {"lifecycle": {"$ne": "archived"}, "status": true}).session(&mut session).await.map_err(|_| transaction_unavailable())? as i64;
     let limit_error = if action == SliderAction::Create && current_count >= MAX_CURRENT_SLIDERS { Some(mutation_error(StatusCode::CONFLICT, "SLIDER_TOTAL_LIMIT_REACHED", "Batas total slider tercapai")) }
         else if (action == SliderAction::Create && input.status && active_count >= MAX_PUBLIC_SLIDERS) || (action == SliderAction::Update && before.as_ref().is_some_and(|value| !value.status) && input.status && active_count >= MAX_PUBLIC_SLIDERS) { Some(mutation_error(StatusCode::CONFLICT, "SLIDER_ACTIVE_LIMIT_REACHED", "Batas slider aktif tercapai")) } else { None };
+    let version_conflict = if revision != input.expected_revision {
+        let documents = load_current_documents_in_session(db, &mut session).await.map_err(|_| transaction_unavailable())?;
+        let snapshot = super::slider_snapshot::admin_snapshot_from_documents(revision, &documents);
+        Some(version_conflict_body(input.expected_revision, revision, snapshot)?)
+    } else {
+        None
+    };
     let _ = session.abort_transaction().await;
-    if revision != input.expected_revision {
-        return Ok(Preflight { current_revision: revision, requires_step_up: false });
+    // A stale expected revision is authoritative even when the current collection also happens
+    // to be at a capacity limit: freeze the conflict before any claim fence or domain write.
+    if version_conflict.is_none() {
+        if let Some(response) = limit_error {
+            return Err(response);
+        }
     }
-    if let Some(response) = limit_error { return Err(response); }
-    Ok(Preflight { current_revision: revision, requires_step_up })
+    Ok(Preflight { current_revision: revision, requires_step_up, version_conflict })
 }
 
 async fn write_transaction(session: &mut ClientSession, db: &Database, operator: &AuthenticatedProxyUser, headers: &HeaderMap, action: SliderAction, target: Option<ObjectId>, input: &MutationInput, binding: &SliderClaimBinding, claim_id: ObjectId, claim_token: &str, generation: u64, started_at: DateTime, ids: &super::SliderRecoveryIdentifiers, preflight: Preflight) -> Result<(StatusCode, Value), Response> {
@@ -363,10 +424,28 @@ async fn write_transaction(session: &mut ClientSession, db: &Database, operator:
         .map_err(claim_error_response)?;
     let revision = load_revision_in_session(db, session).await.map_err(|_| transaction_unavailable())?;
     if revision != input.expected_revision {
-        let documents = load_current_documents_in_session(db, session).await.map_err(|_| transaction_unavailable())?;
-        let snapshot = super::slider_snapshot::admin_snapshot_from_documents(revision, &documents);
-        let body = version_conflict_body(input.expected_revision, revision, snapshot)?;
-        complete_slider_claim_in_session(db, session, claim_id, claim_token, binding, generation, started_at, 409, &body, revision, ids.audit_event_id).await.map_err(claim_error_response)?;
+        // The authoritative preflight owns normal stale-revision resolution. A revision change
+        // after that read-only phase is a deterministic optimistic conflict, not an ambiguous
+        // commit: freeze it in this already-fenced transaction without rerunning the mutation.
+        let documents = load_current_documents_in_session(db, session)
+            .await
+            .map_err(|_| transaction_unavailable())?;
+        let body = write_revision_conflict_body(input.expected_revision, revision, &documents)?;
+        complete_slider_claim_in_session(
+            db,
+            session,
+            claim_id,
+            claim_token,
+            binding,
+            generation,
+            started_at,
+            409,
+            &body,
+            revision,
+            ids.audit_event_id,
+        )
+        .await
+        .map_err(claim_error_response)?;
         return Ok((StatusCode::CONFLICT, body));
     }
     let current = if action == SliderAction::Update {
@@ -457,6 +536,18 @@ fn version_conflict_body(expected_revision: i64, current_revision: i64, snapshot
         },
         "replayed": false,
     }))
+}
+
+fn write_revision_conflict_body(
+    expected_revision: i64,
+    current_revision: i64,
+    documents: &[Document],
+) -> Result<Value, Response> {
+    version_conflict_body(
+        expected_revision,
+        current_revision,
+        super::slider_snapshot::admin_snapshot_from_documents(current_revision, documents),
+    )
 }
 
 fn build_slider_domain_audit_document(
@@ -607,16 +698,22 @@ async fn recover_or_commit_unknown_from_claim(
             Ok(SliderCommitRecovery::CommitUnknown) | Err(_) => {}
         }
     }
-    if let Ok(Some(started_at)) = read_slider_transaction_started_at(
-        db, claim_id, token, binding, generation,
-    )
-    .await
-    {
-        // Conditional fencing prevents a stale recovery worker from changing a completed claim.
-        let _ = mark_slider_commit_unknown_conditionally(
-            db, claim_id, token, binding, generation, started_at,
-        )
-        .await;
+    match read_slider_transaction_started_at(db, claim_id, token, binding, generation).await {
+        Ok(Some(started_at)) => {
+            // Conditional fencing prevents a stale recovery worker from changing a completed claim.
+            let _ = mark_slider_commit_unknown_conditionally(
+                db, claim_id, token, binding, generation, started_at,
+            )
+            .await;
+        }
+        Ok(None) | Err(_) => {
+            // An ambiguous start update is not permission to retry. Seal even an apparently
+            // pre-transaction claim so it cannot become retryable after this request returns.
+            let _ = seal_slider_claim_after_ambiguous_start(
+                db, claim_id, token, binding, generation,
+            )
+            .await;
+        }
     }
     mutation_error(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -705,6 +802,48 @@ mod tests {
     }
 
     #[test]
+    fn start_fence_update_failure_recovers_and_seals_ambiguous_claim() {
+        let source = include_str!("slider_mutation.rs");
+        let start = source
+            .find("mark_slider_transaction_started(")
+            .expect("durable start fence call must remain explicit");
+        let after_start = &source[start..];
+        let boundary = after_start
+            .find("\n    let started_at =")
+            .expect("start fence must precede started timestamp read");
+        let path = &after_start[..boundary];
+        assert!(path.contains("recover_or_commit_unknown_from_claim"));
+        assert!(!path.contains("SLIDER_CLAIM_FENCE_LOST"));
+        let recovery = source
+            .find("async fn recover_or_commit_unknown_from_claim")
+            .expect("missing bounded start-fence recovery helper");
+        let helper = &source[recovery..]
+            [..source[recovery..].find("\n}\n\nasync fn recover_or_commit_unknown(").unwrap()];
+        assert!(helper.contains("seal_slider_claim_after_ambiguous_start"));
+        assert!(helper.contains("SLIDER_COMMIT_UNKNOWN"));
+    }
+
+    #[test]
+    fn stale_revision_is_completed_before_recovery_ids_or_start_fence() {
+        let source = include_str!("slider_mutation.rs");
+        let conflict_completion = source
+            .find("complete_slider_claim_before_transaction(")
+            .expect("stale preflight must use pre-transaction claim completion");
+        let recovery_ids = source
+            .find("store_recovery_identifiers(")
+            .expect("normal path must store recovery identifiers");
+        let start_fence = source
+            .find("mark_slider_transaction_started(")
+            .expect("normal path must durably fence the claim");
+        assert!(conflict_completion < recovery_ids);
+        assert!(conflict_completion < start_fence);
+        let write = source
+            .find("async fn write_transaction")
+            .expect("write transaction helper must remain explicit");
+        assert!(!source[write..].contains("complete_slider_claim_before_transaction("));
+    }
+
+    #[test]
     fn missing_step_up_proof_checks_claim_transition_before_returning_forbidden() {
         let source = include_str!("slider_mutation.rs");
         let mark = source
@@ -742,6 +881,26 @@ mod tests {
         assert_eq!(body["error"]["currentSnapshot"]["revision"], 15);
         assert!(body["error"]["currentSnapshot"]["sliders"].is_array());
         assert!(body["error"]["currentSnapshot"]["limits"].is_object());
+    }
+
+    #[test]
+    fn write_revision_change_freezes_a_version_conflict_body() {
+        let slider_id = ObjectId::new();
+        let documents = vec![doc! {
+            "_id": slider_id,
+            "name": "Latest",
+            "image": "/uploads/covers/1710000000000-deadbeef.webp",
+            "link": "/latest",
+            "sortOrder": 0_i64,
+            "status": false,
+            "lifecycle": "active",
+        }];
+        let body = write_revision_conflict_body(4, 5, &documents).unwrap();
+        assert_eq!(body["error"]["code"], "SLIDER_VERSION_CONFLICT");
+        assert_eq!(body["error"]["expectedRevision"], 4);
+        assert_eq!(body["error"]["currentRevision"], 5);
+        assert_eq!(body["error"]["currentSnapshot"]["revision"], 5);
+        assert_eq!(body["error"]["currentSnapshot"]["sliders"][0]["_id"], slider_id.to_hex());
     }
 
     #[test]

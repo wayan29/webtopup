@@ -618,9 +618,11 @@ pub fn valid_slider_claim_foundation(document: &Document) -> bool {
         "started" | "completed" | "inProgress" | "in_progress" | "retryable" | "commitUnknown" | "commit_unknown"
     );
     let lifecycle_consistent = match (state, commit_unknown, transaction_started_at) {
-        // A commit-unknown flag is permanently fenced and must identify that fence. Task 8 may
-        // retain the ordinary in-progress state while setting this flag.
+        // A commit-unknown flag is permanently fenced. It normally identifies a durable start
+        // fence, but an ambiguous start acknowledgement is sealed with startFenceUnknown instead
+        // of fabricating transactionStartedAt; both forms remain non-reclaimable.
         (_, true, Some(_)) => true,
+        (_, true, None) => document.get_bool("startFenceUnknown").unwrap_or(false),
         // A completed claim necessarily crossed the durable transaction-start fence.
         ("completed", false, Some(_)) => true,
         // Pre-transaction claims may not have a start timestamp yet. A fenced in-progress claim

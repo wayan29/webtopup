@@ -88,3 +88,27 @@ Added focused source-contract tests for transaction-probe ordering, exact probe 
 - Remaining required focused suites and final check/commit are pending.
 
 Residual live Mongo risks: replica-set transaction support and snapshot-read probe behavior, majority read visibility during failover, bounded recovery timing, and claim-transition races were not exercised against live services; no services were started.
+
+## Fix round 4
+
+### RED evidence
+
+Added focused source/pure RED seams for ambiguous durable start-fence handling and stale preflight conflict ordering. The RED contract required recovery rather than direct `SLIDER_CLAIM_FENCE_LOST`, permanent sealing when a start outcome remains ambiguous, a pre-transaction completion helper, and proof that stale conflicts resolve before recovery IDs/start fencing and never in the write transaction.
+
+### GREEN implementation
+
+- H: failed or ambiguous `mark_slider_transaction_started` outcomes now enter bounded majority claim recovery. Completed frozen results replay; a proven start timestamp conditionally marks `commitUnknown`; an ambiguous timestamp is permanently sealed and returns exact `503 SLIDER_COMMIT_UNKNOWN`, preventing retryable reclamation.
+- I: authoritative preflight now carries an optional frozen conflict body and latest admin snapshot. Stale expected revisions are completed with a majority conditional pre-transaction claim update requiring no `transactionStartedAt`; no domain, audit, managed-reference, metadata, or revision write occurs. Same-key retries replay the frozen conflict. The write transaction no longer fences stale conflicts.
+
+### Fix-round 4 validation
+
+- RED: added pure seams for permanent ambiguous-start sealing, conservative readiness classification, write-phase version-conflict freezing, latest snapshot shape, and no closure rerun. The pre-implementation contract failed because the seal update, readiness marker, and write conflict helper were absent.
+- GREEN: ambiguous start-fence outcomes use bounded majority recovery, replay completed frozen claims, conditionally mark known-start claims unknown, and permanently seal ambiguous pre-start claims with `commitUnknown` plus `startFenceUnknown`; sealed claims cannot be reclaimed. A revision change after preflight now freezes a `409 SLIDER_VERSION_CONFLICT` with the latest snapshot in the fenced transaction, without rerunning mutation work.
+- `cd rust-api && cargo test slider_mutation_create -- --nocapture`: passed (1 test; 0 failed).
+- `cd rust-api && cargo test slider_mutation_update -- --nocapture`: passed (1 test; 0 failed).
+- `cd rust-api && cargo test slider_idempotency -- --nocapture`: passed (16 tests; 0 failed).
+- `cd rust-api && cargo test managed_asset_registry -- --nocapture`: passed (9 tests; 0 failed).
+- `cd rust-api && cargo check --bin webtopup-rust-api`: passed (exit 0; warnings only).
+- `git diff --check`: passed.
+
+Residual live Mongo risks remain: majority conditional claim races, ambiguous start acknowledgement versus read visibility, snapshot preflight/write-phase races, registry swaps, and live same-key conflict replay were not exercised; no services were started.
