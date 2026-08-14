@@ -358,9 +358,9 @@ async fn inspect_slider_data(db: &Database, upload_root: &Path) -> Result<Vec<Sl
             continue;
         };
         asset_by_path.entry(path.clone()).or_default().push(asset);
-        match canonical_managed_path(&path) {
-            Ok((folder, _)) if folder == "covers" => {}
-            _ => add(SliderReadinessFinding::blocking("managed_asset_path_invalid", 1, vec![path.clone()])),
+        let parsed_path = canonical_managed_path(&path);
+        if parsed_path.is_err() {
+            add(SliderReadinessFinding::blocking("managed_asset_path_invalid", 1, vec![path.clone()]));
         }
         let state = asset.get_str("state").unwrap_or("");
         if matches!(state, "deleting" | "deleted") || asset.get("deletedAt").is_some_and(|value| !matches!(value, Bson::Null)) {
@@ -368,10 +368,13 @@ async fn inspect_slider_data(db: &Database, upload_root: &Path) -> Result<Vec<Sl
         } else if state != "available" {
             add(SliderReadinessFinding::blocking("managed_asset_state_invalid", 1, vec![document_id(asset)]));
         }
-        let Some((_, filename)) = canonical_managed_path(&path).ok() else { continue; };
-        let expected = upload_root.join("covers").join(filename);
-        if !expected.is_file() {
-            add(SliderReadinessFinding::blocking("managed_asset_missing_file", 1, vec![path]));
+        if let Ok((folder, filename)) = parsed_path {
+            if folder == "covers" {
+                let expected = upload_root.join(folder).join(filename);
+                if !expected.is_file() {
+                    add(SliderReadinessFinding::blocking("managed_asset_missing_file", 1, vec![path]));
+                }
+            }
         }
     }
     for (path, _) in files.iter() {
@@ -514,6 +517,12 @@ fn cover_files(root: &Path) -> Result<Vec<(String, String)>, SliderReadinessErro
 
 fn is_safe_cover_filename(filename: &str) -> bool {
     !filename.is_empty() && filename != "." && filename != ".." && filename.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn is_cover_asset_path(path: &str) -> bool {
+    canonical_managed_path(path)
+        .map(|(folder, _)| folder == "covers")
+        .unwrap_or(false)
 }
 
 fn is_valid_slider_link(value: &str) -> bool {
@@ -729,6 +738,19 @@ mod tests {
             .options(IndexOptions::builder().name("_id_".to_string()).build())
             .build();
         assert!(index_matches(&requirement, &builtin));
+    }
+
+    #[test]
+    fn non_cover_managed_assets_are_not_cover_readiness_findings() {
+        assert!(is_cover_asset_path("/uploads/covers/cover.webp"));
+        for path in [
+            "/uploads/icons/icon.png",
+            "/uploads/popups/popup.webp",
+            "/uploads/instructions/guide.png",
+            "/bundled/logo.svg",
+        ] {
+            assert!(!is_cover_asset_path(path), "{path} must not be treated as a cover");
+        }
     }
 
     #[test]
