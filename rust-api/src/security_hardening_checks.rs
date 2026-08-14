@@ -349,6 +349,121 @@ fn managed_field_source_contract_maps_each_restricted_writer_explicitly() {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ManagedFieldCallSite {
+    source: String,
+    helper: String,
+    policy: Option<String>,
+}
+
+fn scan_managed_field_call_sites() -> Vec<ManagedFieldCallSite> {
+    use std::{fs, path::{Path, PathBuf}};
+
+    fn collect_rust_files(path: &Path, files: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                collect_rust_files(&entry_path, files);
+            } else if entry_path.extension().and_then(|value| value.to_str()) == Some("rs") {
+                files.push(entry_path);
+            }
+        }
+    }
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    collect_rust_files(&root, &mut files);
+    let mut call_sites = Vec::new();
+    for path in files {
+        let Ok(relative) = path.strip_prefix(&root) else {
+            continue;
+        };
+        // Definitions and this source-contract test contain the helper names as strings; neither
+        // is a production call site. Every other Rust source file is scanned recursively.
+        if matches!(
+            relative.to_str(),
+            Some("services/managed_assets.rs" | "security_hardening_checks.rs")
+        ) {
+            continue;
+        }
+        let Ok(source) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut cursor = 0;
+        while cursor < source.len() {
+            let candidates = [
+                ("ensure_managed_field_for_update(", "ensure_managed_field_for_update"),
+                ("ensure_managed_fields(", "ensure_managed_fields"),
+                ("ensure_managed_field(", "ensure_managed_field"),
+            ];
+            let Some((offset, (needle, helper))) = candidates
+                .iter()
+                .filter_map(|candidate| {
+                    source[cursor..]
+                        .find(candidate.0)
+                        .map(|offset| (cursor + offset, *candidate))
+                })
+                .min_by_key(|(offset, _)| *offset)
+            else {
+                break;
+            };
+            let end = (offset + needle.len() + 640).min(source.len());
+            let policy = ["Icons", "Covers", "Popups", "Instructions"]
+                .iter()
+                .find(|policy| source[offset..end].contains(&format!("ManagedFieldFolderPolicy::{policy}")))
+                .map(|policy| (*policy).to_string());
+            call_sites.push(ManagedFieldCallSite {
+                source: relative.to_string_lossy().replace('\\', "/"),
+                helper: helper.to_string(),
+                policy,
+            });
+            cursor = offset + needle.len();
+        }
+    }
+    call_sites.sort_by(|left, right| {
+        left.source
+            .cmp(&right.source)
+            .then(left.helper.cmp(&right.helper))
+    });
+    call_sites
+}
+
+#[test]
+fn managed_field_source_contract_has_closed_recursive_call_site_inventory() {
+    use std::collections::BTreeSet;
+
+    let call_sites = scan_managed_field_call_sites();
+    let expected_sources = BTreeSet::from([
+        "routes/articles/validation.rs",
+        "routes/content/flash_payload.rs",
+        "routes/content/sliders.rs",
+        "routes/payment/categories.rs",
+        "routes/payment/validation.rs",
+        "routes/products/payload.rs",
+        "routes/rewards/validation.rs",
+        "routes/settings/validation.rs",
+        "routes/taxonomy/categories.rs",
+        "routes/taxonomy/operators.rs",
+        "routes/taxonomy/product_types.rs",
+    ]);
+    let actual_sources = call_sites
+        .iter()
+        .map(|call| call.source.as_str())
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(call_sites.len(), 21, "recursive managed-field call-site scan: {call_sites:?}");
+    assert_eq!(actual_sources, expected_sources);
+    assert!(call_sites.iter().all(|call| {
+        call.helper == "ensure_managed_field"
+            || call.helper == "ensure_managed_field_for_update"
+            || call.helper == "ensure_managed_fields"
+    }));
+    assert!(call_sites.iter().all(|call| call.helper != "ensure_managed_fields"));
+}
+
 fn validation_taxonomy_permission_matrix_behavior() {
     use crate::security::team_user_has_any_permission;
 
