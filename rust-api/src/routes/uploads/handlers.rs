@@ -423,7 +423,9 @@ async fn transact_asset_deletion(
         );
         match reference_check {
             DeletionReferenceCheck::AssetInUse => {
-                let _ = session.abort_transaction().await;
+                if session.abort_transaction().await.is_err() {
+                    return DeletionTransactionOutcome::Unavailable;
+                }
                 let mut references = legacy_references;
                 if actual_slider_references > 0 && !references.iter().any(|reference| {
                     reference.resource == "Sliders"
@@ -511,6 +513,35 @@ fn asset_in_use(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn upload_delete_registry_asset_in_use_requires_successful_abort() {
+        let source = include_str!("handlers.rs");
+        let asset_in_use = source
+            .split("DeletionReferenceCheck::AssetInUse")
+            .nth(1)
+            .and_then(|rest| rest.split("DeletionReferenceCheck::RegistryUnavailable").next())
+            .expect("asset-in-use branch");
+        assert!(asset_in_use.contains("if session.abort_transaction().await.is_err()"));
+    }
+
+    #[test]
+    fn upload_delete_registry_fail_closed_scenarios_are_explicit() {
+        let source = include_str!("handlers.rs");
+        for marker in [
+            "managed_asset_deletion_ready",
+            "!state.mongo_transactions_enabled",
+            "Err(RegistryError::NotFound)",
+            "snapshot.state != ManagedAssetState::Available",
+            "count_slider_references_for_deletion",
+            "count_asset_references_in_session",
+            "consume_managed_asset_unlink_fault",
+            "TransactionCommitOutcome::Ambiguous",
+            "mark_asset_deleted_after_unlink",
+        ] {
+            assert!(source.contains(marker), "missing deletion subproof marker: {marker}");
+        }
+    }
+
     #[test]
     fn upload_delete_registry_retries_transient_slider_scan_and_reruns_legacy_scan() {
         let source = include_str!("handlers.rs");
