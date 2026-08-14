@@ -511,22 +511,56 @@ pub async fn count_asset_references(
             .collection::<mongodb::bson::Document>(collection)
             .count_documents(filter)
             .await?;
-        if count > 0 {
-            // Aggregate counts for the same resource label (e.g. operators has two fields).
-            if let Some(existing) = summaries
-                .iter_mut()
-                .find(|item: &&mut AssetReferenceSummary| item.resource == *resource)
-            {
-                existing.count = existing.count.saturating_add(count);
-            } else {
-                summaries.push(AssetReferenceSummary {
-                    resource,
-                    count,
-                });
-            }
-        }
+        append_reference_summary(&mut summaries, resource, count);
     }
     Ok(summaries)
+}
+
+/// Run the complete legacy reference inventory on the transaction snapshot. This must be called
+/// again whenever the deletion transaction is retried; a scan from a prior attempt is never
+/// reusable because Task 5 writers fence through the same managed asset document.
+pub async fn count_asset_references_in_session(
+    session: &mut ClientSession,
+    db: &Database,
+    url: &str,
+) -> Result<Vec<AssetReferenceSummary>, mongodb::error::Error> {
+    let mut summaries = Vec::new();
+    for (collection, resource, field) in SCALAR_REFERENCES {
+        let filter = if *collection == "settings" && *field == "value" {
+            doc! {
+                "key": { "$in": SETTINGS_IMAGE_KEYS },
+                "value": url,
+            }
+        } else {
+            doc! { *field: url }
+        };
+        let count = db
+            .collection::<mongodb::bson::Document>(collection)
+            .count_documents(filter)
+            .session(&mut *session)
+            .await?;
+        append_reference_summary(&mut summaries, resource, count);
+    }
+    Ok(summaries)
+}
+
+fn append_reference_summary(
+    summaries: &mut Vec<AssetReferenceSummary>,
+    resource: &'static str,
+    count: u64,
+) {
+    if count == 0 {
+        return;
+    }
+    // Aggregate counts for the same resource label (e.g. operators has two fields).
+    if let Some(existing) = summaries
+        .iter_mut()
+        .find(|item| item.resource == resource)
+    {
+        existing.count = existing.count.saturating_add(count);
+    } else {
+        summaries.push(AssetReferenceSummary { resource, count });
+    }
 }
 
 fn is_safe_managed_filename(filename: &str) -> bool {

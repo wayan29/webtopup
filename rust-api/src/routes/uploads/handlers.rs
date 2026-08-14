@@ -8,8 +8,17 @@ use axum::{
 use crate::{
     security::{require_any_permission, ErrorResponse},
     services::{
-        managed_asset_registry::register_published_batch_in_transaction,
-        managed_assets::{count_asset_references, normalize_managed_asset},
+        idempotency::{commit_mongo_transaction_with_unknown_retry, TransactionCommitOutcome},
+        managed_asset_registry::{
+            count_slider_references_for_deletion, load_asset_for_deletion,
+            managed_asset_deletion_ready, register_published_batch_in_transaction,
+            transition_asset_to_deleting, deletion_reference_check, DeletionOutcome,
+            DeletionReferenceCheck, ManagedAssetState, RegistryError,
+        },
+        managed_assets::{
+            count_asset_references_in_session, normalize_managed_asset,
+            managed_asset_registry_unavailable_response,
+        },
     },
     state::AppState,
 };
@@ -191,59 +200,54 @@ pub async fn delete_file(
     }
 
     let folder = resolve_upload_folder(query.upload_type.as_deref());
+    if !managed_asset_deletion_ready(&folder) {
+        return managed_asset_registry_unavailable_response();
+    }
     let root = upload_root();
     let managed = match normalize_managed_asset(&root, &folder, filename) {
         Ok(managed) => managed,
         Err(_) => return status_message(axum::http::StatusCode::NOT_FOUND, "File not found"),
     };
 
-    if !managed.filesystem_path.is_file() {
-        return status_message(axum::http::StatusCode::NOT_FOUND, "File not found");
-    }
-
     let Some(client) = state.mongo_client.as_ref() else {
-        return status_message(
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "Database unavailable",
-        );
+        return managed_asset_registry_unavailable_response();
     };
+    if !state.mongo_transactions_enabled {
+        return managed_asset_registry_unavailable_response();
+    }
     let db = client.database(&state.mongo_db);
+    if !managed.filesystem_path.is_file() {
+        // A missing file is an integrity/reconciliation finding, not proof that an unregistered
+        // historical path may be deleted through this protocol.
+        return managed_asset_registry_unavailable_response();
+    }
 
-    let first = match count_asset_references(&db, &managed.url).await {
-        Ok(value) => value,
-        Err(_) => {
-            return status_message(
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to check asset references",
-            )
-        }
+    let outcome = match transact_asset_deletion(&db, &managed.url).await {
+        DeletionTransactionOutcome::Committed(outcome) => outcome,
+        DeletionTransactionOutcome::AssetInUse(references) => return asset_in_use(references),
+        DeletionTransactionOutcome::Unavailable => return managed_asset_registry_unavailable_response(),
     };
-    if !first.is_empty() {
-        return asset_in_use(first);
+
+    if crate::services::local_fault::consume_managed_asset_unlink_fault().await {
+        return managed_asset_registry_unavailable_response();
     }
 
-    // Second immediate scan bounds the filesystem/database race before unlink.
-    let second = match count_asset_references(&db, &managed.url).await {
-        Ok(value) => value,
-        Err(_) => {
-            return status_message(
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to check asset references",
-            )
+    let unlink_result = std::fs::remove_file(&managed.filesystem_path);
+    if let Err(error) = unlink_result {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return managed_asset_registry_unavailable_response();
         }
-    };
-    if !second.is_empty() {
-        return asset_in_use(second);
     }
 
-    match std::fs::remove_file(&managed.filesystem_path) {
-        Ok(()) => Json(UploadDeleteResponse {
-            success: true,
-            message: "File deleted successfully",
-        })
-        .into_response(),
-        Err(_) => status_message(axum::http::StatusCode::NOT_FOUND, "File not found"),
+    if !mark_asset_deleted_after_unlink(&db, outcome.asset_id).await {
+        return managed_asset_registry_unavailable_response();
     }
+
+    Json(UploadDeleteResponse {
+        success: true,
+        message: "File deleted successfully",
+    })
+    .into_response()
 }
 
 async fn publish_and_register_with_state(
@@ -323,6 +327,172 @@ fn batch_error(status: axum::http::StatusCode, code: &'static str, message: &'st
         .into_response()
 }
 
+#[derive(Debug)]
+enum DeletionTransactionOutcome {
+    Committed(DeletionOutcome),
+    AssetInUse(Vec<crate::services::managed_assets::AssetReferenceSummary>),
+    Unavailable,
+}
+
+const MAX_DELETION_TRANSACTION_RETRIES: usize = 3;
+
+/// Only registry errors explicitly mapped from Mongo's retryable labels may restart the complete
+/// deletion transaction. All other registry failures remain fail closed.
+fn is_retryable_deletion_error(error: RegistryError) -> bool {
+    matches!(error, RegistryError::TransientTransaction)
+}
+
+/// Run the deletion decision in a transaction, restarting every read (including the legacy
+/// inventory scan) after a transient conflict. The same managed asset document is read and
+/// conditionally updated, fencing registry acquisition and Task 5 legacy writers.
+async fn transact_asset_deletion(
+    db: &mongodb::Database,
+    path: &str,
+) -> DeletionTransactionOutcome {
+    for _attempt in 0..MAX_DELETION_TRANSACTION_RETRIES {
+        let mut session = match db.client().start_session().await {
+            Ok(session) => session,
+            Err(_) => return DeletionTransactionOutcome::Unavailable,
+        };
+        if session.start_transaction().await.is_err() {
+            return DeletionTransactionOutcome::Unavailable;
+        }
+
+        let snapshot = match load_asset_for_deletion(&mut session, db, path).await {
+            Ok(snapshot) => snapshot,
+            Err(RegistryError::NotFound)
+            | Err(RegistryError::PathInvalid)
+            | Err(RegistryError::Storage)
+            | Err(RegistryError::Unavailable)
+            | Err(RegistryError::AlreadyDeleting)
+            | Err(RegistryError::ReferenceMismatch)
+            | Err(RegistryError::ReferenceUnderflow)
+            | Err(RegistryError::TransactionAbortFailed)
+            | Err(RegistryError::AmbiguousCommit) => {
+                let _ = session.abort_transaction().await;
+                return DeletionTransactionOutcome::Unavailable;
+            }
+            Err(RegistryError::TransientTransaction) => {
+                if session.abort_transaction().await.is_ok() {
+                    continue;
+                }
+                return DeletionTransactionOutcome::Unavailable;
+            }
+        };
+        if snapshot.state != ManagedAssetState::Available {
+            let _ = session.abort_transaction().await;
+            return DeletionTransactionOutcome::Unavailable;
+        }
+
+        let actual_slider_references = match count_slider_references_for_deletion(
+            &mut session,
+            db,
+            snapshot.asset_id,
+            path,
+        )
+        .await
+        {
+            Ok(count) => count,
+            Err(error) => {
+                let abort_ok = session.abort_transaction().await.is_ok();
+                if is_retryable_deletion_error(error) && abort_ok {
+                    continue;
+                }
+                return DeletionTransactionOutcome::Unavailable;
+            }
+        };
+        let legacy_references = match count_asset_references_in_session(&mut session, db, path).await
+        {
+            Ok(references) => references,
+            Err(error) => {
+                let retryable = error.contains_label(mongodb::error::TRANSIENT_TRANSACTION_ERROR)
+                    || error.contains_label(mongodb::error::RETRYABLE_WRITE_ERROR)
+                    || error.contains_label(mongodb::error::RETRYABLE_ERROR);
+                let abort_ok = session.abort_transaction().await.is_ok();
+                if retryable && abort_ok {
+                    continue;
+                }
+                return DeletionTransactionOutcome::Unavailable;
+            }
+        };
+
+        let reference_check = deletion_reference_check(
+            snapshot.reference_count,
+            actual_slider_references,
+            !legacy_references.is_empty(),
+        );
+        match reference_check {
+            DeletionReferenceCheck::AssetInUse => {
+                let _ = session.abort_transaction().await;
+                let mut references = legacy_references;
+                if actual_slider_references > 0 && !references.iter().any(|reference| {
+                    reference.resource == "Sliders"
+                }) {
+                    references.push(crate::services::managed_assets::AssetReferenceSummary {
+                        resource: "Sliders",
+                        count: actual_slider_references as u64,
+                    });
+                }
+                return DeletionTransactionOutcome::AssetInUse(references);
+            }
+            DeletionReferenceCheck::RegistryUnavailable => {
+                let _ = session.abort_transaction().await;
+                return DeletionTransactionOutcome::Unavailable;
+            }
+            DeletionReferenceCheck::Clear => {}
+        }
+
+        let outcome = match transition_asset_to_deleting(&mut session, db, path, &snapshot).await {
+            Ok(outcome) => outcome,
+            Err(RegistryError::Unavailable) | Err(RegistryError::TransientTransaction) => {
+                // A conditional update miss is a transaction conflict. Retry from a fresh
+                // transaction so the legacy scan cannot be reused after a writer race.
+                let abort_ok = session.abort_transaction().await.is_ok();
+                if abort_ok {
+                    continue;
+                }
+                return DeletionTransactionOutcome::Unavailable;
+            }
+            Err(_) => {
+                let _ = session.abort_transaction().await;
+                return DeletionTransactionOutcome::Unavailable;
+            }
+        };
+
+        match commit_mongo_transaction_with_unknown_retry(&mut session).await {
+            TransactionCommitOutcome::Committed => {
+                return DeletionTransactionOutcome::Committed(outcome);
+            }
+            TransactionCommitOutcome::Ambiguous | TransactionCommitOutcome::FailedDefinitely => {
+                // No commit outcome authorizes unlink. The asset remains deleting or is left for
+                // reconciliation; never retry this decision with a potentially durable transition.
+                return DeletionTransactionOutcome::Unavailable;
+            }
+        }
+    }
+    DeletionTransactionOutcome::Unavailable
+}
+
+async fn mark_asset_deleted_after_unlink(db: &mongodb::Database, asset_id: mongodb::bson::oid::ObjectId) -> bool {
+    let Ok(mut session) = db.client().start_session().await else {
+        return false;
+    };
+    if session.start_transaction().await.is_err() {
+        return false;
+    }
+    if crate::services::managed_asset_registry::mark_asset_deleted(&mut session, db, asset_id)
+        .await
+        .is_err()
+    {
+        let _ = session.abort_transaction().await;
+        return false;
+    }
+    matches!(
+        commit_mongo_transaction_with_unknown_retry(&mut session).await,
+        TransactionCommitOutcome::Committed
+    )
+}
+
 fn asset_in_use(
     references: Vec<crate::services::managed_assets::AssetReferenceSummary>,
 ) -> Response {
@@ -337,4 +507,30 @@ fn asset_in_use(
         }),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn upload_delete_registry_retries_transient_slider_scan_and_reruns_legacy_scan() {
+        let source = include_str!("handlers.rs");
+        let transaction_start = source
+            .find("for _attempt in 0..MAX_DELETION_TRANSACTION_RETRIES")
+            .expect("deletion transaction retry loop");
+        let slider_scan_start = source
+            .find("let actual_slider_references = match count_slider_references_for_deletion")
+            .expect("slider reference scan");
+        let legacy_scan_start = source
+            .find("let legacy_references = match count_asset_references_in_session")
+            .expect("legacy reference scan");
+        assert!(transaction_start < slider_scan_start);
+        assert!(slider_scan_start < legacy_scan_start);
+
+        let slider_scan = &source[slider_scan_start..legacy_scan_start];
+        assert!(slider_scan.contains("Err(error)"), "slider errors must be classified");
+        assert!(slider_scan.contains("is_retryable_deletion_error"));
+        assert!(slider_scan.contains("abort_transaction"));
+        assert!(slider_scan.contains("continue"));
+        assert!(!slider_scan.contains("legacy_references"));
+    }
 }

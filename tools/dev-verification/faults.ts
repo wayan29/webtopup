@@ -8,14 +8,16 @@ export const SITE_CONFIG_RUST_FAULT_SCENARIOS = [
   'site_config_claim_undo_mismatch',
   'site_config_commit_unknown_unresolved',
 ] as const;
-export const FAULT_SCENARIOS = ['offline', 'timeout', 'refresh_response_loss_after_commit', 'finance_balance_response_loss_after_commit', 'finance_refund_response_loss_after_commit', 'guest_checkout_response_loss_after_commit', 'site_config_response_loss_after_commit', ...SITE_CONFIG_RUST_FAULT_SCENARIOS, 'status_400', 'status_401', 'status_403', 'status_409', 'status_429', 'status_500', 'status_502', 'status_503', 'refresh_two_request_barrier'] as const;
+export const MANAGED_ASSET_RUST_FAULT_SCENARIOS = ['managed_asset_unlink_failure'] as const;
+export const FAULT_SCENARIOS = ['offline', 'timeout', 'refresh_response_loss_after_commit', 'finance_balance_response_loss_after_commit', 'finance_refund_response_loss_after_commit', 'guest_checkout_response_loss_after_commit', 'site_config_response_loss_after_commit', ...SITE_CONFIG_RUST_FAULT_SCENARIOS, ...MANAGED_ASSET_RUST_FAULT_SCENARIOS, 'status_400', 'status_401', 'status_403', 'status_409', 'status_429', 'status_500', 'status_502', 'status_503', 'refresh_two_request_barrier'] as const;
 export type FaultScenario = typeof FAULT_SCENARIOS[number];
 export type SiteConfigRustFaultScenario = typeof SITE_CONFIG_RUST_FAULT_SCENARIOS[number];
+export type ManagedAssetRustFaultScenario = typeof MANAGED_ASSET_RUST_FAULT_SCENARIOS[number];
 export type FaultRequest = { stateDir: string; capability: string; scenario: FaultScenario; ttlMs: number };
 export type FaultEvidence =
   | { activationId: string; scenario: 'refresh_response_loss_after_commit' | 'finance_balance_response_loss_after_commit' | 'finance_refund_response_loss_after_commit' | 'site_config_response_loss_after_commit'; upstreamComplete: true; downstreamDestroyed: true; consumed: true }
   | { activationId: string; scenario: 'guest_checkout_response_loss_after_commit'; mongoTransactionCommitted: true; guestMarkerDurable: true; idempotencyCompleteSkipped: true; consumed: true }
-  | { activationId: string; scenario: SiteConfigRustFaultScenario; rustOnly: true; consumed: true }
+  | { activationId: string; scenario: SiteConfigRustFaultScenario | ManagedAssetRustFaultScenario; rustOnly: true; consumed: true }
   | { activationId: string; scenario: 'refresh_two_request_barrier'; queued: 2; released: 2 };
 
 type FaultLease = { version: 1; activationId: string; scenario: FaultScenario; capabilityDigest: string; expiresAt: number };
@@ -131,7 +133,7 @@ export async function readFaultEvidence(stateDir: string): Promise<FaultEvidence
       && value.upstreamComplete === true && value.downstreamDestroyed === true && value.consumed === true;
     const rustOnly = keys === ['activationId', 'consumed', 'rustOnly', 'scenario'].sort().join(',')
       && typeof value.activationId === 'string'
-      && (SITE_CONFIG_RUST_FAULT_SCENARIOS as readonly string[]).includes(value.scenario as string)
+      && ([...SITE_CONFIG_RUST_FAULT_SCENARIOS, ...MANAGED_ASSET_RUST_FAULT_SCENARIOS] as readonly string[]).includes(value.scenario as string)
       && value.rustOnly === true && value.consumed === true;
     const guestPostCommit = keys === ['activationId', 'consumed', 'guestMarkerDurable', 'idempotencyCompleteSkipped', 'mongoTransactionCommitted', 'scenario'].sort().join(',')
       && typeof value.activationId === 'string' && value.scenario === 'guest_checkout_response_loss_after_commit'

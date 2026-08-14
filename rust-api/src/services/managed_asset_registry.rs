@@ -71,6 +71,66 @@ pub struct DeletionOutcome {
     pub acquisition_fence_version: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletionAssetSnapshot {
+    pub asset_id: ObjectId,
+    pub state: ManagedAssetState,
+    pub reference_count: i64,
+    pub acquisition_fence_version: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletionReferenceCheck {
+    Clear,
+    AssetInUse,
+    RegistryUnavailable,
+}
+
+/// Deletion is intentionally enabled only for the writer-fenced covers inventory from Task 5.
+/// Keeping this explicit and closed means historical/unreviewed folders cannot fall back to the
+/// old filesystem/reference race while later readiness work is still pending.
+pub const MANAGED_ASSET_DELETION_READINESS: &[(&str, bool)] = &[
+    ("covers", true),
+    ("icons", false),
+    ("popups", false),
+    ("instructions", false),
+];
+
+pub fn managed_asset_deletion_ready(folder: &str) -> bool {
+    MANAGED_ASSET_DELETION_READINESS
+        .iter()
+        .find_map(|(candidate, ready)| (*candidate == folder).then_some(*ready))
+        .unwrap_or(false)
+}
+
+/// Classify registry and legacy evidence before attempting the conditional state transition.
+/// A positive registry count is usable evidence only when it agrees with actual slider rows;
+/// otherwise the deletion must remain fail closed as a reconciliation problem.
+pub fn deletion_reference_check(
+    reference_count: i64,
+    actual_slider_references: i64,
+    legacy_reference_found: bool,
+) -> DeletionReferenceCheck {
+    if reference_count < 0 || actual_slider_references < 0 {
+        return DeletionReferenceCheck::RegistryUnavailable;
+    }
+    if actual_slider_references > 0 {
+        return if reference_count == actual_slider_references {
+            DeletionReferenceCheck::AssetInUse
+        } else {
+            DeletionReferenceCheck::RegistryUnavailable
+        };
+    }
+    if reference_count != 0 {
+        return DeletionReferenceCheck::RegistryUnavailable;
+    }
+    if legacy_reference_found {
+        DeletionReferenceCheck::AssetInUse
+    } else {
+        DeletionReferenceCheck::Clear
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReferenceAction {
     Acquire,
@@ -93,6 +153,9 @@ pub enum RegistryError {
     /// The transaction commit result is unknown; published files must be retained for
     /// reconciliation because the server may already have committed the registry rows.
     AmbiguousCommit,
+    /// Mongo reported a transient transaction conflict. The caller must restart the complete
+    /// transaction, including all reference scans, from the beginning.
+    TransientTransaction,
 }
 
 impl RegistryError {
@@ -100,7 +163,8 @@ impl RegistryError {
         match self {
             Self::Unavailable
             | Self::TransactionAbortFailed
-            | Self::AmbiguousCommit => "MANAGED_ASSET_REGISTRY_UNAVAILABLE",
+            | Self::AmbiguousCommit
+            | Self::TransientTransaction => "MANAGED_ASSET_REGISTRY_UNAVAILABLE",
             Self::NotFound => "MANAGED_ASSET_NOT_FOUND",
             Self::ReferenceMismatch => "MANAGED_ASSET_REFERENCE_MISMATCH",
             Self::ReferenceUnderflow => "MANAGED_ASSET_REFERENCE_UNDERFLOW",
@@ -113,13 +177,20 @@ impl RegistryError {
     pub fn requires_reconciliation(self) -> bool {
         matches!(
             self,
-            Self::TransactionAbortFailed | Self::AmbiguousCommit
+            Self::TransactionAbortFailed | Self::AmbiguousCommit | Self::TransientTransaction
         )
     }
 }
 
-fn storage_error(_: mongodb::error::Error) -> RegistryError {
-    RegistryError::Storage
+fn storage_error(error: mongodb::error::Error) -> RegistryError {
+    if error.contains_label(mongodb::error::TRANSIENT_TRANSACTION_ERROR)
+        || error.contains_label(mongodb::error::RETRYABLE_WRITE_ERROR)
+        || error.contains_label(mongodb::error::RETRYABLE_ERROR)
+    {
+        RegistryError::TransientTransaction
+    } else {
+        RegistryError::Storage
+    }
 }
 
 async fn abort_preserving(
@@ -266,6 +337,23 @@ fn asset_outcome(document: Document) -> Result<DeletionOutcome, RegistryError> {
             .map_err(|_| RegistryError::Storage)?,
     )?;
     Ok(DeletionOutcome {
+        asset_id,
+        state,
+        reference_count: document_i64(&document, "referenceCount")?,
+        acquisition_fence_version: document_i64(&document, "acquisitionFenceVersion")?,
+    })
+}
+
+fn deletion_asset_snapshot(document: Document) -> Result<DeletionAssetSnapshot, RegistryError> {
+    let asset_id = document
+        .get_object_id("_id")
+        .map_err(|_| RegistryError::Storage)?;
+    let state = ManagedAssetState::from_str(
+        document
+            .get_str("state")
+            .map_err(|_| RegistryError::Storage)?,
+    )?;
+    Ok(DeletionAssetSnapshot {
         asset_id,
         state,
         reference_count: document_i64(&document, "referenceCount")?,
@@ -532,21 +620,61 @@ pub async fn increment_legacy_acquisition_fence(
     Ok(())
 }
 
-pub async fn begin_asset_deletion(
+pub async fn load_asset_for_deletion(
     session: &mut ClientSession,
     db: &Database,
     path: &str,
+) -> Result<DeletionAssetSnapshot, RegistryError> {
+    let (folder, _) = canonical_managed_path(path)?;
+    if folder != "covers" {
+        return Err(RegistryError::PathInvalid);
+    }
+    let document = db
+        .collection::<Document>(MANAGED_ASSETS_COLLECTION)
+        .find_one(doc! { "canonicalPath": path, "folder": "covers" })
+        .session(&mut *session)
+        .await
+        .map_err(storage_error)?
+        .ok_or(RegistryError::NotFound)?;
+    deletion_asset_snapshot(document)
+}
+
+pub async fn count_slider_references_for_deletion(
+    session: &mut ClientSession,
+    db: &Database,
+    asset_id: ObjectId,
+    path: &str,
+) -> Result<i64, RegistryError> {
+    db.collection::<Document>(MANAGED_ASSET_REFERENCES_COLLECTION)
+        .count_documents(doc! {
+            "assetId": asset_id,
+            "canonicalPath": path,
+            "resourceType": "slider",
+            "field": "image",
+        })
+        .session(&mut *session)
+        .await
+        .map(|count| i64::try_from(count).map_err(|_| RegistryError::Storage))
+        .map_err(storage_error)?
+}
+
+pub async fn transition_asset_to_deleting(
+    session: &mut ClientSession,
+    db: &Database,
+    path: &str,
+    snapshot: &DeletionAssetSnapshot,
 ) -> Result<DeletionOutcome, RegistryError> {
-    canonical_managed_path(path)?;
-    let assets = db.collection::<Document>(MANAGED_ASSETS_COLLECTION);
     let now = DateTime::now();
-    let updated = assets
+    let updated = db
+        .collection::<Document>(MANAGED_ASSETS_COLLECTION)
         .find_one_and_update(
             doc! {
+                "_id": snapshot.asset_id,
                 "canonicalPath": path,
                 "folder": "covers",
                 "state": AVAILABLE,
                 "referenceCount": 0_i64,
+                "acquisitionFenceVersion": snapshot.acquisition_fence_version,
             },
             doc! {
                 "$set": {
@@ -560,22 +688,25 @@ pub async fn begin_asset_deletion(
         .session(&mut *session)
         .await
         .map_err(storage_error)?;
-    if let Some(document) = updated {
-        return asset_outcome(document);
-    }
-    let existing = assets
-        .find_one(doc! { "canonicalPath": path })
-        .session(&mut *session)
-        .await
-        .map_err(storage_error)?
-        .ok_or(RegistryError::NotFound)?;
-    if existing.get_str("state").ok() == Some(DELETING) {
+    updated.map(asset_outcome).unwrap_or(Err(RegistryError::Unavailable))
+}
+
+/// Compatibility wrapper for callers that already own a transaction. New deletion orchestration
+/// must call `load_asset_for_deletion`, perform both reference scans in-session, then use the
+/// conditional transition above.
+pub async fn begin_asset_deletion(
+    session: &mut ClientSession,
+    db: &Database,
+    path: &str,
+) -> Result<DeletionOutcome, RegistryError> {
+    let snapshot = load_asset_for_deletion(session, db, path).await?;
+    if snapshot.state == ManagedAssetState::Deleting {
         return Err(RegistryError::AlreadyDeleting);
     }
-    if document_i64(&existing, "referenceCount").unwrap_or(1) != 0 {
+    if snapshot.reference_count != 0 {
         return Err(RegistryError::ReferenceMismatch);
     }
-    Err(RegistryError::Unavailable)
+    transition_asset_to_deleting(session, db, path, &snapshot).await
 }
 
 pub async fn mark_asset_deleted(
@@ -711,6 +842,38 @@ mod tests {
                 "slider references must reject {folder} assets"
             );
         }
+    }
+
+    #[test]
+    fn upload_delete_registry_readiness_is_fail_closed_per_folder() {
+        assert!(managed_asset_deletion_ready("covers"));
+        for folder in ["icons", "popups", "instructions", "unknown"] {
+            assert!(!managed_asset_deletion_ready(folder), "{folder} must remain disabled");
+        }
+    }
+
+    #[test]
+    fn upload_delete_registry_preflight_rejects_count_and_reference_mismatches() {
+        assert_eq!(
+            deletion_reference_check(0, 0, false),
+            DeletionReferenceCheck::Clear
+        );
+        assert_eq!(
+            deletion_reference_check(0, 1, true),
+            DeletionReferenceCheck::RegistryUnavailable
+        );
+        assert_eq!(
+            deletion_reference_check(1, 1, true),
+            DeletionReferenceCheck::AssetInUse
+        );
+        assert_eq!(
+            deletion_reference_check(1, 0, false),
+            DeletionReferenceCheck::RegistryUnavailable
+        );
+        assert_eq!(
+            deletion_reference_check(-1, 0, false),
+            DeletionReferenceCheck::RegistryUnavailable
+        );
     }
 
     #[test]

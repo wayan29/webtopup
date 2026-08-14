@@ -4,27 +4,63 @@ import path from 'node:path';
 import test from 'node:test';
 import { MongoClient, ObjectId } from 'mongodb';
 import { loginFixture } from '../e2e/fixtures.ts';
+import { withFault } from '../faults.ts';
 
 const root = path.resolve(import.meta.dirname, '..', '..', '..');
 const stateDir = path.join(root, '.dev-verification');
 
 type Env = Record<string, string>;
 
+test('managed upload deletion source contract is transactional and fail closed', async () => {
+  const [handlers, registry, faults] = await Promise.all([
+    fs.readFile(path.join(root, 'rust-api', 'src', 'routes', 'uploads', 'handlers.rs'), 'utf8'),
+    fs.readFile(path.join(root, 'rust-api', 'src', 'services', 'managed_asset_registry.rs'), 'utf8'),
+    fs.readFile(path.join(root, 'rust-api', 'src', 'services', 'local_fault.rs'), 'utf8'),
+  ]);
+  assert.match(handlers, /managed_asset_deletion_ready/);
+  assert.match(handlers, /count_asset_references_in_session/);
+  assert.match(handlers, /count_slider_references_for_deletion/);
+  assert.match(handlers, /transition_asset_to_deleting/);
+  assert.match(handlers, /DeletionReferenceCheck::AssetInUse/);
+  assert.match(handlers, /consume_managed_asset_unlink_fault/);
+  assert.match(handlers, /remove_file/);
+  assert.match(registry, /\("covers", true\)/);
+  assert.match(registry, /\("icons", false\)/);
+  assert.match(registry, /\("popups", false\)/);
+  assert.match(registry, /\("instructions", false\)/);
+  assert.match(faults, /managed_asset_unlink_failure/);
+  const transactionEnd = handlers.indexOf('transact_asset_deletion');
+  const unlink = handlers.indexOf('std::fs::remove_file');
+  const fault = handlers.indexOf('consume_managed_asset_unlink_fault');
+  assert.ok(transactionEnd >= 0 && fault > transactionEnd && unlink > fault);
+});
+
 const PNG_1X1 = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
   'base64',
 );
 
-test('upload security rejects spoofed content and accepts canonical images through Node', async () => {
+test('upload security rejects spoofed content and accepts canonical images through Node', async (t) => {
   const shared = await readEnv(path.join(stateDir, 'env', 'shared.env'));
   assert.equal(shared.LOCAL_DEV_VERIFICATION, 'true');
   assert.equal(shared.MONGO_DB, 'webtopup_task14_dev');
 
-  const uploader = await loginFixture('catalog-manager');
   const nodeBase = `http://127.0.0.1:${shared.NODE_PORT}`;
+  try {
+    await fetch(`${nodeBase}/health`, { signal: AbortSignal.timeout(500) });
+  } catch (error) {
+    const cause = (error as Error & { cause?: { code?: string } }).cause;
+    if (cause?.code === 'ECONNREFUSED' || String(error).includes('ECONNREFUSED')) {
+      t.skip(`environment-blocked: ECONNREFUSED ${nodeBase}`);
+      return;
+    }
+    throw error;
+  }
+
+  const uploader = await loginFixture('catalog-manager');
   const mongo = new MongoClient(shared.MONGO_URI);
-  const created: string[] = [];
-  let productId: ObjectId | undefined;
+  let legacyId: ObjectId | undefined;
+  let faultFilename: string | undefined;
   let primary: unknown = null;
 
   try {
@@ -77,8 +113,6 @@ test('upload security rejects spoofed content and accepts canonical images throu
     assert.equal(ok.body?.success, true);
     assert.match(String(ok.body?.filename || ''), /\.png$/i);
     assert.match(String(ok.body?.url || ''), /^\/uploads\/icons\//);
-    created.push(String(ok.body.filename));
-
     const canonicalUrl = String(ok.body.url);
     const managed = await db.collection('managedassets').findOne({ canonicalPath: canonicalUrl });
     assert.ok(managed, `managed asset row missing for ${canonicalUrl}`);
@@ -101,17 +135,22 @@ test('upload security rejects spoofed content and accepts canonical images throu
     assert.equal(batch.status, 400);
     assert.ok(codeOf(batch.body));
 
-    productId = new ObjectId();
+    const cover = await multipartUpload(`${nodeBase}/api/v2/upload?type=covers`, headers, 'cover.png', 'image/png', PNG_1X1);
+    assert.equal(cover.status, 200, JSON.stringify(cover.body));
+    const coverFilename = String(cover.body.filename);
+    const coverPath = path.join(root, 'uploads', 'covers', coverFilename);
+
+    legacyId = new ObjectId();
     await db.collection('products').insertOne({
-      _id: productId,
-      code: `UPL-${productId.toHexString().slice(-6)}`,
+      _id: legacyId,
+      code: `UPL-${legacyId.toHexString().slice(-6)}`,
       name: 'Task14 referenced upload',
       status: true,
-      icon: ok.body.url,
+      icon: cover.body.url,
       price: { basic: 1000, gold: 1000, platinum: 1000 },
       task14Fixture: true,
     });
-    const blocked = await fetch(`${nodeBase}/api/v2/upload?type=icons&filename=${encodeURIComponent(ok.body.filename)}`, {
+    const blocked = await fetch(`${nodeBase}/api/v2/upload?type=covers&filename=${encodeURIComponent(coverFilename)}`, {
       method: 'DELETE',
       headers,
     });
@@ -119,12 +158,45 @@ test('upload security rejects spoofed content and accepts canonical images throu
     assert.equal(blocked.status, 409);
     assert.equal(codeOf(blockedBody), 'ASSET_IN_USE');
 
-    await db.collection('products').deleteOne({ _id: productId });
-    const deleted = await fetch(`${nodeBase}/api/v2/upload?type=icons&filename=${encodeURIComponent(ok.body.filename)}`, {
+    await db.collection('products').deleteOne({ _id: legacyId });
+    const deletable = await multipartUpload(`${nodeBase}/api/v2/upload?type=covers`, headers, 'deletable.png', 'image/png', PNG_1X1);
+    assert.equal(deletable.status, 200, JSON.stringify(deletable.body));
+    const deletablePath = path.join(root, 'uploads', 'covers', String(deletable.body.filename));
+    const deleted = await fetch(`${nodeBase}/api/v2/upload?type=covers&filename=${encodeURIComponent(String(deletable.body.filename))}`, {
       method: 'DELETE',
       headers,
     });
-    assert.ok(deleted.status === 200 || deleted.status === 204);
+    assert.equal(deleted.status, 200, JSON.stringify(await deleted.json()));
+    await assert.rejects(fs.access(deletablePath));
+    const deletedRow = await db.collection('managedassets').findOne({ canonicalPath: deletable.body.url });
+    assert.equal(deletedRow?.state, 'deleting');
+    assert.ok(deletedRow?.deletedAt);
+
+    const notReady = await fetch(`${nodeBase}/api/v2/upload?type=icons&filename=${encodeURIComponent(ok.body.filename)}`, {
+      method: 'DELETE',
+      headers,
+    });
+    assert.equal(notReady.status, 503);
+    assert.equal(codeOf(await notReady.json()), 'MANAGED_ASSET_REGISTRY_UNAVAILABLE');
+
+    faultFilename = coverFilename;
+    const nodeEnv = await readEnv(path.join(stateDir, 'env', 'node.env'));
+    await withFault({
+      stateDir,
+      capability: nodeEnv.LOCAL_DESTRUCTIVE_CAPABILITY,
+      scenario: 'managed_asset_unlink_failure',
+      ttlMs: 5_000,
+    }, async () => {
+      const faulted = await fetch(`${nodeBase}/api/v2/upload?type=covers&filename=${encodeURIComponent(faultFilename!)}`, {
+        method: 'DELETE',
+        headers,
+      });
+      assert.equal(faulted.status, 503);
+      assert.equal(codeOf(await faulted.json()), 'MANAGED_ASSET_REGISTRY_UNAVAILABLE');
+      await fs.access(coverPath);
+      const deleting = await db.collection('managedassets').findOne({ canonicalPath: cover.body.url });
+      assert.equal(deleting?.state, 'deleting');
+    });
 
     const manager = await loginFixture('site-config-manager');
     const staffLogin = await fetch(`${nodeBase}/api/v2${manager.loginEndpoint}`, {
@@ -142,7 +214,7 @@ test('upload security rejects spoofed content and accepts canonical images throu
     primary = error;
   } finally {
     try {
-      if (productId) await mongo.db(shared.MONGO_DB).collection('products').deleteOne({ _id: productId });
+      if (legacyId) await mongo.db(shared.MONGO_DB).collection('products').deleteOne({ _id: legacyId });
     } catch { /* ignore */ }
     await mongo.close().catch(() => undefined);
   }
