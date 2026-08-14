@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .context("API_V2_HOST/API_V2_PORT must form a valid socket address")?;
 
-    let state = Arc::new(state::AppState::from_env().await?);
+    let mut state = state::AppState::from_env().await?;
     let cleanup_config = routes::auth::legacy_migration_cleanup::CleanupWorkerConfig::from_env()
         .map_err(anyhow::Error::msg)?;
     if let Some(client) = &state.mongo_client {
@@ -75,11 +75,32 @@ async fn main() -> anyhow::Result<()> {
                     "site config foundation indexes failed before listener readiness: {error:?}"
                 )
             })?;
+        // Slider readiness is inspection-only in production.  Missing indexes/data are logged as
+        // a false capability state; no production index creation, registration, or repair occurs.
+        let slider_report = services::slider_readiness::inspect_slider_foundation(
+            &db,
+            &routes::uploads::upload_root(),
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("slider readiness inspection failed: {error}"))?;
+        let capability = services::slider_readiness::SliderMutationReadiness::from_report(
+            &slider_report,
+            state.mongo_transactions_enabled,
+        );
+        if let Some(app_state) = Arc::get_mut(&mut state) {
+            app_state.slider_mutation_readiness = capability;
+        }
+        info!(
+            mutation_ready = capability.mutation_ready,
+            indexes_ready = slider_report.indexes.ready,
+            findings = slider_report.findings.len(),
+            "slider mutation capability readiness inspected; mutation handlers remain gated"
+        );
     }
     // Build the login timing material before the listener accepts traffic, so the first rejected
     // login does not pay an extra bcrypt hash and stand out from every later attempt.
     routes::auth::warm_login_timing_material();
-    let app = routes::app((*state).clone());
+    let app = routes::app(Arc::clone(&state));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind API v2 on {addr}"))?;

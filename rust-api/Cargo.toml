@@ -17,6 +17,10 @@ path = "src/bin/ensure_staff_2fa_deadlines.rs"
 name = "site_config_identifier_readiness"
 path = "src/bin/site_config_identifier_readiness.rs"
 
+[[bin]]
+name = "slider_managed_asset_readiness"
+path = "src/bin/slider_managed_asset_readiness.rs"
+
 [dependencies]
 ammonia = "=4.1.2"
 base64 = "=0.22.1"

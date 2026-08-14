@@ -132,6 +132,60 @@ export function identifierReadinessApplyPlan(input: {
   };
 }
 
+export function sliderReadinessApplyPlan(input: {
+  root: string;
+  stateDir: string;
+  databaseName: string;
+  mongoUri: string;
+  executable: string;
+}): { command: string; args: string[]; cwd: string; envKeys: ['MONGO_URI', 'MONGO_DB'] } {
+  if (input.databaseName !== REQUIRED_DB) throw new Error(`database must be ${REQUIRED_DB}`);
+  const expected = path.join(input.root, 'rust-api', 'target', 'release', 'slider_managed_asset_readiness');
+  if (path.resolve(input.executable) !== path.resolve(expected)) throw new Error('expected release readiness binary');
+  return {
+    command: expected,
+    args: ['--apply', '--json'],
+    cwd: path.join(input.root, 'rust-api'),
+    envKeys: ['MONGO_URI', 'MONGO_DB'],
+  };
+}
+
+export async function prepareDisposableSliderReadiness(config: VerificationConfig): Promise<void> {
+  const { assertMarkedVerificationDatabaseReady } = await import('./databaseWorkflow.ts');
+  await assertMarkedVerificationDatabaseReady(config);
+  const executable = path.join(config.root, 'rust-api', 'target', 'release', 'slider_managed_asset_readiness');
+  const plan = sliderReadinessApplyPlan({
+    root: config.root,
+    stateDir: config.stateDir,
+    databaseName: config.databaseName,
+    mongoUri: config.mongoUri,
+    executable,
+  });
+  await fs.access(plan.command);
+  const shared = await readEnvFile(path.join(config.stateDir, 'env', 'shared.env'));
+  if (shared.MONGO_DB !== REQUIRED_DB) throw new Error(`database must be ${REQUIRED_DB}`);
+  const child = spawn(plan.command, plan.args, {
+    cwd: plan.cwd,
+    env: {
+      PATH: process.env.PATH ?? '',
+      HOME: process.env.HOME ?? '',
+      MONGO_URI: shared.MONGO_URI,
+      MONGO_DB: shared.MONGO_DB,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const stderr: Buffer[] = [];
+  child.stderr?.on('data', (chunk) => { stderr.push(Buffer.from(chunk)); });
+  const code = await new Promise<number | null>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', (status) => resolve(status));
+  });
+  if (code !== 0) {
+    const detail = Buffer.concat(stderr).toString('utf8').replaceAll(shared.MONGO_URI ?? '', '[redacted]').slice(0, 400);
+    throw new Error(`slider readiness apply failed (${code ?? 'null'}): ${detail}`);
+  }
+}
+
 export async function prepareDisposableIdentifierIndexes(config: VerificationConfig): Promise<void> {
   const { assertMarkedVerificationDatabaseReady } = await import('./databaseWorkflow.ts');
   await assertMarkedVerificationDatabaseReady(config);
@@ -254,6 +308,7 @@ export async function startHostProcesses(config: VerificationConfig, profile: Pr
   try { await fs.access(manifestPath); throw new Error('host processes already have an ownership manifest; run down or inspect status'); } catch (error) {
     if (error instanceof Error && error.message.includes('ownership manifest')) throw error;
   }
+  await prepareDisposableSliderReadiness(config);
   await prepareDisposableIdentifierIndexes(config);
   const commands = hostProcessCommands(config.root, config.ports);
   for (const item of Object.values(commands)) await fs.access(item.command);

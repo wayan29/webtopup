@@ -14,6 +14,7 @@ mod flash_admin;
 mod flash_mappers;
 mod flash_payload;
 mod flash_public;
+mod slider_idempotency;
 mod slider_policy;
 mod slider_snapshot;
 mod slider_types;
@@ -32,6 +33,7 @@ pub use sliders::{
     slider_create, slider_delete, slider_update, sliders_admin_all, sliders_admin_archived,
     sliders_public, sliders_update_sort_order,
 };
+pub use slider_idempotency::{slider_idempotency_index_models, SLIDER_IDEMPOTENCY_CLAIMS_COLLECTION};
 pub use slider_snapshot::{
     load_archived_snapshot, load_current_snapshot, load_public_snapshot, load_slider_revision,
     matches_slider_etag, slider_etag, SliderAdminItem, SliderAdminSnapshot, SliderLimits,

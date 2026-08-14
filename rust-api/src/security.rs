@@ -695,6 +695,7 @@ pub(crate) fn test_app_state_with_proxy_secret(secret: &str) -> std::sync::Arc<A
             "enc-test:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         )
         .expect("valid deterministic test recovery encryption key"),
+        slider_mutation_readiness: crate::services::slider_readiness::SliderMutationReadiness::default(),
     })
 }
 

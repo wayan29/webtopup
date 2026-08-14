@@ -85,6 +85,9 @@ pub struct AppState {
     pub session_token_hash_secret: String,
     pub rotation_keys: RotationKeyRing,
     pub recovery_encryption_keys: RecoveryEncryptionKeyRing,
+    /// Readiness is false closed until startup proves exact indexes, registry integrity, and
+    /// transaction capability. Task 9/11 can inspect this without enabling writes in Task 7.
+    pub slider_mutation_readiness: crate::services::slider_readiness::SliderMutationReadiness,
     pub rollout_config: crate::routes::auth::security_audit::RolloutConfig,
 }
 
@@ -113,6 +116,7 @@ impl AppState {
                 &env::var("SESSION_RECOVERY_ENCRYPTION_KEYS")
                     .context("SESSION_RECOVERY_ENCRYPTION_KEYS must be configured")?,
             )?,
+            slider_mutation_readiness: crate::services::slider_readiness::SliderMutationReadiness::default(),
         }))
     }
 }

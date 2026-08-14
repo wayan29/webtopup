@@ -3,7 +3,7 @@ import test from 'node:test';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { resolveServerHost } from '../../../server/src/config/serverHost.ts';
-import { assertDevicePolicyTarget, assertProcessesExited, assertVerificationHostPortsFree, buildHostChildEnv, devicePolicyRolloutEnv, financePolicyRolloutEnv, faultProfilePorts, faultProxyPort, hostProcessCommands, identifierReadinessApplyPlan, processIdentityMatches, sessionTestRolloutEnv, type OwnedProcess, type ObservedProcess } from '../processes.ts';
+import { assertDevicePolicyTarget, assertProcessesExited, assertVerificationHostPortsFree, buildHostChildEnv, devicePolicyRolloutEnv, financePolicyRolloutEnv, faultProfilePorts, faultProxyPort, hostProcessCommands, identifierReadinessApplyPlan, processIdentityMatches, sessionTestRolloutEnv, sliderReadinessApplyPlan, type OwnedProcess, type ObservedProcess } from '../processes.ts';
 
 test('server host preserves default and accepts loopback verification binding', () => {
   assert.equal(resolveServerHost({}), '0.0.0.0');
@@ -118,6 +118,36 @@ test('identifier readiness apply plan is disposable-only and never logs credenti
   const source = await fs.readFile(path.resolve(import.meta.dirname, '..', 'processes.ts'), 'utf8');
   assert.match(source, /await prepareDisposableIdentifierIndexes\(config\)/);
   assert.match(source, /assertMarkedVerificationDatabaseReady\(config\)/);
+  assert.doesNotMatch(source, /allow-protected-database/);
+});
+
+test('slider readiness apply plan uses the release binary and exact disposable database gate', async () => {
+  const root = '/repo';
+  const allowed = sliderReadinessApplyPlan({
+    root,
+    stateDir: '/repo/.dev-verification',
+    databaseName: 'webtopup_task14_dev',
+    mongoUri: 'mongodb://127.0.0.1:27018/webtopup_task14_dev?replicaSet=rs0&directConnection=true',
+    executable: '/repo/rust-api/target/release/slider_managed_asset_readiness',
+  });
+  assert.deepEqual(allowed, {
+    command: '/repo/rust-api/target/release/slider_managed_asset_readiness',
+    args: ['--apply', '--json'],
+    cwd: '/repo/rust-api',
+    envKeys: ['MONGO_URI', 'MONGO_DB'],
+  });
+  for (const databaseName of ['webtopup', 'webtopup_task14', 'webtopup_task14_dev_backup', '']) {
+    assert.throws(() => sliderReadinessApplyPlan({
+      root,
+      stateDir: '/repo/.dev-verification',
+      databaseName,
+      mongoUri: `mongodb://127.0.0.1:27018/${databaseName}?replicaSet=rs0&directConnection=true`,
+      executable: '/repo/rust-api/target/release/slider_managed_asset_readiness',
+    }), /webtopup_task14_dev/);
+  }
+  const source = await fs.readFile(path.resolve(import.meta.dirname, '..', 'processes.ts'), 'utf8');
+  assert.match(source, /await prepareDisposableSliderReadiness\(config\)/);
+  assert.match(source, /args: \['--apply', '--json'\]/);
   assert.doesNotMatch(source, /allow-protected-database/);
 });
 
