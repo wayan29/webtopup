@@ -29,8 +29,9 @@ async fn validate_payment_method_payload_inner(
     payload: PaymentMethodPayload,
     current: Option<&Document>,
 ) -> Result<ValidPaymentMethodPayload, Response> {
+    let existing = current;
     let empty = Document::new();
-    let current = current.unwrap_or(&empty);
+    let current = existing.unwrap_or(&empty);
     let name = text_value_or_current(payload.name, current, "name", "");
     let category = match payload.category {
         Some(value) => text_value_or_current(Some(value), current, "category", ""),
@@ -40,7 +41,16 @@ async fn validate_payment_method_payload_inner(
         text_value_or_current(payload.account_number, current, "accountNumber", "");
     let account_name = text_value_or_current(payload.account_name, current, "accountName", "");
     let icon = text_value_or_current(payload.icon, current, "icon", "");
-    if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&icon]) {
+    let previous_icon = read_string_default(current, "icon", "");
+    if let Err(response) = crate::services::managed_assets::ensure_managed_field_for_update(
+        &crate::routes::uploads::upload_root(),
+        &icon,
+        crate::services::managed_assets::ManagedFieldFolderPolicy::Icons,
+        crate::services::managed_assets::effectively_changed_managed_field(
+            existing.map(|_| previous_icon.as_str()),
+            &icon,
+        ),
+    ) {
         return Err(response);
     }
     let operational_start = text_value_or_current(

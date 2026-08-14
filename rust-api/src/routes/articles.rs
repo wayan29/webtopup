@@ -13,7 +13,15 @@ use axum::{
 use futures_util::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime, Document};
 
-use crate::{security::require_permission, state::AppState};
+use crate::{
+    security::require_permission,
+    services::managed_assets::{
+        abort_legacy_managed_write, commit_legacy_managed_write, fence_legacy_managed_writes,
+        effectively_changed_cover_path, managed_asset_registry_unavailable_response,
+        start_legacy_managed_write,
+    },
+    state::AppState,
+};
 
 use responses::{internal_error, status_message, unavailable};
 use serialization::{document_to_json, serialize_public_article};
@@ -95,6 +103,7 @@ pub async fn create(
         );
     }
     let now = DateTime::now();
+    let image_path = payload.image.clone();
     let mut document = doc! {
         "title": payload.title,
         "slug": payload.slug,
@@ -109,9 +118,41 @@ pub async fn create(
     if !payload.image.is_empty() {
         document.insert("image", payload.image);
     }
-    let insert_result = match articles.insert_one(document).await {
-        Ok(result) => result,
-        Err(_) => return internal_error(),
+    let insert_result = if let Some(path) = effectively_changed_cover_path(None, &image_path) {
+        if !state.mongo_transactions_enabled {
+            return managed_asset_registry_unavailable_response();
+        }
+        let mut session = match start_legacy_managed_write(client).await {
+            Ok(session) => session,
+            Err(_) => return managed_asset_registry_unavailable_response(),
+        };
+        if fence_legacy_managed_writes(&mut session, &client.database(&state.mongo_db), &[path])
+            .await
+            .is_err()
+        {
+            let _ = abort_legacy_managed_write(
+                &mut session,
+                crate::services::managed_asset_registry::RegistryError::Unavailable,
+            )
+            .await;
+            return managed_asset_registry_unavailable_response();
+        }
+        let result = match articles.insert_one(document).session(&mut session).await {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = session.abort_transaction().await;
+                return internal_error();
+            }
+        };
+        if commit_legacy_managed_write(&mut session).await.is_err() {
+            return managed_asset_registry_unavailable_response();
+        }
+        result
+    } else {
+        match articles.insert_one(document).await {
+            Ok(result) => result,
+            Err(_) => return internal_error(),
+        }
     };
     let Some(article_id) = insert_result.inserted_id.as_object_id() else {
         return internal_error();
@@ -158,6 +199,7 @@ pub async fn update(
     let Some(current) = current else {
         return status_message(axum::http::StatusCode::NOT_FOUND, "Article not found");
     };
+    let previous_image = crate::utils::bson::read_string(&current, "image");
     let payload = match build_article_payload(payload, Some(&current)) {
         Ok(payload) => payload,
         Err(response) => return response,
@@ -182,12 +224,44 @@ pub async fn update(
         "status": payload.status,
         "updatedAt": DateTime::now(),
     };
-    if payload.image.is_empty() {
+    let next_image = payload.image.clone();
+    if next_image.is_empty() {
         set_doc.insert("image", Bson::Null);
     } else {
-        set_doc.insert("image", payload.image);
+        set_doc.insert("image", next_image.clone());
     }
-    if articles
+    if let Some(path) = effectively_changed_cover_path(Some(&previous_image), &next_image) {
+        if !state.mongo_transactions_enabled {
+            return managed_asset_registry_unavailable_response();
+        }
+        let mut session = match start_legacy_managed_write(client).await {
+            Ok(session) => session,
+            Err(_) => return managed_asset_registry_unavailable_response(),
+        };
+        if fence_legacy_managed_writes(&mut session, &client.database(&state.mongo_db), &[path])
+            .await
+            .is_err()
+        {
+            let _ = abort_legacy_managed_write(
+                &mut session,
+                crate::services::managed_asset_registry::RegistryError::Unavailable,
+            )
+            .await;
+            return managed_asset_registry_unavailable_response();
+        }
+        if articles
+            .update_one(doc! { "_id": article_id }, doc! { "$set": set_doc })
+            .session(&mut session)
+            .await
+            .is_err()
+        {
+            let _ = session.abort_transaction().await;
+            return internal_error();
+        }
+        if commit_legacy_managed_write(&mut session).await.is_err() {
+            return managed_asset_registry_unavailable_response();
+        }
+    } else if articles
         .update_one(doc! { "_id": article_id }, doc! { "$set": set_doc })
         .await
         .is_err()

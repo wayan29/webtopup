@@ -11,6 +11,9 @@ use mongodb::bson::{doc, Bson, Document};
 
 use crate::{
     security::{load_active_proxy_user, require_permission},
+    services::managed_assets::{
+        effectively_changed_managed_field, ManagedFieldFolderPolicy,
+    },
     state::AppState,
     utils::bson::{read_i64, read_string},
 };
@@ -230,7 +233,11 @@ pub async fn category_create(
     };
     let now = mongodb::bson::DateTime::now();
     let icon = payload.icon.unwrap_or_default().trim().to_string();
-    if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&icon]) {
+    if let Err(response) = crate::services::managed_assets::ensure_managed_field(
+        &crate::routes::uploads::upload_root(),
+        &icon,
+        crate::services::managed_assets::ManagedFieldFolderPolicy::Icons,
+    ) {
         return response;
     }
     let insert_doc = doc! {
@@ -368,7 +375,13 @@ pub async fn category_update(
         .unwrap_or_else(|| read_string(&current, "icon"))
         .trim()
         .to_string();
-    if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&icon]) {
+    let previous_icon = read_string(&current, "icon");
+    if let Err(response) = crate::services::managed_assets::ensure_managed_field_for_update(
+        &crate::routes::uploads::upload_root(),
+        &icon,
+        ManagedFieldFolderPolicy::Icons,
+        effectively_changed_managed_field(Some(&previous_icon), &icon),
+    ) {
         return response;
     }
     let mut set_doc = doc! {

@@ -405,6 +405,11 @@ fn normalize_slider_payload(
         ));
     }
     let image = text_value_or_current(payload.image, current, "image", "");
+    let previous_image = current.map(|document| read_string(document, "image"));
+    let image_effectively_changed = crate::services::managed_assets::effectively_changed_managed_field(
+        previous_image.as_deref(),
+        &image,
+    );
     if image.is_empty() {
         return Err(status_message(
             axum::http::StatusCode::BAD_REQUEST,
@@ -417,9 +422,22 @@ fn normalize_slider_payload(
             "Gambar slider harus berupa URL http/https atau path internal upload yang diawali \"/\"",
         ));
     }
-    if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&image]) {
-        return Err(response);
+    // Legacy slider mutation remains closed until Task 9 supplies its transactional writer.
+    // Historical values may be retained on unrelated edits, but a new managed cover must never
+    // be persisted without the session-aware slider transaction protocol.
+    if image_effectively_changed
+        && crate::services::managed_assets::parse_managed_upload_url(&image)
+            .map(|(folder, _)| folder == "covers")
+            .unwrap_or(false)
+    {
+        return Err(crate::services::managed_assets::managed_asset_registry_unavailable_response());
     }
+    crate::services::managed_assets::ensure_managed_field_for_update(
+        &crate::routes::uploads::upload_root(),
+        &image,
+        crate::services::managed_assets::ManagedFieldFolderPolicy::Covers,
+        image_effectively_changed,
+    )?;
     let link_was_supplied = payload.link.is_some();
     let link = text_value_or_current(payload.link, current, "link", "");
     if link_was_supplied && !is_safe_slider_link(&link) {

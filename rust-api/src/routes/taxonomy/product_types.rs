@@ -10,6 +10,11 @@ use serde_json::Value;
 
 use crate::{
     security::{require_permission, require_proxy_context},
+    services::managed_assets::{
+        abort_legacy_managed_write, commit_legacy_managed_write,
+        effectively_changed_cover_path, fence_legacy_managed_writes,
+        managed_asset_registry_unavailable_response, start_legacy_managed_write,
+    },
     state::AppState,
     utils::bson::{read_i64, read_string},
 };
@@ -439,15 +444,32 @@ pub async fn product_type_admin_create(
         .unwrap_or(1);
     let icon = payload.icon.unwrap_or_default();
     let cover = payload.cover.unwrap_or_default();
+    let changed_cover = effectively_changed_cover_path(None, &cover).map(str::to_owned);
     let popup_image = payload
         .popup_info
         .as_ref()
         .and_then(|value| value.get("image"))
         .and_then(|value| value.as_str())
         .unwrap_or("");
-    if let Err(response) =
-        crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&icon, &cover, popup_image])
-    {
+    if let Err(response) = crate::services::managed_assets::ensure_managed_field(
+        &crate::routes::uploads::upload_root(),
+        &icon,
+        crate::services::managed_assets::ManagedFieldFolderPolicy::Icons,
+    ) {
+        return response;
+    }
+    if let Err(response) = crate::services::managed_assets::ensure_managed_field(
+        &crate::routes::uploads::upload_root(),
+        &cover,
+        crate::services::managed_assets::ManagedFieldFolderPolicy::Covers,
+    ) {
+        return response;
+    }
+    if let Err(response) = crate::services::managed_assets::ensure_managed_field(
+        &crate::routes::uploads::upload_root(),
+        popup_image,
+        crate::services::managed_assets::ManagedFieldFolderPolicy::Popups,
+    ) {
         return response;
     }
     let popup_info = payload
@@ -478,13 +500,50 @@ pub async fn product_type_admin_create(
         "__v": 0,
     };
     apply_create_description(&mut insert_doc, description);
-    let insert_result = match product_types.insert_one(insert_doc).await {
-        Ok(result) => result,
-        Err(_) => {
-            return status_message(
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal Server Error",
+    let insert_result = if let Some(path) = changed_cover.as_deref() {
+        if !state.mongo_transactions_enabled {
+            return managed_asset_registry_unavailable_response();
+        }
+        let mut session = match start_legacy_managed_write(client).await {
+            Ok(session) => session,
+            Err(_) => return managed_asset_registry_unavailable_response(),
+        };
+        if fence_legacy_managed_writes(&mut session, &db, &[path])
+            .await
+            .is_err()
+        {
+            let _ = abort_legacy_managed_write(
+                &mut session,
+                crate::services::managed_asset_registry::RegistryError::Unavailable,
             )
+            .await;
+            return managed_asset_registry_unavailable_response();
+        }
+        let result = match product_types.insert_one(insert_doc).session(&mut session).await {
+            Ok(result) => result,
+            Err(_) => {
+                if session.abort_transaction().await.is_err() {
+                    return managed_asset_registry_unavailable_response();
+                }
+                return status_message(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal Server Error",
+                );
+            }
+        };
+        if commit_legacy_managed_write(&mut session).await.is_err() {
+            return managed_asset_registry_unavailable_response();
+        }
+        result
+    } else {
+        match product_types.insert_one(insert_doc).await {
+            Ok(result) => result,
+            Err(_) => {
+                return status_message(
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal Server Error",
+                )
+            }
         }
     };
     let id = match insert_result.inserted_id.as_object_id() {
@@ -557,6 +616,8 @@ pub async fn product_type_admin_update(
     };
 
     let previous_name = read_string(&product_type, "name");
+    let previous_icon = read_string(&product_type, "icon");
+    let previous_cover = read_string(&product_type, "cover");
     let previous_category_id = product_type.get_object_id("categoryId").unwrap_or_default();
     let previous_operator_id = product_type.get_object_id("operatorId").unwrap_or_default();
     let normalized_name = payload
@@ -669,15 +730,35 @@ pub async fn product_type_admin_update(
         set_doc.insert("slug", &target_slug);
     }
     if let Some(value) = payload.icon {
-        if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&value]) {
+        if let Err(response) = crate::services::managed_assets::ensure_managed_field_for_update(
+            &crate::routes::uploads::upload_root(),
+            &value,
+            crate::services::managed_assets::ManagedFieldFolderPolicy::Icons,
+            crate::services::managed_assets::effectively_changed_managed_field(
+                Some(&previous_icon),
+                &value,
+            ),
+        ) {
             return response;
         }
         set_doc.insert("icon", value);
     }
+    let mut changed_cover: Option<String> = None;
     if let Some(value) = payload.cover {
-        if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&value]) {
+        let effectively_changed = crate::services::managed_assets::effectively_changed_managed_field(
+            Some(&previous_cover),
+            &value,
+        );
+        if let Err(response) = crate::services::managed_assets::ensure_managed_field_for_update(
+            &crate::routes::uploads::upload_root(),
+            &value,
+            crate::services::managed_assets::ManagedFieldFolderPolicy::Covers,
+            effectively_changed,
+        ) {
             return response;
         }
+        changed_cover = effectively_changed_cover_path(Some(&previous_cover), &value)
+            .map(str::to_owned);
         set_doc.insert("cover", value);
     }
     if let Some(value) = payload.open_time {
@@ -701,9 +782,20 @@ pub async fn product_type_admin_update(
             .get("image")
             .and_then(|image| image.as_str())
             .unwrap_or("");
-        if let Err(response) =
-            crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[popup_image])
-        {
+        let previous_popup_image = product_type
+            .get_document("popupInfo")
+            .ok()
+            .and_then(|popup| popup.get_str("image").ok())
+            .unwrap_or("");
+        if let Err(response) = crate::services::managed_assets::ensure_managed_field_for_update(
+            &crate::routes::uploads::upload_root(),
+            popup_image,
+            crate::services::managed_assets::ManagedFieldFolderPolicy::Popups,
+            crate::services::managed_assets::effectively_changed_managed_field(
+                Some(previous_popup_image),
+                popup_image,
+            ),
+        ) {
             return response;
         }
         set_doc.insert(
@@ -719,7 +811,43 @@ pub async fn product_type_admin_update(
     }
     set_doc.insert("updatedAt", DateTime::now());
 
-    if product_types
+    if let Some(path) = changed_cover.as_deref() {
+        if !state.mongo_transactions_enabled {
+            return managed_asset_registry_unavailable_response();
+        }
+        let mut session = match start_legacy_managed_write(client).await {
+            Ok(session) => session,
+            Err(_) => return managed_asset_registry_unavailable_response(),
+        };
+        if fence_legacy_managed_writes(&mut session, &db, &[path])
+            .await
+            .is_err()
+        {
+            let _ = abort_legacy_managed_write(
+                &mut session,
+                crate::services::managed_asset_registry::RegistryError::Unavailable,
+            )
+            .await;
+            return managed_asset_registry_unavailable_response();
+        }
+        if product_types
+            .update_one(doc! { "_id": product_type_id }, doc! { "$set": set_doc })
+            .session(&mut session)
+            .await
+            .is_err()
+        {
+            if session.abort_transaction().await.is_err() {
+                return managed_asset_registry_unavailable_response();
+            }
+            return status_message(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Server Error",
+            );
+        }
+        if commit_legacy_managed_write(&mut session).await.is_err() {
+            return managed_asset_registry_unavailable_response();
+        }
+    } else if product_types
         .update_one(doc! { "_id": product_type_id }, doc! { "$set": set_doc })
         .await
         .is_err()

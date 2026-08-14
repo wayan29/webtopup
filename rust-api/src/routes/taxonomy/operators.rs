@@ -354,9 +354,18 @@ pub async fn operator_admin_create(
         .unwrap_or_else(|| Bson::Array(Vec::new()));
     let icon = payload.icon.unwrap_or_default();
     let instruction_image = payload.instruction_image.unwrap_or_default();
-    if let Err(response) =
-        crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&icon, &instruction_image])
-    {
+    if let Err(response) = crate::services::managed_assets::ensure_managed_field(
+        &crate::routes::uploads::upload_root(),
+        &icon,
+        crate::services::managed_assets::ManagedFieldFolderPolicy::Icons,
+    ) {
+        return response;
+    }
+    if let Err(response) = crate::services::managed_assets::ensure_managed_field(
+        &crate::routes::uploads::upload_root(),
+        &instruction_image,
+        crate::services::managed_assets::ManagedFieldFolderPolicy::Instructions,
+    ) {
         return response;
     }
     let insert_doc = doc! {
@@ -443,6 +452,8 @@ pub async fn operator_admin_update(
     };
 
     let previous_name = read_string(&operator, "name");
+    let previous_icon = read_string(&operator, "icon");
+    let previous_instruction_image = read_string(&operator, "instructionImage");
     let previous_category_id = match operator.get_object_id("categoryId") {
         Ok(id) => id,
         Err(_) => {
@@ -534,13 +545,29 @@ pub async fn operator_admin_update(
         set_doc.insert("categoryId", target_category_id);
     }
     if let Some(value) = payload.icon {
-        if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&value]) {
+        if let Err(response) = crate::services::managed_assets::ensure_managed_field_for_update(
+            &crate::routes::uploads::upload_root(),
+            &value,
+            crate::services::managed_assets::ManagedFieldFolderPolicy::Icons,
+            crate::services::managed_assets::effectively_changed_managed_field(
+                Some(&previous_icon),
+                &value,
+            ),
+        ) {
             return response;
         }
         set_doc.insert("icon", value);
     }
     if let Some(value) = payload.instruction_image {
-        if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&value]) {
+        if let Err(response) = crate::services::managed_assets::ensure_managed_field_for_update(
+            &crate::routes::uploads::upload_root(),
+            &value,
+            crate::services::managed_assets::ManagedFieldFolderPolicy::Instructions,
+            crate::services::managed_assets::effectively_changed_managed_field(
+                Some(&previous_instruction_image),
+                &value,
+            ),
+        ) {
             return response;
         }
         set_doc.insert("instructionImage", value);

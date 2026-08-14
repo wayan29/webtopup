@@ -10,6 +10,11 @@ use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 
 use crate::{
     security::{require_permission, ErrorResponse},
+    services::managed_assets::{
+        abort_legacy_managed_write, commit_legacy_managed_write, effectively_changed_cover_path,
+        fence_legacy_managed_writes, managed_asset_registry_unavailable_response,
+        start_legacy_managed_write,
+    },
     state::AppState,
 };
 
@@ -111,6 +116,7 @@ pub async fn reward_create(
         Err(response) => return response,
     };
     let now = DateTime::now();
+    let image_url = normalized.image_url.clone();
     let rewards = client
         .database(&state.mongo_db)
         .collection::<Document>("rewards");
@@ -119,16 +125,44 @@ pub async fn reward_create(
         "description": normalized.description,
         "pointsRequired": normalized.points_required,
         "stock": normalized.stock,
-        "imageUrl": normalized.image_url,
+        "imageUrl": &image_url,
         "category": normalized.category,
         "status": normalized.status,
         "createdAt": now,
         "updatedAt": now,
         "__v": 0,
     };
-    let insert_result = match rewards.insert_one(document).await {
-        Ok(result) => result,
-        Err(_) => return internal_error(),
+    let insert_result = if let Some(path) = effectively_changed_cover_path(None, &image_url) {
+        if !state.mongo_transactions_enabled {
+            return managed_asset_registry_unavailable_response();
+        }
+        let mut session = match start_legacy_managed_write(client).await {
+            Ok(session) => session,
+            Err(_) => return managed_asset_registry_unavailable_response(),
+        };
+        if fence_legacy_managed_writes(&mut session, &client.database(&state.mongo_db), &[path]).await.is_err() {
+            let _ = abort_legacy_managed_write(
+                &mut session,
+                crate::services::managed_asset_registry::RegistryError::Unavailable,
+            ).await;
+            return managed_asset_registry_unavailable_response();
+        }
+        let result = match rewards.insert_one(document).session(&mut session).await {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = session.abort_transaction().await;
+                return internal_error();
+            }
+        };
+        if commit_legacy_managed_write(&mut session).await.is_err() {
+            return managed_asset_registry_unavailable_response();
+        }
+        result
+    } else {
+        match rewards.insert_one(document).await {
+            Ok(result) => result,
+            Err(_) => return internal_error(),
+        }
     };
     let Some(id) = insert_result.inserted_id.as_object_id() else {
         return internal_error();
@@ -176,23 +210,42 @@ pub async fn reward_update(
         Ok(normalized) => normalized,
         Err(response) => return response,
     };
-    if rewards
-        .update_one(
-            doc! { "_id": object_id },
-            doc! { "$set": {
-                "name": normalized.name,
-                "description": normalized.description,
-                "pointsRequired": normalized.points_required,
-                "stock": normalized.stock,
-                "imageUrl": normalized.image_url,
-                "category": normalized.category,
-                "status": normalized.status,
-                "updatedAt": DateTime::now(),
-            } },
-        )
-        .await
-        .is_err()
-    {
+    let previous_image = crate::utils::bson::read_string(&current, "imageUrl");
+    let next_image = normalized.image_url.clone();
+    let image_path = effectively_changed_cover_path(Some(&previous_image), &next_image);
+    let update_doc = doc! { "$set": {
+        "name": normalized.name,
+        "description": normalized.description,
+        "pointsRequired": normalized.points_required,
+        "stock": normalized.stock,
+        "imageUrl": &next_image,
+        "category": normalized.category,
+        "status": normalized.status,
+        "updatedAt": DateTime::now(),
+    } };
+    if let Some(path) = image_path {
+        if !state.mongo_transactions_enabled {
+            return managed_asset_registry_unavailable_response();
+        }
+        let mut session = match start_legacy_managed_write(client).await {
+            Ok(session) => session,
+            Err(_) => return managed_asset_registry_unavailable_response(),
+        };
+        if fence_legacy_managed_writes(&mut session, &client.database(&state.mongo_db), &[path]).await.is_err() {
+            let _ = abort_legacy_managed_write(
+                &mut session,
+                crate::services::managed_asset_registry::RegistryError::Unavailable,
+            ).await;
+            return managed_asset_registry_unavailable_response();
+        }
+        if rewards.update_one(doc! { "_id": object_id }, update_doc).session(&mut session).await.is_err() {
+            let _ = session.abort_transaction().await;
+            return internal_error();
+        }
+        if commit_legacy_managed_write(&mut session).await.is_err() {
+            return managed_asset_registry_unavailable_response();
+        }
+    } else if rewards.update_one(doc! { "_id": object_id }, update_doc).await.is_err() {
         return internal_error();
     }
     let Some(reward) = rewards

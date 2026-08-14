@@ -60,12 +60,17 @@ pub fn build_article_payload(
             .unwrap_or_else(|| "draft".to_string()),
     };
     let image = text_value_or_current(payload.image, current, "image", "");
-    if let Err(response) = crate::services::managed_assets::ensure_managed_fields(
+    let previous_image = current.map(|document| read_string_default(document, "image", ""));
+    let effectively_changed = crate::services::managed_assets::effectively_changed_managed_field(
+        previous_image.as_deref(),
+        &image,
+    );
+    crate::services::managed_assets::ensure_managed_field_for_update(
         &crate::routes::uploads::upload_root(),
-        &[&image],
-    ) {
-        return Err(response);
-    }
+        &image,
+        crate::services::managed_assets::ManagedFieldFolderPolicy::Covers,
+        effectively_changed,
+    )?;
     Ok(NormalizedArticlePayload {
         title,
         slug,

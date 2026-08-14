@@ -140,6 +140,215 @@ fn catalog_taxonomy_handlers_enforce_read_write_permissions_in_rust() {
 }
 
 #[test]
+fn covers_writer_inventory_is_closed_and_product_type_cover_is_transactional() {
+    use crate::services::managed_assets::{
+        ACTIVE_COVERS_WRITERS, ENSURE_MANAGED_FIELDS_SOURCE_INVENTORY,
+        RESTRICTED_MANAGED_FIELDS,
+    };
+
+    assert_eq!(
+        ACTIVE_COVERS_WRITERS,
+        &[
+            ("producttypes", "cover"),
+            ("flashsales", "banner"),
+            ("articles", "image"),
+            ("rewards", "imageUrl"),
+            ("sliders", "image"),
+        ]
+    );
+    assert_eq!(RESTRICTED_MANAGED_FIELDS.len(), 11);
+    assert_eq!(ENSURE_MANAGED_FIELDS_SOURCE_INVENTORY.len(), 16);
+
+    let product_types = include_str!("routes/taxonomy/product_types.rs");
+    for handler in product_types
+        .split("pub async fn product_type_admin_create")
+        .skip(1)
+        .chain(
+            product_types
+                .split("pub async fn product_type_admin_update")
+                .skip(1),
+        )
+    {
+        assert!(handler.contains("effectively_changed_cover_path"));
+        assert!(handler.contains("start_legacy_managed_write"));
+        assert!(handler.contains("fence_legacy_managed_writes"));
+        assert!(handler.contains(".session(&mut session)"));
+        assert!(handler.contains("commit_legacy_managed_write"));
+    }
+}
+
+#[test]
+fn managed_field_updates_compare_old_and_new_values_instead_of_supply_flags() {
+    let managed_updates = [
+        (
+            "flash banner",
+            include_str!("routes/content/flash_payload.rs"),
+            "banner_was_supplied",
+        ),
+        (
+            "products icon",
+            include_str!("routes/products/payload.rs"),
+            "icon_was_supplied",
+        ),
+        (
+            "categories icon",
+            include_str!("routes/taxonomy/categories.rs"),
+            "icon_was_supplied",
+        ),
+        (
+            "operators icon/instruction image",
+            include_str!("routes/taxonomy/operators.rs"),
+            "icon_was_supplied",
+        ),
+        (
+            "product types icon/popup image",
+            include_str!("routes/taxonomy/product_types.rs"),
+            "icon_was_supplied",
+        ),
+        (
+            "payment method icon",
+            include_str!("routes/payment/validation.rs"),
+            "icon_was_supplied",
+        ),
+        (
+            "payment category icon",
+            include_str!("routes/payment/categories.rs"),
+            "icon_was_supplied",
+        ),
+        (
+            "settings images",
+            include_str!("routes/settings/validation.rs"),
+            "was_supplied",
+        ),
+        (
+            "slider image",
+            include_str!("routes/content/sliders.rs"),
+            "image_was_supplied",
+        ),
+    ];
+    for (field, source, supply_flag) in managed_updates {
+        assert!(!source.contains(supply_flag), "{field} must compare old and new values");
+        assert!(
+            source.contains("effectively_changed_managed_field"),
+            "{field} must use the trimmed old-vs-new comparison"
+        );
+    }
+}
+
+#[test]
+fn managed_field_source_contract_maps_each_restricted_writer_explicitly() {
+    use crate::services::managed_assets::ManagedFieldFolderPolicy;
+
+    let call_sites = [
+        (
+            "products",
+            "icon",
+            include_str!("routes/products/payload.rs"),
+            "ManagedFieldFolderPolicy::Icons",
+        ),
+        (
+            "categories",
+            "icon",
+            include_str!("routes/taxonomy/categories.rs"),
+            "ManagedFieldFolderPolicy::Icons",
+        ),
+        (
+            "operators",
+            "icon",
+            include_str!("routes/taxonomy/operators.rs"),
+            "ManagedFieldFolderPolicy::Icons",
+        ),
+        (
+            "operators",
+            "instructionImage",
+            include_str!("routes/taxonomy/operators.rs"),
+            "ManagedFieldFolderPolicy::Instructions",
+        ),
+        (
+            "producttypes",
+            "icon",
+            include_str!("routes/taxonomy/product_types.rs"),
+            "ManagedFieldFolderPolicy::Icons",
+        ),
+        (
+            "producttypes",
+            "popupInfo.image",
+            include_str!("routes/taxonomy/product_types.rs"),
+            "ManagedFieldFolderPolicy::Popups",
+        ),
+        (
+            "paymentmethods",
+            "icon",
+            include_str!("routes/payment/validation.rs"),
+            "ManagedFieldFolderPolicy::Icons",
+        ),
+        (
+            "paymentcategories",
+            "icon",
+            include_str!("routes/payment/categories.rs"),
+            "ManagedFieldFolderPolicy::Icons",
+        ),
+        (
+            "settings",
+            "favicon",
+            include_str!("routes/settings/validation.rs"),
+            "ManagedFieldFolderPolicy::Icons",
+        ),
+        (
+            "settings",
+            "logo",
+            include_str!("routes/settings/validation.rs"),
+            "ManagedFieldFolderPolicy::Icons",
+        ),
+        (
+            "settings",
+            "popupBannerImage",
+            include_str!("routes/settings/validation.rs"),
+            "ManagedFieldFolderPolicy::Popups",
+        ),
+    ];
+    for (collection, field, source, policy_marker) in call_sites {
+        assert!(source.contains(policy_marker), "{collection}.{field} policy call");
+        assert!(
+            crate::services::managed_assets::RESTRICTED_MANAGED_FIELDS
+                .iter()
+                .any(|(known_collection, known_field, policy)| {
+                    *known_collection == collection
+                        && *known_field == field
+                        && matches!(
+                            (policy, policy_marker),
+                            (ManagedFieldFolderPolicy::Icons, "ManagedFieldFolderPolicy::Icons")
+                                | (
+                                    ManagedFieldFolderPolicy::Popups,
+                                    "ManagedFieldFolderPolicy::Popups"
+                                )
+                                | (
+                                    ManagedFieldFolderPolicy::Instructions,
+                                    "ManagedFieldFolderPolicy::Instructions"
+                                )
+                        )
+                }),
+            "{collection}.{field} inventory entry"
+        );
+    }
+
+    // The legacy variadic helper is intentionally not a production writer contract anymore.
+    for source in [
+        include_str!("routes/products/payload.rs"),
+        include_str!("routes/taxonomy/categories.rs"),
+        include_str!("routes/taxonomy/operators.rs"),
+        include_str!("routes/taxonomy/product_types.rs"),
+        include_str!("routes/payment/validation.rs"),
+        include_str!("routes/payment/categories.rs"),
+        include_str!("routes/settings/validation.rs"),
+        include_str!("routes/articles/validation.rs"),
+        include_str!("routes/content/flash_payload.rs"),
+        include_str!("routes/rewards/validation.rs"),
+    ] {
+        assert!(!source.contains("ensure_managed_fields("));
+    }
+}
+
 fn validation_taxonomy_permission_matrix_behavior() {
     use crate::security::team_user_has_any_permission;
 

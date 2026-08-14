@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::{
     security::{require_permission, require_proxy_context},
+    services::managed_assets::effectively_changed_managed_field,
     state::AppState,
     utils::bson::read_string,
 };
@@ -245,7 +246,11 @@ pub async fn category_admin_create(
         _ => max_sort_order(&categories).await + 1,
     };
     let icon = payload.icon.unwrap_or_else(|| "📦".to_string());
-    if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&icon]) {
+    if let Err(response) = crate::services::managed_assets::ensure_managed_field(
+        &crate::routes::uploads::upload_root(),
+        &icon,
+        crate::services::managed_assets::ManagedFieldFolderPolicy::Icons,
+    ) {
         return response;
     }
     let now = DateTime::now();
@@ -349,7 +354,13 @@ pub async fn category_admin_update(
     }
 
     if let Some(icon) = payload.icon {
-        if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&icon]) {
+        let previous_icon = read_string(&category, "icon");
+        if let Err(response) = crate::services::managed_assets::ensure_managed_field_for_update(
+            &crate::routes::uploads::upload_root(),
+            &icon,
+            crate::services::managed_assets::ManagedFieldFolderPolicy::Icons,
+            effectively_changed_managed_field(Some(&previous_icon), &icon),
+        ) {
             return response;
         }
         set_doc.insert("icon", icon);

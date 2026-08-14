@@ -7,7 +7,9 @@ use super::{
     responses::{status_message, string_message},
     store::load_settings,
 };
-use crate::services::managed_assets::ensure_managed_fields;
+use crate::services::managed_assets::{
+    ensure_managed_field_for_update, ManagedFieldFolderPolicy,
+};
 
 pub async fn validate_update_payload(
     client: &mongodb::Client,
@@ -44,11 +46,22 @@ pub async fn validate_update_payload(
         changed_values.insert(key.clone(), normalized);
     }
     validate_cross_field_settings(&next_settings)?;
-    for key in ["favicon", "logo", "popupBannerImage"] {
+    for (key, policy) in [
+        ("favicon", ManagedFieldFolderPolicy::Icons),
+        ("logo", ManagedFieldFolderPolicy::Icons),
+        ("popupBannerImage", ManagedFieldFolderPolicy::Popups),
+    ] {
         if let Some(Value::String(path)) = next_settings.get(key) {
-            if let Err(response) = ensure_managed_fields(&crate::routes::uploads::upload_root(), &[path.as_str()]) {
-                return Err(response);
-            }
+            let previous_path = previous_settings.get(key).and_then(Value::as_str);
+            ensure_managed_field_for_update(
+                &crate::routes::uploads::upload_root(),
+                path,
+                policy,
+                crate::services::managed_assets::effectively_changed_managed_field(
+                    previous_path,
+                    path,
+                ),
+            )?;
         }
     }
     Ok((next_settings, changed_values, previous_settings))

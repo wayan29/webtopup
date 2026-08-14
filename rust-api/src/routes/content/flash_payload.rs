@@ -51,7 +51,17 @@ pub(super) async fn sanitize_flash_sale_payload(
             .await?;
 
     let banner = text_value_or_current(payload.banner, current, "banner", "");
-    if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&banner]) {
+    let previous_banner = current.map(|document| read_string(document, "banner"));
+    let effectively_changed = crate::services::managed_assets::effectively_changed_managed_field(
+        previous_banner.as_deref(),
+        &banner,
+    );
+    if let Err(response) = crate::services::managed_assets::ensure_managed_field_for_update(
+        &crate::routes::uploads::upload_root(),
+        &banner,
+        crate::services::managed_assets::ManagedFieldFolderPolicy::Covers,
+        effectively_changed,
+    ) {
         return Err(response);
     }
 

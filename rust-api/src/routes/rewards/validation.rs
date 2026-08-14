@@ -59,8 +59,8 @@ pub(super) fn normalize_reward_payload(
     if normalized.stock < 0 {
         return Err(validation_error("Stok hadiah tidak boleh negatif"));
     }
-    // Rewards historically required http(s). Managed internal upload paths are also accepted
-    // once the file exists on disk.
+    // Rewards historically required http(s). Managed internal cover paths are accepted only
+    // when explicitly submitted; unchanged historical values remain readable until repaired.
     let is_managed = crate::services::managed_assets::parse_managed_upload_url(&normalized.image_url)
         .is_ok();
     if !is_managed && !is_valid_http_url(&normalized.image_url) {
@@ -68,11 +68,17 @@ pub(super) fn normalize_reward_payload(
             "URL gambar harus diawali http:// atau https://",
         ));
     }
-    if let Err(response) =
-        crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&normalized.image_url])
-    {
-        return Err(response);
-    }
+    let previous_image = current.map(|document| read_string(document, "imageUrl"));
+    let effectively_changed = crate::services::managed_assets::effectively_changed_managed_field(
+        previous_image.as_deref(),
+        &normalized.image_url,
+    );
+    crate::services::managed_assets::ensure_managed_field_for_update(
+        &crate::routes::uploads::upload_root(),
+        &normalized.image_url,
+        crate::services::managed_assets::ManagedFieldFolderPolicy::Covers,
+        effectively_changed,
+    )?;
 
     Ok(normalized)
 }

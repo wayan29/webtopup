@@ -183,10 +183,20 @@ pub(super) async fn build_product_payload(
                 .map(|document| read_i64(document, "rewardPoints"))
                 .unwrap_or_default()
         });
+    let previous_icon = existing.map(|document| read_string(document, "icon"));
     let icon = field_string(payload, "icon")
-        .or_else(|| existing.map(|document| read_string(document, "icon")))
+        .or_else(|| previous_icon.clone())
         .unwrap_or_default();
-    if let Err(response) = crate::services::managed_assets::ensure_managed_fields(&crate::routes::uploads::upload_root(), &[&icon]) {
+    let effectively_changed = crate::services::managed_assets::effectively_changed_managed_field(
+        previous_icon.as_deref(),
+        &icon,
+    );
+    if let Err(response) = crate::services::managed_assets::ensure_managed_field_for_update(
+        &crate::routes::uploads::upload_root(),
+        &icon,
+        crate::services::managed_assets::ManagedFieldFolderPolicy::Icons,
+        effectively_changed,
+    ) {
         return Err(response);
     }
     let fallback_vendor = existing

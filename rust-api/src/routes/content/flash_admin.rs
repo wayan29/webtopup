@@ -98,11 +98,40 @@ pub async fn flash_sale_create(
         Err(response) => return response,
     };
     let now = DateTime::now();
+    let banner = sanitized.banner.clone();
     let document = flash_sale_document(sanitized, now, now);
     let flash_sales = db.collection::<Document>("flashsales");
-    let insert_result = match flash_sales.insert_one(document).await {
-        Ok(result) => result,
-        Err(_) => return internal_error(),
+    let insert_result = if let Some(path) = crate::services::managed_assets::effectively_changed_cover_path(None, &banner) {
+        if !state.mongo_transactions_enabled {
+            return crate::services::managed_assets::managed_asset_registry_unavailable_response();
+        }
+        let mut session = match crate::services::managed_assets::start_legacy_managed_write(client).await {
+            Ok(session) => session,
+            Err(_) => return crate::services::managed_assets::managed_asset_registry_unavailable_response(),
+        };
+        if crate::services::managed_assets::fence_legacy_managed_writes(&mut session, &db, &[path]).await.is_err() {
+            let _ = crate::services::managed_assets::abort_legacy_managed_write(
+                &mut session,
+                crate::services::managed_asset_registry::RegistryError::Unavailable,
+            ).await;
+            return crate::services::managed_assets::managed_asset_registry_unavailable_response();
+        }
+        let result = match flash_sales.insert_one(document).session(&mut session).await {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = session.abort_transaction().await;
+                return internal_error();
+            }
+        };
+        if crate::services::managed_assets::commit_legacy_managed_write(&mut session).await.is_err() {
+            return crate::services::managed_assets::managed_asset_registry_unavailable_response();
+        }
+        result
+    } else {
+        match flash_sales.insert_one(document).await {
+            Ok(result) => result,
+            Err(_) => return internal_error(),
+        }
     };
     let Some(id) = insert_result.inserted_id.as_object_id() else {
         return internal_error();
@@ -150,6 +179,7 @@ pub async fn flash_sale_update(
     else {
         return not_found("Flash Sale not found");
     };
+    let previous_banner = crate::utils::bson::read_string(&current, "banner");
     let sanitized = match sanitize_flash_sale_payload(&db, payload, Some(&current)).await {
         Ok(value) => value,
         Err(response) => return response,
@@ -158,8 +188,39 @@ pub async fn flash_sale_update(
         .get_datetime("createdAt")
         .copied()
         .unwrap_or_else(|_| DateTime::now());
+    let next_banner = sanitized.banner.clone();
     let updated = flash_sale_document(sanitized, created_at, DateTime::now());
-    if flash_sales
+    if let Some(path) = crate::services::managed_assets::effectively_changed_cover_path(
+        Some(&previous_banner),
+        &next_banner,
+    ) {
+        if !state.mongo_transactions_enabled {
+            return crate::services::managed_assets::managed_asset_registry_unavailable_response();
+        }
+        let mut session = match crate::services::managed_assets::start_legacy_managed_write(client).await {
+            Ok(session) => session,
+            Err(_) => return crate::services::managed_assets::managed_asset_registry_unavailable_response(),
+        };
+        if crate::services::managed_assets::fence_legacy_managed_writes(&mut session, &db, &[path]).await.is_err() {
+            let _ = crate::services::managed_assets::abort_legacy_managed_write(
+                &mut session,
+                crate::services::managed_asset_registry::RegistryError::Unavailable,
+            ).await;
+            return crate::services::managed_assets::managed_asset_registry_unavailable_response();
+        }
+        if flash_sales
+            .update_one(doc! { "_id": object_id }, doc! { "$set": updated })
+            .session(&mut session)
+            .await
+            .is_err()
+        {
+            let _ = session.abort_transaction().await;
+            return internal_error();
+        }
+        if crate::services::managed_assets::commit_legacy_managed_write(&mut session).await.is_err() {
+            return crate::services::managed_assets::managed_asset_registry_unavailable_response();
+        }
+    } else if flash_sales
         .update_one(doc! { "_id": object_id }, doc! { "$set": updated })
         .await
         .is_err()

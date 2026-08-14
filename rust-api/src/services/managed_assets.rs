@@ -2,10 +2,80 @@
 
 use std::path::{Path, PathBuf};
 
-use mongodb::{bson::doc, Database};
+use mongodb::{bson::doc, Client, ClientSession, Database};
 use serde::Serialize;
 
+use crate::services::{
+    idempotency::{commit_mongo_transaction_with_unknown_retry, TransactionCommitOutcome},
+    managed_asset_registry::{increment_legacy_acquisition_fence, RegistryError},
+};
+
 const MANAGED_FOLDERS: &[&str] = &["icons", "covers", "popups", "instructions"];
+
+/// Folder policy for fields that may contain a managed upload URL.
+///
+/// Values that are not managed upload URLs (empty values, bundled paths, and external URLs) are
+/// intentionally accepted here. The existing filesystem check remains responsible for managed
+/// upload existence, while this policy prevents a managed URL from crossing field boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedFieldFolderPolicy {
+    Icons,
+    Covers,
+    Popups,
+    Instructions,
+    AnyManaged,
+}
+
+impl ManagedFieldFolderPolicy {
+    fn accepts(self, folder: &str) -> bool {
+        match self {
+            Self::Icons => folder == "icons",
+            Self::Covers => folder == "covers",
+            Self::Popups => folder == "popups",
+            Self::Instructions => folder == "instructions",
+            Self::AnyManaged => MANAGED_FOLDERS.contains(&folder),
+        }
+    }
+}
+
+/// Closed inventory of fields that can currently persist a value from `/uploads/covers/...`.
+///
+/// `sliders.image` is listed for readiness and source-contract purposes only; slider mutations
+/// remain owned by the later slider mutation task.
+pub const ACTIVE_COVERS_WRITERS: &[(&str, &str)] = &[
+    ("producttypes", "cover"),
+    ("flashsales", "banner"),
+    ("articles", "image"),
+    ("rewards", "imageUrl"),
+    ("sliders", "image"),
+];
+
+/// Closed inventory of managed fields whose upload folder is restricted.
+pub const RESTRICTED_MANAGED_FIELDS: &[(&str, &str, ManagedFieldFolderPolicy)] = &[
+    ("products", "icon", ManagedFieldFolderPolicy::Icons),
+    ("categories", "icon", ManagedFieldFolderPolicy::Icons),
+    ("operators", "icon", ManagedFieldFolderPolicy::Icons),
+    (
+        "operators",
+        "instructionImage",
+        ManagedFieldFolderPolicy::Instructions,
+    ),
+    ("producttypes", "icon", ManagedFieldFolderPolicy::Icons),
+    (
+        "producttypes",
+        "popupInfo.image",
+        ManagedFieldFolderPolicy::Popups,
+    ),
+    ("paymentmethods", "icon", ManagedFieldFolderPolicy::Icons),
+    ("paymentcategories", "icon", ManagedFieldFolderPolicy::Icons),
+    ("settings", "favicon", ManagedFieldFolderPolicy::Icons),
+    ("settings", "logo", ManagedFieldFolderPolicy::Icons),
+    (
+        "settings",
+        "popupBannerImage",
+        ManagedFieldFolderPolicy::Popups,
+    ),
+];
 
 /// Exact registry: (collection, resource label, field path).
 const SCALAR_REFERENCES: &[(&str, &str, &str)] = &[
@@ -135,16 +205,208 @@ pub async fn managed_asset_exists(root: &Path, value: &str) -> Result<bool, Mana
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagedAssetReferenceError {
     NotFound,
+    WrongFolder,
 }
 
 impl ManagedAssetReferenceError {
     pub fn code(self) -> &'static str {
-        "MANAGED_ASSET_NOT_FOUND"
+        match self {
+            Self::NotFound => "MANAGED_ASSET_NOT_FOUND",
+            Self::WrongFolder => "MANAGED_ASSET_WRONG_FOLDER",
+        }
     }
 
     pub fn message(self) -> &'static str {
-        "Asset upload tidak ditemukan"
+        match self {
+            Self::NotFound => "Asset upload tidak ditemukan",
+            Self::WrongFolder => "Folder asset upload tidak sesuai field",
+        }
     }
+}
+
+/// Require an exact managed folder when a value is a managed upload URL.
+///
+/// A non-managed value is deliberately not rejected: existing callers permit empty values,
+/// bundled assets, and external HTTPS URLs. Historical values are preserved by callers when the
+/// field is not effectively changed; newly submitted values must call this helper before writing.
+pub fn require_managed_folder(
+    value: &str,
+    policy: ManagedFieldFolderPolicy,
+) -> Result<(), ManagedAssetReferenceError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let Ok((folder, _filename)) = parse_managed_upload_url(trimmed) else {
+        return if trimmed.starts_with("/uploads/") {
+            Err(ManagedAssetReferenceError::WrongFolder)
+        } else {
+            Ok(())
+        };
+    };
+    if policy.accepts(&folder) {
+        Ok(())
+    } else {
+        Err(ManagedAssetReferenceError::WrongFolder)
+    }
+}
+
+/// Compare a persisted field value with its next value using the same trimming semantics as
+/// managed upload validation. A value is effectively changed only when its normalized text differs
+/// from the existing value; merely resubmitting a legacy wrong-folder value is therefore allowed.
+pub fn effectively_changed_managed_field(previous: Option<&str>, next: &str) -> bool {
+    previous.map(str::trim) != Some(next.trim())
+}
+
+/// Return only effectively changed managed cover paths, preserving order while deduplicating.
+/// Empty, unchanged/non-managed values and managed folders other than `covers` do not fence.
+pub fn effectively_changed_cover_path<'a>(
+    previous: Option<&str>,
+    next: &'a str,
+) -> Option<&'a str> {
+    let next = next.trim();
+    if next.is_empty() || !effectively_changed_managed_field(previous, next) {
+        return None;
+    }
+    match parse_managed_upload_url(next) {
+        Ok((folder, _)) if folder == "covers" => Some(next),
+        _ => None,
+    }
+}
+
+fn changed_cover_paths<'a>(changed_paths: &'a [&'a str]) -> Result<Vec<&'a str>, RegistryError> {
+    let mut result = Vec::new();
+    for path in changed_paths.iter().copied() {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok((folder, _filename)) = crate::services::managed_asset_registry::canonical_managed_path(trimmed) else {
+            // Bundled and external values are not managed paths. A malformed `/uploads/...`
+            // value is not silently ignored, however: callers must fail closed.
+            if trimmed.starts_with("/uploads/") {
+                return Err(RegistryError::PathInvalid);
+            }
+            continue;
+        };
+        if folder != "covers" || result.contains(&trimmed) {
+            continue;
+        }
+        result.push(trimmed);
+    }
+    Ok(result)
+}
+
+/// Fence legacy non-slider writes in the same transaction as their domain write.
+///
+/// This deliberately creates no reference rows and never changes `referenceCount`; it only
+/// serializes acquisition against registry deletion by incrementing the monotonic fence version.
+pub async fn fence_legacy_managed_writes(
+    session: &mut ClientSession,
+    db: &Database,
+    changed_paths: &[&str],
+) -> Result<(), RegistryError> {
+    for path in changed_cover_paths(changed_paths)? {
+        increment_legacy_acquisition_fence(session, db, path).await?;
+    }
+    Ok(())
+}
+
+/// Start the narrow transaction used by a legacy writer when it is persisting a changed cover.
+pub async fn start_legacy_managed_write(client: &Client) -> Result<ClientSession, RegistryError> {
+    let mut session = client
+        .start_session()
+        .await
+        .map_err(|_| RegistryError::Unavailable)?;
+    session
+        .start_transaction()
+        .await
+        .map_err(|_| RegistryError::Unavailable)?;
+    Ok(session)
+}
+
+/// Abort a legacy writer transaction, preserving the original registry error only when rollback
+/// itself is acknowledged.
+pub async fn abort_legacy_managed_write(
+    session: &mut ClientSession,
+    error: RegistryError,
+) -> RegistryError {
+    match session.abort_transaction().await {
+        Ok(()) => error,
+        Err(_) => RegistryError::TransactionAbortFailed,
+    }
+}
+
+/// Commit only the transaction that already contains the domain write and cover fence. An
+/// ambiguous commit never becomes a success response; Task 7/readiness reconciliation owns it.
+pub async fn commit_legacy_managed_write(
+    session: &mut ClientSession,
+) -> Result<(), RegistryError> {
+    match commit_mongo_transaction_with_unknown_retry(session).await {
+        TransactionCommitOutcome::Committed => Ok(()),
+        TransactionCommitOutcome::Ambiguous => Err(RegistryError::AmbiguousCommit),
+        TransactionCommitOutcome::FailedDefinitely => Err(RegistryError::Unavailable),
+    }
+}
+
+pub fn managed_asset_registry_unavailable_response() -> axum::response::Response {
+    use axum::{response::IntoResponse, Json};
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": {
+                "code": "MANAGED_ASSET_REGISTRY_UNAVAILABLE",
+                "message": "Managed asset registry tidak tersedia"
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// Validate one managed-or-external field with an exact folder policy.
+pub fn ensure_managed_field(
+    root: &Path,
+    value: &str,
+    policy: ManagedFieldFolderPolicy,
+) -> Result<(), axum::response::Response> {
+    ensure_managed_field_for_update(root, value, policy, true)
+}
+
+/// Validate a submitted field while allowing an unchanged historical value to retain its old
+/// folder classification. Existence checks still apply to managed paths in either case.
+pub fn ensure_managed_field_for_update(
+    root: &Path,
+    value: &str,
+    policy: ManagedFieldFolderPolicy,
+    effectively_changed: bool,
+) -> Result<(), axum::response::Response> {
+    if effectively_changed {
+        if let Err(error) = require_managed_folder(value, policy) {
+            return Err(managed_asset_policy_response(error));
+        }
+    }
+    if require_existing_managed_asset_sync(root, value).is_err() {
+        return Err(managed_asset_not_found_response());
+    }
+    Ok(())
+}
+
+fn managed_asset_policy_response(error: ManagedAssetReferenceError) -> axum::response::Response {
+    use axum::{response::IntoResponse, Json};
+    let status = match error {
+        ManagedAssetReferenceError::NotFound => axum::http::StatusCode::BAD_REQUEST,
+        ManagedAssetReferenceError::WrongFolder => axum::http::StatusCode::BAD_REQUEST,
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "error": {
+                "code": error.code(),
+                "message": error.message()
+            }
+        })),
+    )
+        .into_response()
 }
 
 /// Empty values, emoji/category glyphs, bundled assets, and external HTTPS URLs pass.
@@ -210,6 +472,27 @@ pub fn ensure_managed_fields(
     Ok(())
 }
 
+/// Source-contract inventory used by security tests and readiness policy. Every production call
+/// site of `ensure_managed_fields` must be represented by one of these field entries.
+pub const ENSURE_MANAGED_FIELDS_SOURCE_INVENTORY: &[(&str, &str, ManagedFieldFolderPolicy)] = &[
+    ("products", "icon", ManagedFieldFolderPolicy::Icons),
+    ("categories", "icon", ManagedFieldFolderPolicy::Icons),
+    ("operators", "icon", ManagedFieldFolderPolicy::Icons),
+    ("operators", "instructionImage", ManagedFieldFolderPolicy::Instructions),
+    ("producttypes", "icon", ManagedFieldFolderPolicy::Icons),
+    ("producttypes", "cover", ManagedFieldFolderPolicy::Covers),
+    ("producttypes", "popupInfo.image", ManagedFieldFolderPolicy::Popups),
+    ("paymentmethods", "icon", ManagedFieldFolderPolicy::Icons),
+    ("paymentcategories", "icon", ManagedFieldFolderPolicy::Icons),
+    ("settings", "favicon", ManagedFieldFolderPolicy::Icons),
+    ("settings", "logo", ManagedFieldFolderPolicy::Icons),
+    ("settings", "popupBannerImage", ManagedFieldFolderPolicy::Popups),
+    ("flashsales", "banner", ManagedFieldFolderPolicy::Covers),
+    ("articles", "image", ManagedFieldFolderPolicy::Covers),
+    ("rewards", "imageUrl", ManagedFieldFolderPolicy::Covers),
+    ("sliders", "image", ManagedFieldFolderPolicy::Covers),
+];
+
 pub async fn count_asset_references(
     db: &Database,
     url: &str,
@@ -265,6 +548,168 @@ fn is_safe_managed_filename(filename: &str) -> bool {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn managed_field_folder_policy_rejects_wrong_managed_folder_but_allows_legacy_values() {
+        assert!(require_managed_folder(
+            "/uploads/icons/logo.png",
+            ManagedFieldFolderPolicy::Icons,
+        )
+        .is_ok());
+        assert_eq!(
+            require_managed_folder(
+                "/uploads/covers/banner.webp",
+                ManagedFieldFolderPolicy::Icons,
+            )
+            .unwrap_err(),
+            ManagedAssetReferenceError::WrongFolder,
+        );
+        assert!(require_managed_folder(
+            "/uploads/covers/banner.webp",
+            ManagedFieldFolderPolicy::Covers,
+        )
+        .is_ok());
+        assert!(require_managed_folder("", ManagedFieldFolderPolicy::Icons).is_ok());
+        assert!(require_managed_folder("/danayasa-logo.svg", ManagedFieldFolderPolicy::Icons).is_ok());
+        assert!(require_managed_folder("https://cdn.example/logo.png", ManagedFieldFolderPolicy::Icons).is_ok());
+    }
+
+    #[test]
+    fn unchanged_historical_wrong_folder_is_preserved() {
+        let root = temp_root();
+        let historical = root.join("covers").join("legacy-cover.png");
+        std::fs::create_dir_all(historical.parent().unwrap()).unwrap();
+        std::fs::write(&historical, b"legacy").unwrap();
+
+        assert!(ensure_managed_field_for_update(
+            &root,
+            "/uploads/covers/legacy-cover.png",
+            ManagedFieldFolderPolicy::Icons,
+            false,
+        )
+        .is_ok());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn changed_wrong_folder_is_rejected() {
+        assert_eq!(
+            require_managed_folder(
+                "/uploads/covers/new-cover.png",
+                ManagedFieldFolderPolicy::Icons,
+            )
+            .unwrap_err(),
+            ManagedAssetReferenceError::WrongFolder,
+        );
+    }
+
+    #[test]
+    fn malformed_upload_namespace_is_not_treated_as_external() {
+        assert_eq!(
+            require_managed_folder(
+                "/uploads/covers/../new-cover.png",
+                ManagedFieldFolderPolicy::Covers,
+            )
+            .unwrap_err(),
+            ManagedAssetReferenceError::WrongFolder,
+        );
+    }
+
+    #[test]
+    fn effectively_changed_managed_field_distinguishes_unchanged_and_changed_values() {
+        assert!(!effectively_changed_managed_field(
+            Some("/uploads/covers/legacy-cover.png"),
+            "/uploads/covers/legacy-cover.png",
+        ));
+        assert!(effectively_changed_managed_field(
+            Some("/uploads/covers/legacy-cover.png"),
+            "/uploads/covers/repaired-cover.png",
+        ));
+        assert!(effectively_changed_managed_field(
+            None,
+            "/uploads/icons/new-icon.png",
+        ));
+    }
+
+    #[test]
+    fn effectively_changed_cover_selection_only_returns_changed_covers() {
+        assert_eq!(
+            effectively_changed_cover_path(
+                Some("/uploads/covers/old.webp"),
+                "/uploads/covers/new.webp",
+            ),
+            Some("/uploads/covers/new.webp"),
+        );
+        assert_eq!(
+            effectively_changed_cover_path(
+                Some("/uploads/covers/same.webp"),
+                "/uploads/covers/same.webp",
+            ),
+            None,
+        );
+        assert_eq!(
+            effectively_changed_cover_path(Some("/uploads/icons/old.png"), "/uploads/icons/new.png"),
+            None,
+        );
+        assert_eq!(effectively_changed_cover_path(None, ""), None);
+    }
+
+    #[test]
+    fn covers_writer_inputs_are_deduplicated_and_non_cover_paths_are_ignored() {
+        let paths = changed_cover_paths(&[
+            "",
+            "/uploads/icons/icon.png",
+            "/uploads/covers/banner.webp",
+            "/uploads/covers/banner.webp",
+            "/uploads/covers/other.webp",
+        ])
+        .unwrap();
+        assert_eq!(paths, vec!["/uploads/covers/banner.webp", "/uploads/covers/other.webp"]);
+    }
+
+    #[test]
+    fn legacy_fence_does_not_mutate_reference_rows_or_reference_count() {
+        let source = include_str!("managed_assets.rs");
+        let fence = source
+            .split("pub async fn fence_legacy_managed_writes")
+            .nth(1)
+            .and_then(|rest| rest.split("/// Start the narrow transaction").next())
+            .expect("legacy fence source contract");
+        assert!(fence.contains("increment_legacy_acquisition_fence"));
+        assert!(!fence.contains("referenceCount"));
+        assert!(!fence.contains("managedassetreferences"));
+    }
+
+    #[test]
+    fn legacy_fence_cannot_persist_after_asset_enters_deleting() {
+        let source = include_str!("managed_asset_registry.rs");
+        let fence = source
+            .split("pub async fn increment_legacy_acquisition_fence")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn begin_asset_deletion").next())
+            .expect("registry fence source contract");
+        assert!(fence.contains("\"folder\": \"covers\""));
+        assert!(fence.contains("\"state\": AVAILABLE"));
+        assert!(fence.contains("acquisitionFenceVersion"));
+        assert!(fence.contains("modified_count != 1"));
+    }
+
+    #[test]
+    fn closed_inventory_constants_are_exact() {
+        assert_eq!(
+            ACTIVE_COVERS_WRITERS,
+            &[
+                ("producttypes", "cover"),
+                ("flashsales", "banner"),
+                ("articles", "image"),
+                ("rewards", "imageUrl"),
+                ("sliders", "image"),
+            ]
+        );
+        assert_eq!(RESTRICTED_MANAGED_FIELDS.len(), 11);
+        assert_eq!(ENSURE_MANAGED_FIELDS_SOURCE_INVENTORY.len(), 16);
+    }
 
     fn temp_root() -> PathBuf {
         let nanos = SystemTime::now()
