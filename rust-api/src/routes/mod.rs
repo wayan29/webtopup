@@ -13,6 +13,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::security::resolve_request_trace_layer_correlation;
 use crate::state::AppState;
+use crate::routes::content::MAX_SLIDER_JSON_BYTES;
 
 pub mod articles;
 pub mod audit_logs;
@@ -324,11 +325,14 @@ pub fn app(state: Arc<AppState>) -> Router {
         )
         .route(
             "/v2/sliders/admin/create",
-            axum::routing::post(content::slider_mutation_create),
+            axum::routing::post(content::slider_mutation_create)
+                .layer(DefaultBodyLimit::max(MAX_SLIDER_JSON_BYTES)),
         )
         .route(
             "/v2/sliders/admin/{id}",
-            axum::routing::put(content::slider_mutation_update).delete(content::slider_delete),
+            axum::routing::put(content::slider_mutation_update)
+                .delete(content::slider_delete)
+                .layer(DefaultBodyLimit::max(MAX_SLIDER_JSON_BYTES)),
         )
         .route("/v2/sliders/admin/archived", get(content::sliders_admin_archived))
         .route("/v2/sliders/admin/all", get(content::sliders_admin_all))

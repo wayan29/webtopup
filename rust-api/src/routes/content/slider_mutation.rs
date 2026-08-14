@@ -31,7 +31,8 @@ use crate::{
 use super::{
     complete_slider_claim_in_session, begin_slider_claim, canonical_slider_claim_digest,
     effective_requires_step_up,
-    mark_slider_commit_unknown_conditionally, mark_slider_transaction_started,
+    mark_slider_commit_unknown_conditionally, mark_slider_step_up_required,
+    mark_slider_transaction_started,
     normalize_create, normalize_update, normalize_slider_claim_binding, preallocate_slider_recovery_ids,
     recover_slider_commit, store_recovery_identifiers, verify_slider_claim_fence_in_session,
     SliderAction, SliderClaimBegin, SliderClaimBinding, SliderClaimError, SliderCommitRecovery,
@@ -158,6 +159,16 @@ pub async fn execute_slider_mutation(
     };
     if preflight.requires_step_up {
         if let Err(response) = require_trusted_step_up_group(&headers, SENSITIVE_GROUP) {
+            // Keep the permanent claim, but explicitly return it to an immediate pre-transaction
+            // retry state. No transaction fence, commitUnknown, or frozen result is written.
+            let _ = mark_slider_step_up_required(
+                &db,
+                claim_id,
+                &claim_token,
+                &binding,
+                lease_generation,
+            )
+            .await;
             return response;
         }
     }
@@ -185,6 +196,7 @@ pub async fn execute_slider_mutation(
         &mut session,
         &db,
         &operator,
+        &headers,
         action,
         target,
         &input,
@@ -287,7 +299,7 @@ async fn authoritative_preflight(db: &Database, action: SliderAction, target: Op
     Ok(Preflight { current_revision: revision, requires_step_up })
 }
 
-async fn write_transaction(session: &mut ClientSession, db: &Database, operator: &AuthenticatedProxyUser, action: SliderAction, target: Option<ObjectId>, input: &MutationInput, binding: &SliderClaimBinding, claim_id: ObjectId, claim_token: &str, generation: u64, started_at: DateTime, ids: &super::SliderRecoveryIdentifiers, preflight: Preflight) -> Result<(StatusCode, Value), Response> {
+async fn write_transaction(session: &mut ClientSession, db: &Database, operator: &AuthenticatedProxyUser, headers: &HeaderMap, action: SliderAction, target: Option<ObjectId>, input: &MutationInput, binding: &SliderClaimBinding, claim_id: ObjectId, claim_token: &str, generation: u64, started_at: DateTime, ids: &super::SliderRecoveryIdentifiers, preflight: Preflight) -> Result<(StatusCode, Value), Response> {
     // This is the first operation in the write transaction. No domain, reference, metadata,
     // audit, or claim-result write is allowed before the exact same-session fence succeeds.
     verify_slider_claim_fence_in_session(db, session, claim_id, claim_token, binding, generation, started_at, ids)
@@ -308,21 +320,39 @@ async fn write_transaction(session: &mut ClientSession, db: &Database, operator:
     let before = current.as_ref().map(|value| snapshot_from_document(value, target.unwrap()).unwrap());
     let after = snapshot_after(action, target, input, before.as_ref());
     let sensitivity = effective_requires_step_up(action, before.as_ref(), after.as_ref(), &[], &[]);
-    if sensitivity && !preflight.requires_step_up { return Err(mutation_error(StatusCode::FORBIDDEN, "AUTH_STEP_UP_REQUIRED", "Verifikasi ulang diperlukan untuk aksi sensitif")); }
+    // Recompute and verify the authoritative proof in this same transaction immediately before
+    // any asset, domain, revision, or audit write. Preflight is only an early response hint.
+    if sensitivity {
+        require_trusted_step_up_group(headers, SENSITIVE_GROUP)
+            .map_err(|_| mutation_error(StatusCode::FORBIDDEN, "AUTH_STEP_UP_REQUIRED", "Verifikasi ulang diperlukan untuk aksi sensitif"))?;
+    }
     if action == SliderAction::Create && input.status { let count = db.collection::<Document>("sliders").count_documents(doc! {"lifecycle":{"$ne":"archived"},"status":true}).session(&mut *session).await.map_err(|_| transaction_unavailable())?; if count >= MAX_PUBLIC_SLIDERS as u64 { return Err(mutation_error(StatusCode::CONFLICT, "SLIDER_ACTIVE_LIMIT_REACHED", "Batas slider aktif tercapai")); } }
     if action == SliderAction::Create { let count = db.collection::<Document>("sliders").count_documents(doc! {"lifecycle":{"$ne":"archived"}}).session(&mut *session).await.map_err(|_| transaction_unavailable())?; if count >= MAX_CURRENT_SLIDERS as u64 { return Err(mutation_error(StatusCode::CONFLICT, "SLIDER_TOTAL_LIMIT_REACHED", "Batas total slider tercapai")); } }
     let slider_id = ids.candidate_slider_id.or(target).ok_or_else(internal_mutation_error)?;
-    let mut acquired_new = false;
+    let mut managed_references_acquired = Vec::new();
+    let mut managed_references_released = Vec::new();
     if !is_existing_image(before.as_ref().map(|v| v.image.as_str()), &input.image) {
         ensure_cover_file(&input.image)?;
-        acquire_slider_reference(session, db, &input.image, slider_id).await.map_err(registry_error_response)?;
-        acquired_new = true;
+        let outcome = acquire_slider_reference(session, db, &input.image, slider_id)
+            .await
+            .map_err(registry_error_response)?;
+        managed_references_acquired.push(doc! {
+            "assetId": outcome.asset_id,
+            "referenceId": outcome.reference_id,
+            "path": &input.image,
+        });
     }
     if let Some(before) = before.as_ref() {
         if before.image != input.image && is_registered_asset(db, session, &before.image, false).await? {
-            release_slider_reference(session, db, &before.image, slider_id).await.map_err(registry_error_response)?;
+            let outcome = release_slider_reference(session, db, &before.image, slider_id)
+                .await
+                .map_err(registry_error_response)?;
+            managed_references_released.push(doc! {
+                "assetId": outcome.asset_id,
+                "referenceId": outcome.reference_id,
+                "path": &before.image,
+            });
         }
-        let _ = acquired_new;
     }
     let now = DateTime::now();
     let slider = if action == SliderAction::Create {
@@ -337,7 +367,23 @@ async fn write_transaction(session: &mut ClientSession, db: &Database, operator:
     };
     let next_revision = input.expected_revision.checked_add(1).ok_or_else(internal_mutation_error)?;
     db.collection::<Document>(SLIDER_METADATA_COLLECTION).update_one(doc! {"_id":"global"}, doc! {"$set":{"revision":next_revision,"updatedAt":now,"updatedBy":operator.id},"$setOnInsert":{"_id":"global"}},).with_options(UpdateOptions::builder().upsert(true).build()).session(&mut *session).await.map_err(|_| transaction_unavailable())?;
-    let audit = sanitize_audit_document(&doc! {"_id":ids.audit_event_id,"claimId":claim_id,"action":action.as_str(),"targetId":slider_id,"actorId":operator.id,"revisionBefore":input.expected_revision,"revisionAfter":next_revision,"before":before.as_ref().map(snapshot_document).unwrap_or_default(),"after":snapshot_document(&snapshot_from_document(&slider,slider_id).map_err(|_| internal_mutation_error())?),"publicImpact":preflight.requires_step_up,"idempotencyKeyHash":sha256_hex(binding.key.as_bytes())});
+    let after_snapshot = snapshot_from_document(&slider, slider_id).map_err(|_| internal_mutation_error())?;
+    let audit = build_slider_domain_audit_document(
+        operator,
+        headers,
+        action,
+        slider_id,
+        claim_id,
+        ids.audit_event_id,
+        input.expected_revision,
+        next_revision,
+        before.as_ref(),
+        &after_snapshot,
+        sensitivity,
+        &managed_references_acquired,
+        &managed_references_released,
+        &binding.key,
+    );
     db.collection::<Document>(DOMAIN_AUDITS_COLLECTION).insert_one(audit).session(&mut *session).await.map_err(|_| transaction_unavailable())?;
     let body = json!({"message":if action==SliderAction::Create {"Slider created"} else {"Slider updated"},"slider":super::document_to_json(slider),"revision":next_revision,"replayed":false});
     complete_slider_claim_in_session(db, session, claim_id, claim_token, binding, generation, started_at, if action==SliderAction::Create {201} else {200}, &body, next_revision, ids.audit_event_id).await.map_err(claim_error_response)?;
@@ -355,6 +401,110 @@ fn version_conflict_body(expected_revision: i64, current_revision: i64, snapshot
         },
         "replayed": false,
     }))
+}
+
+fn build_slider_domain_audit_document(
+    actor: &AuthenticatedProxyUser,
+    headers: &HeaderMap,
+    action: SliderAction,
+    target_id: ObjectId,
+    claim_id: ObjectId,
+    audit_event_id: ObjectId,
+    revision_before: i64,
+    revision_after: i64,
+    before: Option<&SliderSnapshotItem>,
+    after: &SliderSnapshotItem,
+    public_impact: bool,
+    acquired: &[Document],
+    released: &[Document],
+    idempotency_key: &str,
+) -> Document {
+    let correlation = actor.resolve_correlation(headers);
+    build_slider_domain_audit_shape(
+        actor.id,
+        &actor.role,
+        correlation.source.as_str(),
+        correlation.trace_id.as_deref(),
+        action,
+        target_id,
+        claim_id,
+        audit_event_id,
+        revision_before,
+        revision_after,
+        before,
+        after,
+        public_impact,
+        acquired,
+        released,
+        idempotency_key,
+    )
+}
+
+/// Construct the complete sanitized domain-audit shape. This pure seam deliberately accepts only
+/// normalized snapshots and trusted actor/correlation values; callers never pass raw secrets.
+fn build_slider_domain_audit_shape(
+    actor_id: ObjectId,
+    actor_role: &str,
+    correlation_source: &str,
+    trace_id: Option<&str>,
+    action: SliderAction,
+    target_id: ObjectId,
+    claim_id: ObjectId,
+    audit_event_id: ObjectId,
+    revision_before: i64,
+    revision_after: i64,
+    before: Option<&SliderSnapshotItem>,
+    after: &SliderSnapshotItem,
+    public_impact: bool,
+    acquired: &[Document],
+    released: &[Document],
+    idempotency_key: &str,
+) -> Document {
+    let before_doc = before.map(snapshot_document).unwrap_or_default();
+    let after_doc = snapshot_document(after);
+    let field_names = ["name", "image", "link", "sortOrder", "status", "lifecycle"];
+    let changed_fields = field_names
+        .iter()
+        .filter(|field| before_doc.get(**field) != after_doc.get(**field))
+        .map(|field| Bson::String((*field).to_string()))
+        .collect::<Vec<_>>();
+    let old_order = before.map(|value| value.sort_order);
+    let new_order = Some(after.sort_order);
+    let ordering_digest = sha256_hex(
+        format!("{}:{}", old_order.unwrap_or(-1), new_order.unwrap_or(-1)).as_bytes(),
+    );
+    let mut correlation = doc! { "source": correlation_source };
+    if let Some(trace_id) = trace_id {
+        correlation.insert("trace", trace_id);
+    }
+    let mut audit = doc! {
+        "_id": audit_event_id,
+        "claimId": claim_id,
+        "action": action.as_str(),
+        "targetId": target_id,
+        "actor": { "id": actor_id, "role": actor_role },
+        "actorId": actor_id,
+        "actorRole": actor_role,
+        "revision": { "before": revision_before, "after": revision_after },
+        "revisionBefore": revision_before,
+        "revisionAfter": revision_after,
+        "normalized": { "before": before_doc.clone(), "after": after_doc.clone() },
+        "before": before_doc,
+        "after": after_doc,
+        "changedFields": Bson::Array(changed_fields),
+        "lifecycle": { "before": before.map(|value| value.lifecycle.as_str()).unwrap_or("none"), "after": after.lifecycle.as_str() },
+        "status": { "before": before.map(|value| value.status), "after": after.status },
+        "publicImpact": public_impact,
+        "ordering": { "old": old_order, "new": new_order, "digest": ordering_digest },
+        "managedReferences": { "acquired": Bson::Array(acquired.iter().cloned().map(Bson::Document).collect()), "released": Bson::Array(released.iter().cloned().map(Bson::Document).collect()) },
+        "idempotencyKeyHash": sha256_hex(idempotency_key.as_bytes()),
+        "auditEventId": audit_event_id,
+        "claimIdentifier": claim_id,
+        "correlation": correlation,
+        "result": { "replayed": false, "commitUnknown": false, "evidence": "transaction_committed" },
+    };
+    audit.insert("auditSource", "rust_domain");
+    sanitize_audit_document(&audit)
 }
 
 fn snapshot_after(action: SliderAction, target: Option<ObjectId>, input: &MutationInput, before: Option<&SliderSnapshotItem>) -> Option<SliderSnapshotItem> {
@@ -458,5 +608,19 @@ mod tests {
         assert_eq!(body["error"]["currentSnapshot"]["revision"], 15);
         assert!(body["error"]["currentSnapshot"]["sliders"].is_array());
         assert!(body["error"]["currentSnapshot"]["limits"].is_object());
+    }
+
+    #[test]
+    fn slider_domain_audit_shape_contains_required_sanitized_evidence() {
+        let id = ObjectId::new();
+        let before = SliderSnapshotItem { id, name: "Old".into(), image: "/uploads/covers/1710000000000-deadbeef.webp".into(), link: "/old".into(), sort_order: 2, status: false, lifecycle: "active".into() };
+        let after = SliderSnapshotItem { id, name: "New".into(), image: before.image.clone(), link: "/new".into(), sort_order: 3, status: true, lifecycle: "active".into() };
+        let audit = build_slider_domain_audit_shape(ObjectId::new(), "admin", "gateway_header", Some("4bf92f3577b34da6a3ce929d0e0e4736"), SliderAction::Update, id, ObjectId::new(), ObjectId::new(), 4, 5, Some(&before), &after, true, &[doc! { "assetId": ObjectId::new() }], &[doc! { "assetId": ObjectId::new() }], "secret-key-value");
+        for key in ["action", "targetId", "actorId", "actorRole", "revisionBefore", "revisionAfter", "normalized", "changedFields", "lifecycle", "status", "publicImpact", "ordering", "managedReferences", "idempotencyKeyHash", "auditEventId", "claimIdentifier", "correlation", "result"] {
+            assert!(audit.contains_key(key), "missing audit key {key}");
+        }
+        assert!(!audit.to_string().contains("secret-key-value"));
+        assert_eq!(audit.get_str("auditSource"), Ok("rust_domain"));
+        assert_eq!(audit.get_document("result").unwrap().get_bool("commitUnknown"), Ok(false));
     }
 }

@@ -46,3 +46,26 @@ Focused pure tests were added for the complete same-session write fence, unresol
 - `git diff --check`: passed.
 
 Residual live Mongo risks remain: same-session fence races, majority recovery under replica-set failover, ambiguous commit classification, registry swaps, and deliberate response-loss behavior were not exercised against live services; no services were started.
+
+## Fix round 2
+
+### RED evidence
+
+Added focused pure RED seams for immediate pre-transaction step-up claim resumption and the complete sanitized domain-audit shape. Before the helpers were implemented, the claim filter and audit-shape assertions had no production seam and failed to compile; the body-limit source contract was likewise absent from the slider route definitions.
+
+### GREEN implementation
+
+- A: authoritative missing `settings.sensitive` proof now keeps the permanent claim and conditionally transitions it to `retryable` with an expired lease, without `transactionStartedAt`, `commitUnknown`, or a frozen response. The same key can reclaim immediately with token/binding/generation fencing; claims are never deleted.
+- B: create and update slider JSON routes apply `DefaultBodyLimit::max(MAX_SLIDER_JSON_BYTES)` (`64 * 1024`) via the shared policy constant.
+- C: request headers flow into `write_transaction`; effective sensitivity is recomputed there and exact trusted step-up proof is checked before registry/domain writes.
+- D: same-transaction slider domain audit now includes action/target, actor id/role, revision before/after, normalized snapshots, changed fields, lifecycle/status, public impact, old/new ordering and digest, managed references acquired/released, hashed key, claim/audit identifiers, correlation source/trace, and result replay/commit-unknown evidence. Shared sanitizer is applied and raw keys/secrets are absent.
+
+### Fix-round 2 validation
+
+- `cd rust-api && cargo test slider_idempotency -- --nocapture`: passed (14 tests).
+- `cd rust-api && cargo test slider_mutation_create -- --nocapture`: passed (1 test).
+- `cd rust-api && cargo test slider_mutation_update -- --nocapture`: passed (1 test).
+- `cd rust-api && cargo check --bin webtopup-rust-api`: passed.
+- `git diff --check`: passed.
+
+Residual live Mongo risks remain: claim reclaim races, transaction proof under replica-set failover, managed-reference swap behavior, and correlation values from live trusted gateway spans were not exercised; no services were started.

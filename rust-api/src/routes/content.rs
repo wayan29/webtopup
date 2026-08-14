@@ -42,7 +42,8 @@ pub use slider_mutation::{
 pub use slider_idempotency::{
     begin_slider_claim,
     complete_slider_claim_in_session, mark_slider_commit_unknown_conditionally,
-    mark_slider_transaction_started, normalize_slider_claim_binding,
+    mark_slider_step_up_required, mark_slider_transaction_started, normalize_slider_claim_binding,
+    pre_transaction_retry_filter,
     normalize_slider_idempotency_key, preallocate_slider_recovery_ids,
     recover_slider_commit, store_recovery_identifiers, verify_slider_claim_fence_in_session,
     SliderClaimBegin, SliderClaimBinding, SliderClaimError, SliderCommitRecovery,
@@ -66,6 +67,22 @@ pub use slider_types::{
 };
 use types::*;
 use utils::*;
+
+#[cfg(test)]
+mod route_contract_tests {
+    #[test]
+    fn slider_create_and_update_routes_use_the_shared_json_body_limit() {
+        let source = include_str!("../mod.rs");
+        assert_eq!(
+            source
+                .matches("DefaultBodyLimit::max(MAX_SLIDER_JSON_BYTES)")
+                .count(),
+            2
+        );
+        assert!(source.contains("post(content::slider_mutation_create)"));
+        assert!(source.contains("put(content::slider_mutation_update)"));
+    }
+}
 
 pub(super) fn collect_flash_sale_product_ids(documents: &[Document]) -> Vec<ObjectId> {
     let mut ids = Vec::new();

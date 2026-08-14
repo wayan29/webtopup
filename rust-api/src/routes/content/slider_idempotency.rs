@@ -654,6 +654,64 @@ pub async fn store_recovery_identifiers(
     Ok(result.matched_count == 1)
 }
 
+/// Release a claim after authoritative preflight asks for step-up. The permanent claim is
+/// retained, but is immediately resumable: it has no transaction fence, commit-unknown marker,
+/// or frozen response and its expired lease lets the same key reclaim it without waiting.
+pub fn pre_transaction_retry_filter(
+    claim_id: ObjectId,
+    claim_token: &str,
+    binding: &SliderClaimBinding,
+    lease_generation: u64,
+) -> Document {
+    let mut filter = slider_claim_fence_filter(claim_id, claim_token, binding, lease_generation);
+    filter.extend(doc! {
+        "state": SLIDER_CLAIM_STATE_IN_PROGRESS,
+        "commitUnknown": { "$ne": true },
+        "transactionStartedAt": { "$exists": false },
+        "responseBodyJson": { "$exists": false },
+    });
+    filter
+}
+
+pub async fn mark_slider_step_up_required(
+    db: &Database,
+    claim_id: ObjectId,
+    claim_token: &str,
+    binding: &SliderClaimBinding,
+    lease_generation: u64,
+) -> Result<bool, SliderClaimError> {
+    let now = DateTime::now();
+    let result = db
+        .collection::<Document>(SLIDER_IDEMPOTENCY_CLAIMS_COLLECTION)
+        .update_one(
+            pre_transaction_retry_filter(claim_id, claim_token, binding, lease_generation),
+            doc! {
+                "$set": {
+                    "state": SLIDER_CLAIM_STATE_RETRYABLE,
+                    // Make this pre-transaction claim reclaimable immediately, without deleting it.
+                    "leaseExpiresAt": DateTime::from_millis(now.timestamp_millis() - 1),
+                    "updatedAt": now,
+                },
+                "$unset": {
+                    "transactionStartedAt": "",
+                    "commitUnknown": "",
+                    "responseStatus": "",
+                    "responseBodyJson": "",
+                    "resultRevision": "",
+                    "completedAt": "",
+                },
+            },
+        )
+        .with_options(
+            UpdateOptions::builder()
+                .write_concern(WriteConcern::majority())
+                .build(),
+        )
+        .await
+        .map_err(|_| SliderClaimError::Storage)?;
+    Ok(result.matched_count == 1)
+}
+
 pub async fn mark_slider_transaction_started(
     db: &Database,
     claim_id: ObjectId,
@@ -1136,6 +1194,19 @@ mod tests {
         assert_eq!(replay["data"], body["data"]);
         let oversized = Value::String("x".repeat(SLIDER_FROZEN_RESPONSE_MAX_BYTES - 1));
         assert_eq!(frozen_slider_response(&oversized).unwrap_err(), SliderClaimError::ResponseTooLarge);
+    }
+
+    #[test]
+    fn pre_transaction_step_up_retry_filter_is_immediate_and_never_fenced() {
+        let value = binding();
+        let filter = pre_transaction_retry_filter(ObjectId::new(), "token-1", &value, 4);
+        assert_eq!(filter.get_str("claimToken"), Ok("token-1"));
+        assert_eq!(filter.get_i64("leaseGeneration"), Ok(4_i64));
+        assert_eq!(filter.get_str("state"), Ok(SLIDER_CLAIM_STATE_IN_PROGRESS));
+        assert!(filter.get_document("transactionStartedAt").is_ok());
+        assert!(filter.get_document("commitUnknown").is_ok());
+        assert!(filter.get_document("responseBodyJson").is_ok());
+        assert!(filter.get_document("transactionStartedAt").is_ok());
     }
 
     #[test]
