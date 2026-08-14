@@ -14,6 +14,7 @@ const SITE_CONFIG_START_SCENARIO: &str = "site_config_transaction_start_unavaila
 const SITE_CONFIG_UNDO_MISMATCH_SCENARIO: &str = "site_config_claim_undo_mismatch";
 const SITE_CONFIG_COMMIT_UNKNOWN_SCENARIO: &str = "site_config_commit_unknown_unresolved";
 pub const MANAGED_ASSET_UNLINK_SCENARIO: &str = "managed_asset_unlink_failure";
+pub const SLIDER_RESPONSE_LOSS_SCENARIO: &str = "slider_response_loss_after_commit";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,6 +76,24 @@ pub async fn consume_site_config_commit_unknown_fault() -> bool {
 /// Guarded one-shot seam used only by local disposable upload verification. It is deliberately
 /// consumed after the deletion transaction commits and before unlink, so a fault leaves the asset
 /// in its durable `deleting` reconciliation state and cannot accidentally authorize removal.
+pub async fn consume_slider_response_loss_fault() -> bool {
+    let Some((state_dir, capability)) = guarded_fault_context() else {
+        return false;
+    };
+    consume_named_fault_files(
+        &state_dir,
+        &capability,
+        SLIDER_RESPONSE_LOSS_SCENARIO,
+        serde_json::json!({
+            "activationId": "",
+            "scenario": SLIDER_RESPONSE_LOSS_SCENARIO,
+            "rustOnly": true,
+            "consumed": true,
+        }),
+    )
+    .await
+}
+
 pub async fn consume_managed_asset_unlink_fault() -> bool {
     let Some((state_dir, capability)) = guarded_fault_context() else {
         return false;

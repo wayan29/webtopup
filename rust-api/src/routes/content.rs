@@ -15,6 +15,7 @@ mod flash_mappers;
 mod flash_payload;
 mod flash_public;
 mod slider_idempotency;
+mod slider_mutation;
 mod slider_policy;
 mod slider_snapshot;
 mod slider_types;
@@ -30,10 +31,23 @@ use flash_mappers::*;
 use flash_payload::*;
 pub use flash_public::{flash_sale_price, flash_sales_active};
 pub use sliders::{
-    slider_create, slider_delete, slider_update, sliders_admin_all, sliders_admin_archived,
-    sliders_public, sliders_update_sort_order,
+    slider_delete, sliders_admin_all, sliders_admin_archived, sliders_public,
+    sliders_update_sort_order,
 };
-pub use slider_idempotency::{slider_idempotency_index_models, SLIDER_IDEMPOTENCY_CLAIMS_COLLECTION};
+pub use slider_mutation::{
+    execute_slider_mutation,
+    slider_create as slider_mutation_create,
+    slider_update as slider_mutation_update,
+};
+pub use slider_idempotency::{
+    begin_slider_claim,
+    complete_slider_claim_in_session, mark_slider_commit_unknown_conditionally,
+    mark_slider_transaction_started, normalize_slider_claim_binding,
+    normalize_slider_idempotency_key, preallocate_slider_recovery_ids,
+    store_recovery_identifiers, SliderClaimBegin, SliderClaimBinding, SliderClaimError,
+    SliderCommitRecovery, SliderRecoveryIdentifiers, SLIDER_IDEMPOTENCY_CLAIMS_COLLECTION,
+    slider_idempotency_index_models,
+};
 pub use slider_snapshot::{
     load_archived_snapshot, load_current_snapshot, load_public_snapshot, load_slider_revision,
     matches_slider_etag, slider_etag, SliderAdminItem, SliderAdminSnapshot, SliderLimits,

@@ -324,11 +324,11 @@ pub fn app(state: Arc<AppState>) -> Router {
         )
         .route(
             "/v2/sliders/admin/create",
-            axum::routing::post(content::slider_create),
+            axum::routing::post(content::slider_mutation_create),
         )
         .route(
             "/v2/sliders/admin/{id}",
-            axum::routing::put(content::slider_update).delete(content::slider_delete),
+            axum::routing::put(content::slider_mutation_update).delete(content::slider_delete),
         )
         .route("/v2/sliders/admin/archived", get(content::sliders_admin_archived))
         .route("/v2/sliders/admin/all", get(content::sliders_admin_all))
