@@ -183,13 +183,25 @@ export function createStepUpOrchestrator(deps: StepUpOrchestratorDeps) {
 
   /**
    * Decide whether the pending action may be auto-retried after grant issuance.
-   * Task 12 idempotency is absent: only gateway-local AUTH_STEP_UP_REQUIRED or an
-   * already-present stable Idempotency-Key is safe.
+   * Gateway-local AUTH_STEP_UP_REQUIRED and an already-present stable Idempotency-Key are safe;
+   * reached-Rust/ambiguous mutations without a key remain investigation-only.
    */
   function canAutoRetry(action: StepUpPendingAction): boolean {
+    const stableKey = Object.entries(action.headers).find(([name, value]) => {
+      if (name.toLowerCase() !== 'idempotency-key') return false;
+      if (typeof value === 'string') return value.trim().length > 0;
+      return Array.isArray(value)
+        && value.some((item) => typeof item === 'string' && item.trim().length > 0);
+    });
+    const keyValue = stableKey?.[1];
+    const normalizedHeaders = typeof keyValue === 'string'
+      ? { 'Idempotency-Key': keyValue }
+      : Array.isArray(keyValue)
+        ? { 'Idempotency-Key': keyValue.find((item) => typeof item === 'string' && item.trim().length > 0) }
+        : action.headers;
     return isStepUpRetrySafe({
       gatewayRejectedBeforeUpstream: action.gatewayRejectedBeforeUpstream === true,
-      headers: action.headers,
+      headers: normalizedHeaders,
     });
   }
 
