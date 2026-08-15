@@ -61,4 +61,10 @@ exit 0
 - RED regression updated `adminPageChrome.test.ts` to require an explicit `restrictSelectionTo="covers"` on `Sliders.tsx` and reject the fallback expression; it failed before the fix.
 - GREEN fix passes the source suite: ImagePickerField forwards only the optional restriction, and Sliders.tsx supplies the explicit covers-only selection policy. This is the only Task 14 caller adjustment needed to preserve legacy callers while enforcing the Task 13 contract.
 
+## Review fix round 2
+
+- Focused accessibility review found a blocker: a root dialog only trapped focus but did not inert other `document.body` children, leaving app/background portal siblings interactive.
+- RED regression extended `adminPageChrome.test.ts` to require body-child inerting and restoration state tracking; it failed before the fix.
+- GREEN fix snapshots each non-dialog body child’s inert state, marks root-modal siblings inert, and restores only connected elements on cleanup. Nested dialogs continue to inert only their explicit parent dialog so the active portal remains usable.
+
 No live integration, browser behavior, service startup, or production operation was run or claimed; browser behavior is delegated to Task 16.

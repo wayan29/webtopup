@@ -261,6 +261,8 @@ test('accessible dialog primitive protects focus, scroll, nesting, and busy clos
     assert.match(dialog, /previousOverflow/);
     assert.match(dialog, /document\.body\.style\.overflow = previousOverflow/);
     assert.match(dialog, /inert/);
+    assert.match(dialog, /document\.body\.children/);
+    assert.match(dialog, /previousSiblingInert/);
     assert.match(dialog, /isConnected/);
     assert.match(dialog, /onCloseRef\.current\(\)/);
 });

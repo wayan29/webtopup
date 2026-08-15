@@ -58,9 +58,23 @@ export default function AccessibleDialog({
             ?? null;
         const previousOverflow = document.body.style.overflow;
         const previousParentInert = parentDialog?.inert ?? false;
+        const dialogHost = dialog?.parentElement;
+        const previousSiblingInert = new Map<HTMLElement, boolean>();
 
         document.body.style.overflow = 'hidden';
-        if (parentDialog) parentDialog.inert = true;
+        if (parentDialog) {
+            parentDialog.inert = true;
+        } else if (dialogHost) {
+            // A root modal is portalled directly under body. Inert every other body child so
+            // focus trapping is backed by an actual interaction barrier, including app content
+            // and any unrelated portal roots. The modal host itself stays interactive.
+            for (const child of Array.from(document.body.children)) {
+                const element = child as HTMLElement;
+                if (element === dialogHost) continue;
+                previousSiblingInert.set(element, element.inert);
+                element.inert = true;
+            }
+        }
 
         const focusInitial = () => {
             const requestedFocus = initialFocusRef?.current;
@@ -118,6 +132,9 @@ export default function AccessibleDialog({
             document.removeEventListener('keydown', handleKeyDown);
             document.body.style.overflow = previousOverflow;
             if (parentDialog) parentDialog.inert = previousParentInert;
+            for (const [element, wasInert] of previousSiblingInert) {
+                if (element.isConnected) element.inert = wasInert;
+            }
 
             const requestedReturnFocus = returnFocusRef?.current;
             const focusTarget = requestedReturnFocus?.isConnected
