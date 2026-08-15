@@ -755,6 +755,7 @@ export default function Sliders() {
                                     value={form.image}
                                     onChange={(url: string) => setForm({ ...form, image: url })}
                                     folder="covers"
+                                    restrictSelectionTo="covers"
                                 />
                             </div>
 

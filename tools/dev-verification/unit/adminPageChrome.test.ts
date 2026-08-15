@@ -289,5 +289,7 @@ test('image picker exposes nested accessible semantics and folder-restricted sel
     assert.match(picker, /\{ id: 'instructions'/);
     assert.match(field, /restrictSelectionTo/);
     assert.match(sliders, /folder="covers"/);
-    assert.match(field, /restrictSelectionTo \?\? folder/);
+    assert.match(sliders, /restrictSelectionTo="covers"/);
+    assert.match(field, /restrictSelectionTo=\{restrictSelectionTo\}/);
+    assert.doesNotMatch(field, /restrictSelectionTo=\{restrictSelectionTo \?\? folder\}/);
 });

@@ -67,7 +67,7 @@ export default function ImagePickerField({
                 }}
                 currentValue={value}
                 type={folder}
-                restrictSelectionTo={restrictSelectionTo ?? folder}
+                restrictSelectionTo={restrictSelectionTo}
             />
         </>
     );
