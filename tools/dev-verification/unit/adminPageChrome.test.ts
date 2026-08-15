@@ -244,3 +244,50 @@ test('audit detail dialog preserves accessible interaction semantics', () => {
     assert.match(dialog, /aria-live="polite"/);
     assert.match(dialog, /\[redacted\]/);
 });
+
+test('accessible dialog primitive protects focus, scroll, nesting, and busy close', () => {
+    const dialog = fs.readFileSync(path.join(root, 'client/src/components/admin/AccessibleDialog.tsx'), 'utf8');
+    assert.match(dialog, /role="dialog"/);
+    assert.match(dialog, /aria-modal="true"/);
+    assert.match(dialog, /aria-labelledby=\{titleId\}/);
+    assert.match(dialog, /aria-describedby=\{descriptionId\}/);
+    assert.match(dialog, /initialFocusRef/);
+    assert.match(dialog, /returnFocusRef/);
+    assert.match(dialog, /parentDialogRef/);
+    assert.match(dialog, /busy/);
+    assert.match(dialog, /document\.addEventListener\(['"]keydown['"]/);
+    assert.match(dialog, /event\.key === ['"]Escape['"]/);
+    assert.match(dialog, /event\.key !== ['"]Tab['"]/);
+    assert.match(dialog, /previousOverflow/);
+    assert.match(dialog, /document\.body\.style\.overflow = previousOverflow/);
+    assert.match(dialog, /inert/);
+    assert.match(dialog, /isConnected/);
+    assert.match(dialog, /onCloseRef\.current\(\)/);
+});
+
+test('image picker exposes nested accessible semantics and folder-restricted selection', () => {
+    const picker = fs.readFileSync(path.join(root, 'client/src/components/admin/ImagePicker.tsx'), 'utf8');
+    const field = fs.readFileSync(path.join(root, 'client/src/components/admin/ImagePickerField.tsx'), 'utf8');
+    const sliders = readAdminPage('Sliders.tsx');
+    assert.match(picker, /AccessibleDialog/);
+    assert.match(picker, /aria-label="Tutup pemilih gambar"/);
+    assert.match(picker, /aria-label=\{`Hapus gambar/);
+    assert.match(picker, /role="tab"/);
+    assert.match(picker, /aria-selected/);
+    assert.match(picker, /aria-pressed=\{selectedUrl === file\.url\}/);
+    assert.match(picker, /type="button"/);
+    assert.match(picker, /role="alert"/);
+    assert.match(picker, /ASSET_IN_USE/);
+    assert.doesNotMatch(picker, /confirm\(/, 'image deletion must use the nested accessible confirmation');
+    assert.match(picker, /restrictSelectionTo\?/);
+    assert.match(picker, /const canConfirm = Boolean/);
+    assert.match(picker, /activeTab === restrictSelectionTo/);
+    assert.match(picker, /disabled=\{!canConfirm \|\| dialogBusy\}/);
+    assert.match(picker, /\{ id: 'icons'/);
+    assert.match(picker, /\{ id: 'covers'/);
+    assert.match(picker, /\{ id: 'popups'/);
+    assert.match(picker, /\{ id: 'instructions'/);
+    assert.match(field, /restrictSelectionTo/);
+    assert.match(sliders, /folder="covers"/);
+    assert.match(field, /restrictSelectionTo \?\? folder/);
+});

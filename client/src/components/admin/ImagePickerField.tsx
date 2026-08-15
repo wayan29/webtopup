@@ -3,16 +3,20 @@ import { Image as ImageIcon, X } from 'lucide-react';
 import ImagePicker from './ImagePicker';
 import { getAssetUrl } from '../../lib/assetUrl';
 
+type ImageFolder = 'icons' | 'covers' | 'popups' | 'instructions';
+
 interface ImagePickerFieldProps {
     value: string;
     onChange: (url: string) => void;
-    folder?: 'icons' | 'covers' | 'popups' | 'instructions';
+    folder?: ImageFolder;
+    restrictSelectionTo?: ImageFolder;
 }
 
 export default function ImagePickerField({ 
-    value, 
-    onChange, 
-    folder = 'icons'
+    value,
+    onChange,
+    folder = 'icons',
+    restrictSelectionTo,
 }: ImagePickerFieldProps) {
     const [isOpen, setIsOpen] = useState(false);
 
@@ -63,6 +67,7 @@ export default function ImagePickerField({
                 }}
                 currentValue={value}
                 type={folder}
+                restrictSelectionTo={restrictSelectionTo ?? folder}
             />
         </>
     );
