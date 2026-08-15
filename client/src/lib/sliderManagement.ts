@@ -26,7 +26,8 @@ export type SliderAdminItem = {
   link: string;
   sortOrder: number;
   status: boolean;
-  lifecycle: string;
+  /** Present on revisioned admin snapshots; legacy arrays may omit it. */
+  lifecycle?: string;
   createdAt?: string;
   updatedAt?: string;
   archivedAt?: string | null;
@@ -122,7 +123,7 @@ function isSliderLimits(value: unknown): value is SliderLimits {
  * are optional for compatibility with older read snapshots; mutation is still gated by the
  * complete top-level shape and exact capability marker.
  */
-function isSliderAdminItem(value: unknown): value is SliderAdminItem {
+function isLegacySliderAdminItem(value: unknown): value is SliderAdminItem {
   if (!isRecord(value)) return false;
   return (
     typeof value._id === 'string'
@@ -132,12 +133,15 @@ function isSliderAdminItem(value: unknown): value is SliderAdminItem {
     && typeof value.link === 'string'
     && isSafeRevision(value.sortOrder)
     && typeof value.status === 'boolean'
-    && typeof value.lifecycle === 'string'
     && (value.createdAt === undefined || typeof value.createdAt === 'string')
     && (value.updatedAt === undefined || typeof value.updatedAt === 'string')
     && (value.archivedAt === undefined || value.archivedAt === null || typeof value.archivedAt === 'string')
     && (value.archivedBy === undefined || value.archivedBy === null || typeof value.archivedBy === 'string')
   );
+}
+
+function isSliderAdminItem(value: unknown): value is SliderAdminItem {
+  return isLegacySliderAdminItem(value) && typeof value.lifecycle === 'string';
 }
 
 function readOnlySnapshot(
@@ -165,7 +169,7 @@ export function parseSliderAdminSnapshot(input: unknown): ParsedSliderAdminSnaps
   if (Array.isArray(input)) {
     // Legacy arrays are intentionally preserved as read-only data.  Invalid members remain
     // renderable data but cannot accidentally become a mutation-capable snapshot.
-    const sliders = input.filter(isSliderAdminItem).map((item) => cloneValue(item));
+    const sliders = input.filter(isLegacySliderAdminItem).map((item) => cloneValue(item));
     return readOnlySnapshot(sliders);
   }
   if (!isRecord(input)) return readOnlySnapshot();

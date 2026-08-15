@@ -22,6 +22,11 @@ GREEN for the scoped pure client contracts and step-up provenance regression. No
 - `npm --prefix client run build`: PASS.
 - `git diff --check`: pending final scoped diff check.
 
+## Review fix round 1
+- Important finding confirmed: the initial parser reused the versioned admin-item validator for legacy arrays, but the old `server/src/controllers/sliderController.ts` shape has `_id`, `name`, `image`, `link`, `sortOrder`, and `status` without `lifecycle`; valid legacy records were therefore filtered out.
+- RED regression: the new legacy-record test failed with `0 !== 1` before the fix.
+- GREEN fix: legacy arrays now use a minimal read-only record validator that does not require `lifecycle`; exact versioned snapshots still require `lifecycle` on every item plus the exact marker, safe revision, and complete limits.
+
 ## Residual risks
 - This task adds pure contracts only; live Node↔Rust/Mongo integration, UI wiring, and production behavior were not claimed or exercised.
 - Existing repository build emits unrelated Vite dynamic-import warnings.

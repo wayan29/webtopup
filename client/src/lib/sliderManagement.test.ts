@@ -55,6 +55,22 @@ test('legacy array is read-only and exact capability enables writes', () => {
   assert.equal(current.revision, 4);
 });
 
+test('legacy admin records without lifecycle remain available read-only', () => {
+  const legacy = parseSliderAdminSnapshot([{
+    _id: '507f1f77bcf86cd799439011',
+    name: 'Legacy Promo',
+    image: '/uploads/covers/1710000000000-deadbeef.webp',
+    link: '/legacy-promo',
+    sortOrder: 0,
+    status: true,
+  }]);
+  assert.equal(legacy.versioned, false);
+  assert.equal(legacy.mutationEnabled, false);
+  assert.equal(legacy.sliders.length, 1);
+  assert.equal(legacy.sliders[0]?.name, 'Legacy Promo');
+  assert.equal(legacy.sliders[0]?.lifecycle, undefined);
+});
+
 test('malformed present revision, marker, and snapshot shape fail closed', () => {
   const base = { sliders: [], limits: fixtureLimits };
   assert.equal(parseSliderAdminSnapshot({ ...base, mutationContract: 'slider-revision-v1', revision: '4' }).mutationEnabled, false);
