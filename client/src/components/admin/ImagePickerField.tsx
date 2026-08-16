@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, type RefObject } from 'react';
 import { Image as ImageIcon, X } from 'lucide-react';
 import ImagePicker from './ImagePicker';
 import { getAssetUrl } from '../../lib/assetUrl';
@@ -10,6 +10,7 @@ interface ImagePickerFieldProps {
     onChange: (url: string) => void;
     folder?: ImageFolder;
     restrictSelectionTo?: ImageFolder;
+    parentDialogRef?: RefObject<HTMLElement | null>;
 }
 
 export default function ImagePickerField({ 
@@ -17,6 +18,7 @@ export default function ImagePickerField({
     onChange,
     folder = 'icons',
     restrictSelectionTo,
+    parentDialogRef,
 }: ImagePickerFieldProps) {
     const [isOpen, setIsOpen] = useState(false);
 
@@ -68,6 +70,7 @@ export default function ImagePickerField({
                 currentValue={value}
                 type={folder}
                 restrictSelectionTo={restrictSelectionTo}
+                parentDialogRef={parentDialogRef}
             />
         </>
     );

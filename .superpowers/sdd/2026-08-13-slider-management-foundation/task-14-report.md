@@ -56,11 +56,26 @@ git diff --check
 ```
 
 ## Self-review
-- Changed only the approved Task 14 page/tests plus the report; `useStepUpOrchestration.tsx` required no code change because the Task 12 shared orchestrator already preserves stable idempotency keys and is consumed by the page. The required staged task-file list therefore includes that unchanged seam only if the final commit command is kept literal; no unrelated file was touched.
+- Initial implementation changed only the approved Task 14 page/tests plus the report; the shared orchestrator already preserved stable idempotency keys.
+- Review fix round 1 found three concrete accessibility gaps: edit focus returned to the Add trigger, the form lacked the required public-impact summary, and an inline StepUpDialog could be made inert by the root AccessibleDialog background barrier.
+- RED contracts were added for edit-trigger focus/public impact, `ImagePickerField` parent forwarding, and a portal-backed step-up dialog; they failed before the fixes.
+- GREEN fixes use a per-open `formReturnFocusRef`, add the non-authoritative public-impact summary, pass `parentDialogRef={formDialogRef}` through ImagePickerField, and portal the shared step-up dialog to `document.body`. The ImagePickerField prop is a necessary Task 13→14 seam; existing callers remain unchanged because it is optional.
+- No `apiV2.delete`, legacy `/sliders/admin/sort-order`, or legacy flat mutation fallback remains in the page.
 - No `apiV2.delete`, legacy `/sliders/admin/sort-order`, or legacy flat mutation fallback remains in the page.
 - Current/archive reads each have independent request IDs, while successful mutation state is retained if reconciliation fails.
 - Legacy arrays and malformed snapshots stay readable but mutation-disabled through `parseSliderAdminSnapshot`; no marker is synthesized.
 - The image picker API and explicit `folder="covers" restrictSelectionTo="covers"` policy remain unchanged.
+
+## Review fix round 1 validation
+
+```text
+node --import tsx --test tools/dev-verification/unit/adminPageChrome.test.ts
+✔ 13 passed, 0 failed
+npm --prefix client run build
+✓ built successfully (exit 0; existing Vite dynamic-import warnings only)
+git diff --check
+exit 0
+```
 
 ## Concerns / residual risks
 - This task was validated with source/pure tests and a production client build only. Live Node↔Rust/Mongo behavior, step-up effective-sensitivity permutations, browser focus behavior, upload/image failure behavior, and mobile interaction remain for the explicitly out-of-scope integration/browser tasks.

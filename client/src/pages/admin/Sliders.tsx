@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type FormEvent, type MouseEvent } from 'react';
 import {
     AlertTriangle,
     Archive,
@@ -228,7 +228,7 @@ function SliderImagePreview({
 }: {
     image: string;
     name: string;
-    onEdit?: () => void;
+    onEdit?: (event: MouseEvent<HTMLButtonElement>) => void;
     compact?: boolean;
 }) {
     const [broken, setBroken] = useState(false);
@@ -307,7 +307,7 @@ function SortableSliderRow({
     busy: boolean;
     archived: boolean;
     mutationEnabled: boolean;
-    onEdit: (slider: Slider) => void;
+    onEdit: (slider: Slider, trigger?: HTMLElement) => void;
     onArchive: (slider: Slider) => void;
     onRestore: (slider: Slider) => void;
 }) {
@@ -342,7 +342,7 @@ function SortableSliderRow({
                 <div className="break-all text-xs ui-text-muted">{slider._id}</div>
             </td>
             <td className="min-w-[220px] px-4 py-3 text-sm">
-                <SliderImagePreview image={slider.image} name={slider.name} onEdit={() => onEdit(slider)} />
+                <SliderImagePreview image={slider.image} name={slider.name} onEdit={(event) => onEdit(slider, event.currentTarget)} />
             </td>
             <td className="px-4 py-3 text-sm"><SliderLink link={slider.link} /></td>
             <td className="px-4 py-3 text-sm">
@@ -357,7 +357,7 @@ function SortableSliderRow({
                         <>
                             <button
                                 type="button"
-                                onClick={() => onEdit(slider)}
+                                onClick={(event) => onEdit(slider, event.currentTarget)}
                                 disabled={busy || !mutationEnabled}
                                 aria-label={`Edit slider ${slider.name}`}
                                 title="Edit slider"
@@ -408,14 +408,14 @@ function SliderMobileCard({
     busy: boolean;
     canReorder: boolean;
     mutationEnabled: boolean;
-    onEdit: (slider: Slider) => void;
+    onEdit: (slider: Slider, trigger?: HTMLElement) => void;
     onArchive: (slider: Slider) => void;
     onRestore: (slider: Slider) => void;
     onMove: (index: number, direction: -1 | 1) => void;
 }) {
     return (
         <article className="rounded-2xl border ui-border ui-panel-muted p-3 shadow-sm">
-            <SliderImagePreview image={slider.image} name={slider.name} compact onEdit={() => onEdit(slider)} />
+            <SliderImagePreview image={slider.image} name={slider.name} compact onEdit={(event) => onEdit(slider, event.currentTarget)} />
             <div className="mt-3 flex items-start justify-between gap-3">
                 <div className="min-w-0">
                     <h3 className="truncate font-semibold ui-text">{slider.name}</h3>
@@ -445,7 +445,7 @@ function SliderMobileCard({
                 ) : null}
                 {!archived ? (
                     <>
-                        <button type="button" onClick={() => onEdit(slider)} disabled={busy || !mutationEnabled} aria-label={`Edit slider ${slider.name}`} className="rounded-lg border px-3 py-2 text-xs font-semibold ui-info-chip disabled:opacity-50">Edit</button>
+                        <button type="button" onClick={(event) => onEdit(slider, event.currentTarget)} disabled={busy || !mutationEnabled} aria-label={`Edit slider ${slider.name}`} className="rounded-lg border px-3 py-2 text-xs font-semibold ui-info-chip disabled:opacity-50">Edit</button>
                         <button type="button" onClick={() => onArchive(slider)} disabled={busy || !mutationEnabled} aria-label={`Arsipkan slider ${slider.name}`} className="rounded-lg border px-3 py-2 text-xs font-semibold ui-danger-action disabled:opacity-50">Arsipkan</button>
                     </>
                 ) : (
@@ -490,6 +490,7 @@ export default function Sliders() {
     const conflictDialogRef = useRef<HTMLDivElement>(null);
     const unknownDialogRef = useRef<HTMLDivElement>(null);
     const formInitialFocusRef = useRef<HTMLInputElement>(null);
+    const formReturnFocusRef = useRef<HTMLElement>(null);
     const addTriggerRef = useRef<HTMLButtonElement>(null);
     const stepUp = useStepUpOrchestration();
 
@@ -586,8 +587,9 @@ export default function Sliders() {
         setDialogError(null);
     };
 
-    const openAddModal = () => {
+    const openAddModal = (event?: MouseEvent<HTMLButtonElement>) => {
         if (!canAdd) return;
+        formReturnFocusRef.current = event?.currentTarget ?? addTriggerRef.current;
         setEditingSlider(null);
         setEditingBase(null);
         setForm(defaultForm);
@@ -597,8 +599,9 @@ export default function Sliders() {
         setDialogKind('form');
     };
 
-    const handleEdit = (slider: Slider) => {
+    const handleEdit = (slider: Slider, trigger?: HTMLElement) => {
         if (!mainSnapshot?.mutationEnabled) return;
+        formReturnFocusRef.current = trigger ?? null;
         setEditingSlider(slider);
         setEditingBase({ ...slider });
         setForm(sliderToForm(slider));
@@ -1012,13 +1015,14 @@ export default function Sliders() {
                 </>
             ) : null}
 
-            <AccessibleDialog open={dialogKind === 'form'} titleId="slider-form-title" descriptionId="slider-form-description" dialogRef={formDialogRef} initialFocusRef={formInitialFocusRef} returnFocusRef={addTriggerRef} busy={saving} onClose={resetDialog}>
+            <AccessibleDialog open={dialogKind === 'form'} titleId="slider-form-title" descriptionId="slider-form-description" dialogRef={formDialogRef} initialFocusRef={formInitialFocusRef} returnFocusRef={formReturnFocusRef} busy={saving} onClose={resetDialog}>
                 <div className="border-b ui-border p-4 ui-card-gradient"><div className="flex items-center justify-between gap-3"><div><h2 id="slider-form-title" className="text-lg font-semibold ui-text">{editingSlider ? 'Edit Slider' : 'Tambah Slider'}</h2><p id="slider-form-description" className="mt-1 text-sm ui-text-muted">Perubahan disimpan sebagai intent revisioned pada snapshot {formRevision}.</p></div><button type="button" onClick={resetDialog} disabled={saving} aria-label="Tutup form slider" className="rounded-lg p-2 ui-muted-action disabled:opacity-50"><X className="h-5 w-5" aria-hidden="true" /></button></div></div>
                 <form onSubmit={handleSubmit} className="space-y-4 overflow-y-auto p-4">
                     {dialogError ? <div role="alert" className="rounded-lg border p-3 text-sm ui-danger-chip">{dialogError}</div> : null}
                     <div><label htmlFor="slider-name" className="mb-1 block text-sm font-medium ui-text">Nama Slider</label><input ref={formInitialFocusRef} id="slider-name" value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} aria-invalid={!form.name.trim() ? 'true' : undefined} className="w-full rounded-lg border px-3 py-2 text-sm ui-field" required /></div>
-                    <div><label className="mb-1 block text-sm font-medium ui-text">Gambar cover</label><ImagePickerField value={form.image} onChange={(url: string) => setForm({ ...form, image: url })} folder="covers" restrictSelectionTo="covers" /><div className="mt-3 grid gap-3 sm:grid-cols-2"><SliderImagePreview image={form.image} name={form.name || 'Slider desktop'} onEdit={() => undefined} /><div className="rounded-xl border ui-border ui-panel-muted p-3 text-xs ui-text-muted"><strong className="ui-text">Preview mobile</strong><p className="mt-1">Crop aman untuk layar mobile akan mengikuti area tengah.</p><div className="mt-2"><SliderImagePreview image={form.image} name={form.name || 'Slider mobile'} compact onEdit={() => undefined} /></div></div></div><p className="mt-2 text-xs ui-text-muted">Gunakan cover terdaftar; rekomendasi 1600×600 desktop dan area aman di tengah untuk mobile.</p></div>
+                    <div><label className="mb-1 block text-sm font-medium ui-text">Gambar cover</label><ImagePickerField value={form.image} onChange={(url: string) => setForm({ ...form, image: url })} folder="covers" restrictSelectionTo="covers" parentDialogRef={formDialogRef} /><div className="mt-3 grid gap-3 sm:grid-cols-2"><SliderImagePreview image={form.image} name={form.name || 'Slider desktop'} onEdit={() => undefined} /><div className="rounded-xl border ui-border ui-panel-muted p-3 text-xs ui-text-muted"><strong className="ui-text">Preview mobile</strong><p className="mt-1">Crop aman untuk layar mobile akan mengikuti area tengah.</p><div className="mt-2"><SliderImagePreview image={form.image} name={form.name || 'Slider mobile'} compact onEdit={() => undefined} /></div></div></div><p className="mt-2 text-xs ui-text-muted">Gunakan cover terdaftar; rekomendasi 1600×600 desktop dan area aman di tengah untuk mobile.</p></div>
                     <div><label htmlFor="slider-link" className="mb-1 block text-sm font-medium ui-text">Link (opsional)</label><input id="slider-link" value={form.link} onChange={(event) => setForm({ ...form, link: event.target.value })} aria-describedby="slider-link-help" className="w-full rounded-lg border px-3 py-2 text-sm ui-field" placeholder="https://example.com/promo atau /promo" /><p id="slider-link-help" className="mt-1 text-xs ui-text-muted">Kosong, path internal, atau URL HTTPS/HTTP yang aman.</p>{form.link.trim() && getSafeSliderLink(form.link) ? <div className="mt-2 rounded-lg border p-3 text-sm ui-success-chip"><Link2 className="mr-1 inline h-4 w-4" aria-hidden="true" /> Tujuan {getLinkMeta(form.link).label}</div> : null}</div>
+                    <div className="rounded-lg border ui-border ui-panel-muted p-3 text-sm" aria-live="polite"><p className="font-semibold ui-text">Dampak publik</p><p className="mt-1 ui-text-muted">{form.status ? (editingSlider?.status ? 'Perubahan akan memodifikasi konten slider yang sedang publik.' : 'Slider akan menjadi publik setelah disimpan.') : editingSlider?.status ? 'Slider akan dinonaktifkan dari tampilan publik.' : 'Slider tetap menjadi draft nonaktif.'}</p><p className="mt-1 text-xs ui-text-muted">Rust tetap authoritative untuk menentukan sensitivitas dan meminta step-up bila diperlukan.</p></div>
                     <label className="flex items-center gap-2 rounded-lg border ui-border ui-panel-muted p-3 text-sm ui-text"><input type="checkbox" checked={form.status} onChange={(event) => setForm({ ...form, status: event.target.checked })} className="h-4 w-4" /> Publikasikan sebagai slider aktif</label>
                     <div className="flex justify-end gap-3 pt-2"><button type="button" onClick={resetDialog} disabled={saving} className="rounded-lg border px-4 py-2 text-sm font-medium ui-muted-action disabled:opacity-50">Batal</button><button type="submit" disabled={saving || !mainSnapshot?.mutationEnabled} className="rounded-lg ui-accent-solid px-4 py-2 text-sm font-semibold disabled:opacity-50">{saving ? 'Menyimpan...' : 'Simpan Slider'}</button></div>
                 </form>

@@ -3,6 +3,7 @@
  * Pages use this instead of per-page pendingActionRef / dialog state.
  */
 import { useEffect, useMemo, useState, type ReactElement } from 'react';
+import { createPortal } from 'react-dom';
 import StepUpDialog from '../components/auth/StepUpDialog.tsx';
 import {
   getSharedStepUpOrchestrator,
@@ -42,7 +43,7 @@ export function useStepUpOrchestration(): UseStepUpOrchestrationResult {
 
   // Unmount does not cancel: multi-step pages may remount. Session lifecycle cancels explicitly.
 
-  const dialog = (
+  const dialogContent = (
     <StepUpDialog
       open={snapshot.open}
       actionGroup={(snapshot.actionGroup ?? 'security.sessions_all') as StepUpActionGroup}
@@ -57,6 +58,7 @@ export function useStepUpOrchestration(): UseStepUpOrchestrationResult {
       }}
     />
   );
+  const dialog = typeof document === 'undefined' ? dialogContent : createPortal(dialogContent, document.body);
 
   return {
     run: orchestrator.run,

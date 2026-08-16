@@ -293,6 +293,7 @@ test('image picker exposes nested accessible semantics and folder-restricted sel
     assert.match(sliders, /folder="covers"/);
     assert.match(sliders, /restrictSelectionTo="covers"/);
     assert.match(field, /restrictSelectionTo=\{restrictSelectionTo\}/);
+    assert.match(field, /parentDialogRef/);
     assert.doesNotMatch(field, /restrictSelectionTo=\{restrictSelectionTo \?\? folder\}/);
 });
 
@@ -327,4 +328,19 @@ test('slider administration uses the revisioned lifecycle and accessible state c
     assert.match(sliders, /aria-label=\{`Arsipkan slider/);
     assert.match(sliders, /aria-label=\{`Restore slider/);
     assert.match(sliders, /hidden md:table/);
+});
+
+test('slider form preserves edit-trigger focus and explains public impact', () => {
+    const sliders = readAdminPage('Sliders.tsx');
+    assert.match(sliders, /formReturnFocusRef/);
+    assert.match(sliders, /event\.currentTarget/);
+    assert.match(sliders, /Dampak publik/);
+    assert.match(sliders, /Rust tetap authoritative/);
+    assert.match(sliders, /parentDialogRef=\{formDialogRef\}/);
+});
+
+test('slider step-up dialog remains interactive above an inert app background', () => {
+    const orchestration = fs.readFileSync(path.join(root, 'client/src/auth/useStepUpOrchestration.tsx'), 'utf8');
+    assert.match(orchestration, /createPortal/);
+    assert.match(orchestration, /document\.body/);
 });
