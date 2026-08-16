@@ -77,6 +77,21 @@ git diff --check
 exit 0
 ```
 
+## Final verification after fix round
+
+```text
+node --import tsx --test client/src/lib/sliderManagement.test.ts
+✔ 9 passed, 0 failed
+npm --prefix client run build
+✓ built successfully (exit 0; existing Vite dynamic-import warnings only)
+node --import tsx --test tools/dev-verification/unit/adminPageChrome.test.ts
+✔ 13 passed, 0 failed
+git diff --check
+exit 0
+```
+
+Scoped re-review `75cf2f5b` approved fix commit `c72353f`.
+
 ## Concerns / residual risks
 - This task was validated with source/pure tests and a production client build only. Live Node↔Rust/Mongo behavior, step-up effective-sensitivity permutations, browser focus behavior, upload/image failure behavior, and mobile interaction remain for the explicitly out-of-scope integration/browser tasks.
 - The repository’s existing build emits Vite dynamic-import warnings unrelated to this page.

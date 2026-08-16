@@ -1,8 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
-    ChevronLeft,
-    ChevronRight,
     Users,
     Shield,
     Clock,
@@ -28,6 +26,7 @@ import {
 import { apiV2 } from '../api';
 import OperatorIcon from '../components/OperatorIcon';
 import HomeCountdown from '../components/HomeCountdown';
+import HomeSliderCarousel from '../components/home/HomeSliderCarousel';
 import { getAssetUrl } from '../lib/assetUrl';
 
 interface Category {
@@ -132,7 +131,6 @@ export default function Home() {
     const [flashSales, setFlashSales] = useState<FlashSale[]>([]);
     const [articles, setArticles] = useState<Article[]>([]);
     const [loading, setLoading] = useState(true);
-    const [currentSlide, setCurrentSlide] = useState(0);
     const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
 
     // Instant Search query
@@ -256,21 +254,11 @@ export default function Home() {
         setHasDirectProducts(false);
     };
 
-    const hasApiSliders = sliders.length > 0;
-    const slidesCount = hasApiSliders ? sliders.length : defaultSlides.length;
     const activeFlashSales = flashSales.filter((flashSale) => flashSale.products.length > 0);
     const hasMultipleFlashSales = activeFlashSales.length > 1;
     const flashSaleEntries = activeFlashSales.flatMap((sale) => (
         sale.products.map((item) => ({ sale, item }))
     ));
-
-    useEffect(() => {
-        if (slidesCount === 0) return;
-        const timer = setInterval(() => {
-            setCurrentSlide((prev) => (prev + 1) % slidesCount);
-        }, 5000);
-        return () => clearInterval(timer);
-    }, [slidesCount]);
 
     const calculateFlashPrice = (price: number, discountType: 'percentage' | 'fixed', discountValue: number) => {
         if (discountType === 'percentage') {
@@ -281,35 +269,6 @@ export default function Home() {
 
     const formatPrice = (price: number) => {
         return new Intl.NumberFormat('id-ID').format(price);
-    };
-
-    const nextSlide = () => setCurrentSlide((prev) => (prev + 1) % slidesCount);
-    const prevSlide = () => setCurrentSlide((prev) => (prev - 1 + slidesCount) % slidesCount);
-
-    const getImageUrl = (image: string) => {
-        if (image.startsWith('http')) return image;
-        return getAssetUrl(image);
-    };
-
-    const getSafeSliderLink = (link?: string | null) => {
-        const normalized = typeof link === 'string' ? link.trim() : '';
-
-        if (!normalized) {
-            return null;
-        }
-
-        if (normalized.startsWith('/')) {
-            return normalized.startsWith('//') ? null : normalized;
-        }
-
-        try {
-            const parsed = new URL(normalized);
-            return parsed.protocol === 'http:' || parsed.protocol === 'https:'
-                ? parsed.toString()
-                : null;
-        } catch {
-            return null;
-        }
     };
 
     const filteredOperators = useMemo(() => operators.filter(op => {
@@ -515,124 +474,7 @@ export default function Home() {
 
                 <div className="order-1 grid gap-5">
                     <div className="relative self-start overflow-hidden rounded-[28px] border ui-border ui-panel p-2 shadow-xl sm:rounded-[34px] sm:p-3 sm:shadow-2xl">
-                        <div className="group relative overflow-hidden rounded-[28px] border ui-border ui-panel-muted">
-                            <div className="relative aspect-[16/9] min-h-[235px] md:min-h-[340px] xl:min-h-[390px]">
-                                {hasApiSliders ? (
-                                    sliders.map((slide, index) => {
-                                        const safeLink = getSafeSliderLink(slide.link);
-                                        const isExternal = Boolean(safeLink && /^https?:\/\//i.test(safeLink));
-
-                                        if (safeLink) {
-                                            return (
-                                                <a
-                                                    key={slide._id}
-                                                    href={safeLink}
-                                                    target={isExternal ? '_blank' : undefined}
-                                                    rel={isExternal ? 'noreferrer' : undefined}
-                                                    className={`absolute inset-0 transition-opacity duration-700 ease-in-out ${index === currentSlide ? 'opacity-100' : 'pointer-events-none opacity-0'}`}
-                                                >
-                                                    <img
-                                                        src={getImageUrl(slide.image)}
-                                                        alt={slide.name}
-                                                        onError={(event) => { event.currentTarget.style.display = 'none'; }}
-                                                        className="h-full w-full bg-gradient-to-br from-orange-600 to-indigo-700 object-cover"
-                                                    />
-                                                </a>
-                                            );
-                                        }
-
-                                        return (
-                                            <div
-                                                key={slide._id}
-                                                className={`absolute inset-0 transition-opacity duration-700 ease-in-out ${index === currentSlide ? 'opacity-100' : 'pointer-events-none opacity-0'}`}
-                                            >
-                                                <img
-                                                    src={getImageUrl(slide.image)}
-                                                    alt={slide.name}
-                                                    onError={(event) => { event.currentTarget.style.display = 'none'; }}
-                                                    className="h-full w-full bg-gradient-to-br from-orange-600 to-indigo-700 object-cover"
-                                                />
-                                            </div>
-                                        );
-                                    })
-                                ) : (
-                                    defaultSlides.map((slide, index) => (
-                                        <div
-                                            key={slide.id}
-                                            className={`absolute inset-0 transition-opacity duration-700 ease-in-out bg-gradient-to-br ${slide.bg} ${index === currentSlide ? 'opacity-100' : 'opacity-0'}`}
-                                        >
-                                            <div className="absolute inset-0 bg-[radial-gradient(circle_at_top_right,_rgba(255,255,255,0.22),_transparent_28%)]" />
-                                            <div className="pointer-events-none absolute inset-0 opacity-70">
-                                                {slide.icon}
-                                            </div>
-                                        </div>
-                                    ))
-                                )}
-
-                                <div className="absolute inset-0 bg-gradient-to-br from-orange-600/45 via-indigo-700/25 to-slate-950/20" />
-                                <div className="absolute inset-0 bg-gradient-to-t from-black/78 via-black/28 to-transparent" />
-                                <div className="absolute bottom-0 left-0 right-0 flex flex-wrap items-end justify-between gap-4 px-5 py-5 md:px-7 md:py-6">
-                                    <div>
-                                        <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-black/20 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.34em] text-white/80 backdrop-blur-md max-sm:hidden">
-                                            <Sparkles className="h-3 w-3 ui-accent-text" />
-                                            Promo Pilihan
-                                        </div>
-                                        <p className="mt-0 max-w-xl text-2xl font-black leading-tight text-white sm:mt-3 md:text-[2.65rem]">
-                                            Top up voucher digital cepat.
-                                        </p>
-                                        <p className="mt-2 max-w-lg text-sm leading-6 text-white/82 md:text-[15px]">
-                                            Pilih produk, bayar, lalu pantau status pesanan tanpa proses ribet.
-                                        </p>
-                                        <div className="mt-4 flex flex-wrap gap-2">
-                                            <a href="#kategori-produk" className="rounded-full bg-white px-4 py-2 text-sm font-black text-slate-950 shadow-lg transition hover:scale-[1.02]">
-                                                Lihat Produk
-                                            </a>
-                                            <Link to="/check-transaction" className="rounded-full border border-white/25 bg-white/15 px-4 py-2 text-sm font-bold text-white backdrop-blur-md transition hover:bg-white/25">
-                                                Cek Pesanan
-                                            </Link>
-                                        </div>
-                                    </div>
-                                    <div className="hidden rounded-[24px] border border-white/10 bg-black/20 p-4 text-white backdrop-blur-md sm:block">
-                                        <p className="text-[11px] font-semibold uppercase tracking-[0.3em] ui-text-muted">Kategori Aktif</p>
-                                        <p className="mt-2 text-3xl font-black">{categories.length}</p>
-                                        <p className="mt-1 text-xs ui-text-muted">Produk digital siap dipilih</p>
-                                    </div>
-                                </div>
-                            </div>
-
-                            {slidesCount > 1 && (
-                                <>
-                                    <button
-                                        type="button"
-                                        aria-label="Slide sebelumnya"
-                                        onClick={prevSlide}
-                                        className="absolute left-4 top-1/2 hidden h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full border border-white/20 bg-white/15 text-white opacity-100 backdrop-blur-md transition-all hover:bg-white/25 md:flex md:opacity-0 md:group-hover:opacity-100"
-                                    >
-                                        <ChevronLeft className="h-5 w-5" />
-                                    </button>
-                                    <button
-                                        type="button"
-                                        aria-label="Slide berikutnya"
-                                        onClick={nextSlide}
-                                        className="absolute right-4 top-1/2 hidden h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full border border-white/20 bg-white/15 text-white opacity-100 backdrop-blur-md transition-all hover:bg-white/25 md:flex md:opacity-0 md:group-hover:opacity-100"
-                                    >
-                                        <ChevronRight className="h-5 w-5" />
-                                    </button>
-                                    <div className="absolute bottom-4 left-1/2 hidden -translate-x-1/2 gap-2 rounded-full border border-white/15 bg-white/15 px-3 py-2 backdrop-blur-sm md:flex">
-                                        {Array.from({ length: slidesCount }).map((_, index) => (
-                                            <button
-                                                key={index}
-                                                type="button"
-                                                aria-label={`Tampilkan slide ${index + 1}`}
-                                                aria-current={index === currentSlide ? 'true' : undefined}
-                                                onClick={() => setCurrentSlide(index)}
-                                                className={`min-h-6 rounded-full transition-all duration-300 ${index === currentSlide ? 'w-8 bg-white' : 'w-6 bg-white/40'}`}
-                                            />
-                                        ))}
-                                    </div>
-                                </>
-                            )}
-                        </div>
+                        <HomeSliderCarousel sliders={sliders} defaultSlides={defaultSlides} categoryCount={categories.length} />
                     </div>
 
                     <div className="hidden">
@@ -1076,7 +918,7 @@ export default function Home() {
                                         {article.image ? (
                                             <div className="h-40 overflow-hidden">
                                                 <img
-                                                    src={getImageUrl(article.image)}
+                                                    src={getAssetUrl(article.image)}
                                                     alt={article.title}
                                                     loading="lazy"
                                                     className="h-full w-full object-cover transition duration-300 group-hover:scale-105"
