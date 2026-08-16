@@ -295,3 +295,36 @@ test('image picker exposes nested accessible semantics and folder-restricted sel
     assert.match(field, /restrictSelectionTo=\{restrictSelectionTo\}/);
     assert.doesNotMatch(field, /restrictSelectionTo=\{restrictSelectionTo \?\? folder\}/);
 });
+
+test('slider administration uses the revisioned lifecycle and accessible state contracts', () => {
+    const sliders = readAdminPage('Sliders.tsx');
+    assert.match(sliders, /Backend slider belum siap untuk mutasi revisioned/);
+    assert.match(sliders, /Aktif & Draft/);
+    assert.match(sliders, /Arsip/);
+    assert.match(sliders, /Revision/);
+    assert.match(sliders, /Sisa kapasitas total/);
+    assert.match(sliders, /Sisa kapasitas aktif/);
+    assert.match(sliders, /\/sliders\/admin\/archived/);
+    assert.match(sliders, /\/sliders\/admin\/create/);
+    assert.match(sliders, /\/sliders\/admin\/.+\/archive/);
+    assert.match(sliders, /\/sliders\/admin\/.+\/restore/);
+    assert.match(sliders, /\/sliders\/admin\/reorder/);
+    assert.doesNotMatch(sliders, /apiV2\.delete/);
+    assert.doesNotMatch(sliders, /\/sliders\/admin\/sort-order/);
+    assert.match(sliders, /sliderErrorMessage/);
+    assert.match(sliders, /error\?\.response\?\.data\?\.error/);
+    assert.match(sliders, /AccessibleDialog/);
+    assert.match(sliders, /role="alert"/);
+    assert.match(sliders, /Move Up/);
+    assert.match(sliders, /Move Down/);
+    assert.match(sliders, /previousSliders/);
+    assert.match(sliders, /SLIDER_VERSION_CONFLICT/);
+    assert.match(sliders, /Load Latest Snapshot/);
+    assert.match(sliders, /Open Audit/);
+    assert.match(sliders, /SLIDER_COMMIT_UNKNOWN/);
+    assert.doesNotMatch(sliders, /Retry Mutation/);
+    assert.match(sliders, /aria-label=\{`Edit slider/);
+    assert.match(sliders, /aria-label=\{`Arsipkan slider/);
+    assert.match(sliders, /aria-label=\{`Restore slider/);
+    assert.match(sliders, /hidden md:table/);
+});

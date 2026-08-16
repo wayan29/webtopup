@@ -209,3 +209,13 @@ test('three-way conflict classification distinguishes draft-only, server-only, c
   assert.equal(kinds.link, 'unchanged');
   assert.equal(kinds.status, 'draft-only');
 });
+
+test('three-way slider conflict preserves draft-only fields and flags overlapping server edits', () => {
+  const base = { name: 'Base', image: 'base.webp', link: '/base' };
+  const draft = { name: 'Draft name', image: 'draft.webp', link: '/base' };
+  const server = { name: 'Server name', image: 'base.webp', link: '/server' };
+  const result = classifySliderConflict(base, draft, server);
+  assert.equal(result.name, 'conflict');
+  assert.equal(result.link, 'server-only');
+  assert.equal(result.image, 'draft-only');
+});
