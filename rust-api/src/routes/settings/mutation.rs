@@ -37,7 +37,7 @@ use super::{
     snapshot::{
         load_consistent_snapshot, with_revision_field, SITE_CONFIG_REVISION_KEY, SnapshotError,
     },
-    store::load_settings,
+    store::load_settings_in_session,
 };
 
 pub async fn execute_site_config_mutation(
@@ -337,7 +337,7 @@ async fn run_mutation_transaction(
     let current_revision = load_revision_in_session(db, session)
         .await
         .map_err(|_| MutationTxnError::DefinitePreEffect)?;
-    let current_settings = load_settings(db.client(), db.name(), &selected_keys)
+    let current_settings = load_settings_in_session(db, session, &selected_keys)
         .await
         .map_err(|_| MutationTxnError::Internal)?;
 
@@ -649,5 +649,21 @@ mod tests {
         let source = include_str!("../settings.rs");
         assert!(source.contains("execute_site_config_mutation"));
         assert!(!source.contains("write_settings_audit_log(client, db_name, actor"));
+    }
+
+    #[test]
+    fn source_contract_mutation_reads_settings_in_session() {
+        let production = include_str!("mutation.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or("");
+        assert!(
+            production.contains("load_settings_in_session(db, session, &selected_keys)"),
+            "authoritative mutation snapshot must load settings inside the write transaction"
+        );
+        assert!(
+            !production.contains("load_settings(db.client()"),
+            "out-of-session settings reads can disagree with the in-transaction revision"
+        );
     }
 }

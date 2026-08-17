@@ -2,7 +2,7 @@ use futures_util::TryStreamExt;
 use mongodb::{
     bson::{doc, Bson, Document},
     options::{UpdateModifications, UpdateOneModel, WriteModel},
-    Namespace,
+    ClientSession, Database, Namespace,
 };
 use serde_json::{Map, Value};
 
@@ -16,15 +16,7 @@ pub async fn load_settings(
     db_name: &str,
     selected_keys: &[&str],
 ) -> Result<Map<String, Value>, mongodb::error::Error> {
-    let defaults = default_site_settings();
-    let mut settings = selected_keys
-        .iter()
-        .filter_map(|key| {
-            defaults
-                .get(*key)
-                .map(|value| ((*key).to_string(), value.clone()))
-        })
-        .collect::<Map<_, _>>();
+    let mut settings = settings_from_defaults(selected_keys);
     let keys = selected_keys
         .iter()
         .map(|key| Bson::String((*key).to_string()))
@@ -38,6 +30,23 @@ pub async fn load_settings(
         Ok(cursor) => cursor.try_collect::<Vec<_>>().await?,
         Err(error) => return Err(error),
     };
+    apply_setting_documents(&mut settings, docs);
+    Ok(settings)
+}
+
+fn settings_from_defaults(selected_keys: &[&str]) -> Map<String, Value> {
+    let defaults = default_site_settings();
+    selected_keys
+        .iter()
+        .filter_map(|key| {
+            defaults
+                .get(*key)
+                .map(|value| ((*key).to_string(), value.clone()))
+        })
+        .collect::<Map<_, _>>()
+}
+
+fn apply_setting_documents(settings: &mut Map<String, Value>, docs: Vec<Document>) {
     for document in docs {
         if let Ok(key) = document.get_str("key") {
             if settings.contains_key(key) {
@@ -47,7 +56,29 @@ pub async fn load_settings(
             }
         }
     }
-    normalize_cross_field_settings(&mut settings);
+    normalize_cross_field_settings(settings);
+}
+
+pub async fn load_settings_in_session(
+    db: &Database,
+    session: &mut ClientSession,
+    selected_keys: &[&str],
+) -> Result<Map<String, Value>, mongodb::error::Error> {
+    let mut settings = settings_from_defaults(selected_keys);
+    let keys = selected_keys
+        .iter()
+        .map(|key| Bson::String((*key).to_string()))
+        .collect::<Vec<_>>();
+    let mut cursor = db
+        .collection::<Document>("settings")
+        .find(doc! { "key": { "$in": keys } })
+        .session(&mut *session)
+        .await?;
+    let mut docs = Vec::new();
+    while cursor.advance(&mut *session).await? {
+        docs.push(cursor.deserialize_current()?);
+    }
+    apply_setting_documents(&mut settings, docs);
     Ok(settings)
 }
 
