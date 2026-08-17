@@ -61,6 +61,7 @@ test('upload security rejects spoofed content and accepts canonical images throu
   const mongo = new MongoClient(shared.MONGO_URI);
   let legacyId: ObjectId | undefined;
   let faultFilename: string | undefined;
+  const leftoverPaths: string[] = [];
   let primary: unknown = null;
 
   try {
@@ -124,6 +125,7 @@ test('upload security rejects spoofed content and accepts canonical images throu
     assert.equal(managed.width, 1);
     assert.equal(managed.height, 1);
     const uploadPath = path.join(root, 'uploads', 'icons', String(ok.body.filename));
+    leftoverPaths.push(uploadPath);
     const publishedBytes = await fs.readFile(uploadPath);
     assert.ok(publishedBytes.length > 0);
     assert.equal(managed.size, publishedBytes.length);
@@ -139,6 +141,7 @@ test('upload security rejects spoofed content and accepts canonical images throu
     assert.equal(cover.status, 200, JSON.stringify(cover.body));
     const coverFilename = String(cover.body.filename);
     const coverPath = path.join(root, 'uploads', 'covers', coverFilename);
+    leftoverPaths.push(coverPath);
 
     legacyId = new ObjectId();
     await db.collection('products').insertOne({
@@ -162,6 +165,7 @@ test('upload security rejects spoofed content and accepts canonical images throu
     const deletable = await multipartUpload(`${nodeBase}/api/v2/upload?type=covers`, headers, 'deletable.png', 'image/png', PNG_1X1);
     assert.equal(deletable.status, 200, JSON.stringify(deletable.body));
     const deletablePath = path.join(root, 'uploads', 'covers', String(deletable.body.filename));
+    leftoverPaths.push(deletablePath);
     const deleted = await fetch(`${nodeBase}/api/v2/upload?type=covers&filename=${encodeURIComponent(String(deletable.body.filename))}`, {
       method: 'DELETE',
       headers,
@@ -216,6 +220,7 @@ test('upload security rejects spoofed content and accepts canonical images throu
     try {
       if (legacyId) await mongo.db(shared.MONGO_DB).collection('products').deleteOne({ _id: legacyId });
     } catch { /* ignore */ }
+    await Promise.all(leftoverPaths.map((filePath) => fs.rm(filePath, { force: true })));
     await mongo.close().catch(() => undefined);
   }
   if (primary) throw primary;
