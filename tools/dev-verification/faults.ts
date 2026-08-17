@@ -8,16 +8,52 @@ export const SITE_CONFIG_RUST_FAULT_SCENARIOS = [
   'site_config_claim_undo_mismatch',
   'site_config_commit_unknown_unresolved',
 ] as const;
-export const MANAGED_ASSET_RUST_FAULT_SCENARIOS = ['managed_asset_unlink_failure'] as const;
-export const FAULT_SCENARIOS = ['offline', 'timeout', 'refresh_response_loss_after_commit', 'finance_balance_response_loss_after_commit', 'finance_refund_response_loss_after_commit', 'guest_checkout_response_loss_after_commit', 'site_config_response_loss_after_commit', ...SITE_CONFIG_RUST_FAULT_SCENARIOS, ...MANAGED_ASSET_RUST_FAULT_SCENARIOS, 'status_400', 'status_401', 'status_403', 'status_409', 'status_429', 'status_500', 'status_502', 'status_503', 'refresh_two_request_barrier'] as const;
+export const MANAGED_ASSET_RUST_FAULT_SCENARIOS = [
+  'managed_asset_unlink_failure',
+  'managed_asset_delete_after_first_scan',
+] as const;
+/** Rust-only slider seams. The response-loss seam is deliberately gateway-owned below. */
+export const SLIDER_RUST_FAULT_SCENARIOS = [
+  'slider_transaction_probe_unavailable',
+  'slider_before_transaction_start',
+  'slider_after_claim_fence_before_write',
+  'slider_after_registry_write',
+  'slider_after_domain_write',
+  'slider_audit_failure',
+  'slider_commit_unknown_unresolved',
+  'slider_complete_during_commit_unknown_mark',
+  'slider_frozen_response_oversize',
+  'slider_reference_count_mismatch',
+  'slider_unlink_failure',
+  'slider_revision_conflict',
+  'slider_create_contention',
+  'slider_order_contention',
+  'slider_limit_contention',
+] as const;
+export const SLIDER_GATEWAY_FAULT_SCENARIOS = ['slider_response_loss_after_commit'] as const;
+export const FAULT_SCENARIOS = [
+  'offline', 'timeout',
+  'refresh_response_loss_after_commit',
+  'finance_balance_response_loss_after_commit',
+  'finance_refund_response_loss_after_commit',
+  'guest_checkout_response_loss_after_commit',
+  'site_config_response_loss_after_commit',
+  ...SITE_CONFIG_RUST_FAULT_SCENARIOS,
+  ...MANAGED_ASSET_RUST_FAULT_SCENARIOS,
+  ...SLIDER_RUST_FAULT_SCENARIOS,
+  ...SLIDER_GATEWAY_FAULT_SCENARIOS,
+  'status_400', 'status_401', 'status_403', 'status_409', 'status_429', 'status_500', 'status_502', 'status_503',
+  'refresh_two_request_barrier',
+] as const;
 export type FaultScenario = typeof FAULT_SCENARIOS[number];
 export type SiteConfigRustFaultScenario = typeof SITE_CONFIG_RUST_FAULT_SCENARIOS[number];
 export type ManagedAssetRustFaultScenario = typeof MANAGED_ASSET_RUST_FAULT_SCENARIOS[number];
+export type SliderRustFaultScenario = typeof SLIDER_RUST_FAULT_SCENARIOS[number];
 export type FaultRequest = { stateDir: string; capability: string; scenario: FaultScenario; ttlMs: number };
 export type FaultEvidence =
-  | { activationId: string; scenario: 'refresh_response_loss_after_commit' | 'finance_balance_response_loss_after_commit' | 'finance_refund_response_loss_after_commit' | 'site_config_response_loss_after_commit'; upstreamComplete: true; downstreamDestroyed: true; consumed: true }
+  | { activationId: string; scenario: 'refresh_response_loss_after_commit' | 'finance_balance_response_loss_after_commit' | 'finance_refund_response_loss_after_commit' | 'site_config_response_loss_after_commit' | 'slider_response_loss_after_commit'; upstreamComplete: true; downstreamDestroyed: true; consumed: true }
   | { activationId: string; scenario: 'guest_checkout_response_loss_after_commit'; mongoTransactionCommitted: true; guestMarkerDurable: true; idempotencyCompleteSkipped: true; consumed: true }
-  | { activationId: string; scenario: SiteConfigRustFaultScenario | ManagedAssetRustFaultScenario; rustOnly: true; consumed: true }
+  | { activationId: string; scenario: SiteConfigRustFaultScenario | ManagedAssetRustFaultScenario | SliderRustFaultScenario; rustOnly: true; consumed: true }
   | { activationId: string; scenario: 'refresh_two_request_barrier'; queued: 2; released: 2 };
 
 type FaultLease = { version: 1; activationId: string; scenario: FaultScenario; capabilityDigest: string; expiresAt: number };
@@ -116,7 +152,7 @@ async function writeEvidence(stateDir: string, evidence: FaultEvidence): Promise
   await fs.rename(temporary, target);
 }
 
-export async function writeFaultEvidence(stateDir: string, activationId: string, scenario: 'refresh_response_loss_after_commit' | 'finance_balance_response_loss_after_commit' | 'finance_refund_response_loss_after_commit' | 'site_config_response_loss_after_commit' = 'refresh_response_loss_after_commit'): Promise<void> {
+export async function writeFaultEvidence(stateDir: string, activationId: string, scenario: 'refresh_response_loss_after_commit' | 'finance_balance_response_loss_after_commit' | 'finance_refund_response_loss_after_commit' | 'site_config_response_loss_after_commit' | 'slider_response_loss_after_commit' = 'refresh_response_loss_after_commit'): Promise<void> {
   await writeEvidence(stateDir, { activationId, scenario, upstreamComplete: true, downstreamDestroyed: true, consumed: true });
 }
 
@@ -129,11 +165,11 @@ export async function readFaultEvidence(stateDir: string): Promise<FaultEvidence
     const value = JSON.parse(await fs.readFile(evidencePath(stateDir), 'utf8')) as Partial<FaultEvidence>;
     const keys = Object.keys(value).sort().join(',');
     const responseLoss = keys === ['activationId', 'consumed', 'downstreamDestroyed', 'scenario', 'upstreamComplete'].sort().join(',')
-      && typeof value.activationId === 'string' && ['refresh_response_loss_after_commit', 'finance_balance_response_loss_after_commit', 'finance_refund_response_loss_after_commit', 'site_config_response_loss_after_commit'].includes(value.scenario as string)
+      && typeof value.activationId === 'string' && ['refresh_response_loss_after_commit', 'finance_balance_response_loss_after_commit', 'finance_refund_response_loss_after_commit', 'site_config_response_loss_after_commit', 'slider_response_loss_after_commit'].includes(value.scenario as string)
       && value.upstreamComplete === true && value.downstreamDestroyed === true && value.consumed === true;
     const rustOnly = keys === ['activationId', 'consumed', 'rustOnly', 'scenario'].sort().join(',')
       && typeof value.activationId === 'string'
-      && ([...SITE_CONFIG_RUST_FAULT_SCENARIOS, ...MANAGED_ASSET_RUST_FAULT_SCENARIOS] as readonly string[]).includes(value.scenario as string)
+      && ([...SITE_CONFIG_RUST_FAULT_SCENARIOS, ...MANAGED_ASSET_RUST_FAULT_SCENARIOS, ...SLIDER_RUST_FAULT_SCENARIOS] as readonly string[]).includes(value.scenario as string)
       && value.rustOnly === true && value.consumed === true;
     const guestPostCommit = keys === ['activationId', 'consumed', 'guestMarkerDurable', 'idempotencyCompleteSkipped', 'mongoTransactionCommitted', 'scenario'].sort().join(',')
       && typeof value.activationId === 'string' && value.scenario === 'guest_checkout_response_loss_after_commit'

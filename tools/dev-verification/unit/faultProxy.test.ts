@@ -226,6 +226,48 @@ test('oversized targeted response fails closed without consuming the lease', asy
   }
 });
 
+test('slider response-loss is gateway-owned for every exact mutation path and one-shot after 2xx', async () => {
+  const { FAULT_SCENARIOS } = await import('../faults.ts');
+  assert.ok(FAULT_SCENARIOS.includes('slider_response_loss_after_commit'));
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'webtopup-slider-fault-proxy-'));
+  const capability = 'synthetic-local-capability';
+  await fs.mkdir(path.join(stateDir, 'env'), { recursive: true });
+  await fs.writeFile(path.join(stateDir, 'env', 'shared.env'), 'LOCAL_DEV_VERIFICATION=true\n');
+  await fs.writeFile(path.join(stateDir, 'env', 'node.env'), `LOCAL_DESTRUCTIVE_CAPABILITY=${capability}\n`);
+  const upstream = http.createServer((_req, res) => res.end('{"ok":true}'));
+  const upstreamPort = await listen(upstream);
+  const proxy = await startFaultProxy({ stateDir, upstreamOrigin: `http://127.0.0.1:${upstreamPort}`, host: '127.0.0.1', port: 0 });
+  const proxyPort = (proxy.address() as { port: number }).port;
+  try {
+    const mutationPaths = [
+      ['/v2/sliders/admin/create', 'POST'],
+      ['/v2/sliders/admin/0123456789abcdef01234567', 'PUT'],
+      ['/v2/sliders/admin/0123456789abcdef01234567/archive', 'POST'],
+      ['/v2/sliders/admin/0123456789abcdef01234567/restore', 'POST'],
+      ['/v2/sliders/admin/reorder', 'PUT'],
+    ] as const;
+    for (const [route, method] of mutationPaths) {
+      const activationId = await activateFault({ stateDir, capability, scenario: 'slider_response_loss_after_commit', ttlMs: 1_000 });
+      assert.deepEqual(await request(proxyPort, route, method), { kind: 'lost' }, route);
+      let evidence = await readFaultEvidence(stateDir);
+      for (let attempt = 0; attempt < 50 && !evidence; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        evidence = await readFaultEvidence(stateDir);
+      }
+      assert.equal(evidence?.activationId, activationId);
+      assert.equal(evidence?.scenario, 'slider_response_loss_after_commit');
+      const replay = await request(proxyPort, route, method);
+      assert.equal(replay.kind, 'response', `replay ${route}: ${JSON.stringify(replay)}`);
+      if (replay.kind === 'response') assert.deepEqual(replay, { kind: 'response', status: 200, body: '{"ok":true}' }, `replay ${route}`);
+    }
+    await activateFault({ stateDir, capability, scenario: 'slider_response_loss_after_commit', ttlMs: 1_000 });
+    assert.deepEqual(await request(proxyPort, '/v2/sliders/admin/create?unexpected=true', 'POST'), { kind: 'response', status: 200, body: '{"ok":true}' });
+  } finally {
+    await Promise.all([new Promise<void>((resolve) => proxy.close(() => resolve())), new Promise<void>((resolve) => upstream.close(() => resolve()))]);
+    await fs.rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test('site config fault inventory is closed and response-loss is PUT-only after 2xx', async () => {
   const { FAULT_SCENARIOS, SITE_CONFIG_RUST_FAULT_SCENARIOS } = await import('../faults.ts');
   assert.ok(FAULT_SCENARIOS.includes('site_config_response_loss_after_commit'));

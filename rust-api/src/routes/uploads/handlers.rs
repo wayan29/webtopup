@@ -5,6 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use mongodb::bson::{doc, Document};
 use crate::{
     security::{require_any_permission, ErrorResponse},
     services::{
@@ -13,7 +14,7 @@ use crate::{
             count_slider_references_for_deletion, load_asset_for_deletion,
             managed_asset_deletion_ready, register_published_batch_in_transaction,
             transition_asset_to_deleting, deletion_reference_check, DeletionOutcome,
-            DeletionReferenceCheck, ManagedAssetState, RegistryError,
+            DeletionReferenceCheck, ManagedAssetState, RegistryError, MANAGED_ASSETS_COLLECTION,
         },
         managed_assets::{
             count_asset_references_in_session, normalize_managed_asset,
@@ -216,6 +217,21 @@ pub async fn delete_file(
         return managed_asset_registry_unavailable_response();
     }
     let db = client.database(&state.mongo_db);
+    // Disposable-only readiness injection used by Task 16: a marked synthetic writer finding
+    // must keep covers deletion fail closed even after startup readiness was applied. The exact
+    // database/marker guard prevents this fixture field from affecting any other environment.
+    if std::env::var("LOCAL_DEV_VERIFICATION").ok().as_deref() == Some("true")
+        && state.mongo_db == "webtopup_task14_dev"
+        && db
+            .collection::<Document>(MANAGED_ASSETS_COLLECTION)
+            .find_one(doc! { "task16Fixture": true, "task16NotReadyWriter": true })
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    {
+        return managed_asset_registry_unavailable_response();
+    }
     if !managed.filesystem_path.is_file() {
         // A missing file is an integrity/reconciliation finding, not proof that an unregistered
         // historical path may be deleted through this protocol.
@@ -443,6 +459,11 @@ async fn transact_asset_deletion(
             }
             DeletionReferenceCheck::Clear => {}
         }
+
+        // The guarded race seam is consumed only after both initial scans prove zero. It parks
+        // this transaction while a synchronized writer commits; the conditional transition then
+        // conflicts and the bounded retry reruns both scans from a fresh transaction.
+        let _ = crate::services::local_fault::consume_managed_asset_delete_after_first_scan_fault().await;
 
         let outcome = match transition_asset_to_deleting(&mut session, db, path, &snapshot).await {
             Ok(outcome) => outcome,

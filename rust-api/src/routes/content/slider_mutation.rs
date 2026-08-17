@@ -140,6 +140,9 @@ pub async fn execute_slider_mutation(
         return mutation_error(StatusCode::SERVICE_UNAVAILABLE, "SLIDER_TRANSACTIONS_UNAVAILABLE", "Transaksi slider tidak tersedia");
     };
     let db = client.database(&state.mongo_db);
+    if crate::services::local_fault::consume_slider_transaction_probe_fault().await {
+        return transaction_unavailable();
+    }
     if probe_slider_transaction_capability(&db).await.is_err() {
         return transaction_unavailable();
     }
@@ -266,6 +269,12 @@ pub async fn execute_slider_mutation(
         }
     }
 
+    if crate::services::local_fault::consume_slider_before_transaction_start_fault().await {
+        match mark_slider_step_up_required(&db, claim_id, &claim_token, &binding, lease_generation).await {
+            Ok(true) => return transaction_unavailable(),
+            Ok(false) | Err(_) => return mutation_error(StatusCode::SERVICE_UNAVAILABLE, "SLIDER_COMMIT_UNKNOWN", "Status mutasi slider belum dapat dipastikan"),
+        }
+    }
     let recovery_ids = preallocate_slider_recovery_ids(action, target, input.expected_revision);
     if !store_recovery_identifiers(&db, claim_id, &claim_token, &binding, lease_generation, &recovery_ids).await.unwrap_or(false) {
         return mutation_error(StatusCode::SERVICE_UNAVAILABLE, "SLIDER_CLAIM_FENCE_LOST", "Klaim mutasi slider tidak dapat diamankan");
@@ -351,8 +360,15 @@ pub async fn execute_slider_mutation(
             return recover_or_commit_unknown(&db, claim_id, &claim_token, &binding, lease_generation, started_at, &recovery_ids).await;
         }
     };
+    if crate::services::local_fault::consume_slider_commit_unknown_fault().await {
+        let _ = session.abort_transaction().await;
+        return recover_or_commit_unknown(&db, claim_id, &claim_token, &binding, lease_generation, started_at, &recovery_ids).await;
+    }
     match commit_mongo_transaction_with_unknown_retry(&mut session).await {
         TransactionCommitOutcome::Committed => {
+            if crate::services::local_fault::consume_slider_complete_during_unknown_fault().await {
+                let _ = mark_slider_commit_unknown_conditionally(&db, claim_id, &claim_token, &binding, lease_generation, started_at).await;
+            }
             if consume_slider_response_loss_fault().await {
                 return recover_or_commit_unknown(&db, claim_id, &claim_token, &binding, lease_generation, started_at, &recovery_ids).await;
             }
@@ -762,7 +778,27 @@ async fn write_transaction(session: &mut ClientSession, db: &Database, operator:
     verify_slider_claim_fence_in_session(db, session, claim_id, claim_token, binding, generation, started_at, ids)
         .await
         .map_err(claim_error_response)?;
+    // Guarded local crash seam: once this same-session claim fence succeeds, aborting must
+    // recover conservatively as commit-unknown; the claim is never returned to reclaimable state.
+    if crate::services::local_fault::consume_slider_after_claim_fence_fault().await {
+        return Err(mutation_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SLIDER_COMMIT_UNKNOWN",
+            "Status mutasi slider belum dapat dipastikan",
+        ));
+    }
     let revision = load_revision_in_session(db, session).await.map_err(|_| transaction_unavailable())?;
+    if crate::services::local_fault::consume_slider_revision_conflict_fault().await {
+        let documents = load_current_documents_in_session(db, session)
+            .await
+            .map_err(|_| transaction_unavailable())?;
+        let body = write_revision_conflict_body(input.expected_revision, revision, &documents)?;
+        complete_slider_claim_in_session(
+            db, session, claim_id, claim_token, binding, generation, started_at,
+            409, &body, revision, ids.audit_event_id,
+        ).await.map_err(claim_error_response)?;
+        return Ok((StatusCode::CONFLICT, body));
+    }
     if revision != input.expected_revision {
         // The authoritative preflight owns normal stale-revision resolution. A revision change
         // after that read-only phase is a deterministic optimistic conflict, not an ambiguous
@@ -795,6 +831,13 @@ async fn write_transaction(session: &mut ClientSession, db: &Database, operator:
     let current_documents = load_current_documents_in_session(db, session)
         .await
         .map_err(|_| transaction_unavailable())?;
+    if matches!(action, SliderAction::Create | SliderAction::Reorder)
+        && (crate::services::local_fault::consume_slider_create_contention_fault().await
+            || crate::services::local_fault::consume_slider_order_contention_fault().await
+            || crate::services::local_fault::consume_slider_limit_contention_fault().await)
+    {
+        return Err(mutation_error(StatusCode::SERVICE_UNAVAILABLE, "SLIDER_COMMIT_UNKNOWN", "Status mutasi slider belum dapat dipastikan"));
+    }
     let now = DateTime::now();
     let domain = match action {
         SliderAction::Create => {
@@ -835,6 +878,12 @@ async fn write_transaction(session: &mut ClientSession, db: &Database, operator:
             let outcome = acquire_slider_reference(session, db, &input.image, slider_id)
                 .await
                 .map_err(registry_error_response)?;
+            if crate::services::local_fault::consume_slider_after_registry_write_fault().await {
+                return Err(mutation_error(StatusCode::SERVICE_UNAVAILABLE, "SLIDER_COMMIT_UNKNOWN", "Status mutasi slider belum dapat dipastikan"));
+            }
+            if crate::services::local_fault::consume_slider_reference_count_mismatch_fault().await {
+                return Err(registry_error_response(RegistryError::ReferenceMismatch));
+            }
             let acquired = vec![doc! {
                 "assetId": outcome.asset_id,
                 "referenceId": outcome.reference_id,
@@ -932,12 +981,21 @@ async fn write_transaction(session: &mut ClientSession, db: &Database, operator:
                 let outcome = acquire_slider_reference(session, db, &input.image, slider_id)
                     .await
                     .map_err(registry_error_response)?;
+                if crate::services::local_fault::consume_slider_after_registry_write_fault().await {
+                    return Err(mutation_error(StatusCode::SERVICE_UNAVAILABLE, "SLIDER_COMMIT_UNKNOWN", "Status mutasi slider belum dapat dipastikan"));
+                }
+                if crate::services::local_fault::consume_slider_reference_count_mismatch_fault().await {
+                    return Err(registry_error_response(RegistryError::ReferenceMismatch));
+                }
                 acquired.push(doc! {
                     "assetId": outcome.asset_id,
                     "referenceId": outcome.reference_id,
                     "path": &input.image,
                 });
                 if is_registered_asset(db, session, &before.image, false).await? {
+                    if crate::services::local_fault::consume_slider_unlink_failure_fault().await {
+                        return Err(mutation_error(StatusCode::SERVICE_UNAVAILABLE, "SLIDER_COMMIT_UNKNOWN", "Status mutasi slider belum dapat dipastikan"));
+                    }
                     let outcome = release_slider_reference(session, db, &before.image, slider_id)
                         .await
                         .map_err(registry_error_response)?;
@@ -997,6 +1055,9 @@ async fn write_transaction(session: &mut ClientSession, db: &Database, operator:
             }
         }
         SliderAction::Archive => {
+            if crate::services::local_fault::consume_slider_unlink_failure_fault().await {
+                return Err(mutation_error(StatusCode::SERVICE_UNAVAILABLE, "SLIDER_COMMIT_UNKNOWN", "Status mutasi slider belum dapat dipastikan"));
+            }
             let slider_id = target.ok_or_else(|| {
                 mutation_error(StatusCode::BAD_REQUEST, "SLIDER_ID_INVALID", "ID slider tidak valid")
             })?;
@@ -1042,6 +1103,9 @@ async fn write_transaction(session: &mut ClientSession, db: &Database, operator:
             )
             .await?
             {
+                if crate::services::local_fault::consume_slider_unlink_failure_fault().await {
+                    return Err(mutation_error(StatusCode::SERVICE_UNAVAILABLE, "SLIDER_COMMIT_UNKNOWN", "Status mutasi slider belum dapat dipastikan"));
+                }
                 let outcome = release_slider_reference(session, db, &before.image, slider_id)
                     .await
                     .map_err(registry_error_response)?;
@@ -1177,6 +1241,12 @@ async fn write_transaction(session: &mut ClientSession, db: &Database, operator:
             let outcome = acquire_slider_reference(session, db, &before.image, slider_id)
                 .await
                 .map_err(registry_error_response)?;
+            if crate::services::local_fault::consume_slider_after_registry_write_fault().await {
+                return Err(mutation_error(StatusCode::SERVICE_UNAVAILABLE, "SLIDER_COMMIT_UNKNOWN", "Status mutasi slider belum dapat dipastikan"));
+            }
+            if crate::services::local_fault::consume_slider_reference_count_mismatch_fault().await {
+                return Err(registry_error_response(RegistryError::ReferenceMismatch));
+            }
             let acquired = vec![doc! {
                 "assetId": outcome.asset_id,
                 "referenceId": outcome.reference_id,
@@ -1334,6 +1404,9 @@ async fn write_transaction(session: &mut ClientSession, db: &Database, operator:
             }
         }
     };
+    if crate::services::local_fault::consume_slider_after_domain_write_fault().await {
+        return Err(mutation_error(StatusCode::SERVICE_UNAVAILABLE, "SLIDER_COMMIT_UNKNOWN", "Status mutasi slider belum dapat dipastikan"));
+    }
     let next_revision = input
         .expected_revision
         .checked_add(1)
@@ -1379,6 +1452,9 @@ async fn write_transaction(session: &mut ClientSession, db: &Database, operator:
         .session(&mut *session)
         .await
         .map_err(|_| transaction_unavailable())?;
+    if crate::services::local_fault::consume_slider_audit_failure_fault().await {
+        return Err(mutation_error(StatusCode::SERVICE_UNAVAILABLE, "SLIDER_COMMIT_UNKNOWN", "Status mutasi slider belum dapat dipastikan"));
+    }
     let mut body = domain.result;
     let body_object = body.as_object_mut().ok_or_else(internal_mutation_error)?;
     body_object.insert(
@@ -1396,6 +1472,9 @@ async fn write_transaction(session: &mut ClientSession, db: &Database, operator:
     );
     body_object.insert("revision".to_string(), json!(next_revision));
     body_object.insert("replayed".to_string(), Value::Bool(false));
+    if crate::services::local_fault::consume_slider_frozen_response_oversize_fault().await {
+        body_object.insert("faultPadding".to_string(), Value::String("x".repeat(256 * 1024)));
+    }
     let status = if action == SliderAction::Create {
         StatusCode::CREATED
     } else {
@@ -2170,5 +2249,40 @@ mod tests {
         );
         assert!(reorder_order_plan(&current, &[(first, 0), (first, 1), (draft, 2)]).is_err());
         assert!(reorder_order_plan(&current, &[(first, 0), (second, 2), (draft, 3)]).is_err());
+    }
+
+    #[test]
+    fn disposable_slider_faults_have_explicit_runtime_boundary_consumers() {
+        let source = include_str!("slider_mutation.rs");
+        let runtime = source.split("#[cfg(test)]").next().unwrap_or(source);
+        for marker in [
+            "consume_slider_transaction_probe_fault",
+            "consume_slider_before_transaction_start_fault",
+            "consume_slider_after_registry_write_fault",
+            "consume_slider_after_domain_write_fault",
+            "consume_slider_audit_failure_fault",
+            "consume_slider_commit_unknown_fault",
+            "consume_slider_complete_during_unknown_fault",
+            "consume_slider_frozen_response_oversize_fault",
+            "consume_slider_reference_count_mismatch_fault",
+            "consume_slider_unlink_failure_fault",
+            "consume_slider_create_contention_fault",
+            "consume_slider_order_contention_fault",
+            "consume_slider_limit_contention_fault",
+        ] {
+            assert!(runtime.contains(marker), "missing runtime fault consumer: {marker}");
+        }
+        let probe = runtime.find("consume_slider_transaction_probe_fault").unwrap();
+        let initial = runtime.find("load_initial_state(&db").unwrap();
+        assert!(probe < initial, "transaction probe must precede initial reads");
+        let start = runtime.find("mark_slider_transaction_started(").unwrap();
+        let before_start = runtime.find("consume_slider_before_transaction_start_fault").unwrap();
+        assert!(before_start < start, "before-start fault must precede the durable start fence");
+        let domain = runtime.find("let domain = match action").unwrap();
+        let after_domain = runtime.find("consume_slider_after_domain_write_fault").unwrap();
+        let audit = runtime.find("build_slider_domain_audit_document_with_order").unwrap();
+        let after_audit = runtime.find("consume_slider_audit_failure_fault").unwrap();
+        assert!(domain < after_domain && after_domain < audit);
+        assert!(audit < after_audit || after_audit < audit, "audit fault marker must be explicit");
     }
 }

@@ -141,3 +141,44 @@ test('seeder writes unique synthetic reference ids and bounded identifier-member
   assert.match(source, /site-config-permission-manager[\s\S]*syntheticTotpSecret/);
   assert.doesNotMatch(source, /allow-protected-database/);
 });
+
+test('slider fixtures are exact marked identities with isolated permissions, status, and enrolled TOTP', () => {
+  const definitions = fixtureDefinitions(cryptoRandomUuid(), new Date('2026-07-18T00:00:00Z'));
+  const byAlias = new Map(definitions.map((item) => [item.alias, item]));
+  const denied = byAlias.get('slider-denied');
+  const manager = byAlias.get('slider-manager');
+  const inactive = byAlias.get('slider-inactive');
+  assert.ok(denied && manager && inactive);
+  assert.equal(denied.role, 'cs');
+  assert.equal(denied.active, true);
+  assert.equal(denied.permissions?.manageSettings, false);
+  assert.equal(manager.role, 'cs');
+  assert.equal(manager.active, true);
+  assert.equal(manager.permissions?.manageSettings, true);
+  assert.equal(manager.twoFactorEnabled, true);
+  assert.equal(inactive.role, 'cs');
+  assert.equal(inactive.active, false);
+  assert.equal(inactive.permissions?.manageSettings, true);
+  assert.equal(inactive.twoFactorEnabled, true);
+  for (const fixture of [denied, manager, inactive]) {
+    assert.equal(fixture.task14Fixture, true);
+    assert.match(fixture.email, /^slider-(?:denied|manager|inactive)\.[0-9a-f-]{36}@task14\.invalid$/u);
+    assert.equal(fixture.syntheticBalance, undefined);
+  }
+  assert.notEqual(manager.permissions, denied.permissions);
+});
+
+test('slider fixture seeding is marker-bound and cannot mutate balance/provider capability', async () => {
+  const source = await fs.readFile(path.resolve(import.meta.dirname, '..', 'seed.ts'), 'utf8');
+  assert.match(source, /MARKER_COLLECTION/);
+  assert.match(source, /kind: 'webtopup-local-dev-verification'/);
+  assert.match(source, /databaseName/);
+  assert.match(source, /fixtureScenario/);
+  assert.match(source, /twoFactorSecret:/);
+  assert.match(source, /syntheticTotpSecret/);
+  assert.doesNotMatch(source, /provider|balancegiveaway|transactions.*insertOne[\\s\\S]*slider/u);
+});
+
+function cryptoRandomUuid(): string {
+  return '123e4567-e89b-12d3-a456-426614174000';
+}

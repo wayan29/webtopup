@@ -4,7 +4,10 @@
 //! disposable database, loopback Mongo URI, state directory, and destructive capability. The
 //! browser cannot supply any of these values. Lease consumption is atomic (`rename`) and one-shot.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use serde::Deserialize;
 
@@ -14,7 +17,23 @@ const SITE_CONFIG_START_SCENARIO: &str = "site_config_transaction_start_unavaila
 const SITE_CONFIG_UNDO_MISMATCH_SCENARIO: &str = "site_config_claim_undo_mismatch";
 const SITE_CONFIG_COMMIT_UNKNOWN_SCENARIO: &str = "site_config_commit_unknown_unresolved";
 pub const MANAGED_ASSET_UNLINK_SCENARIO: &str = "managed_asset_unlink_failure";
+pub const MANAGED_ASSET_DELETE_AFTER_FIRST_SCAN_SCENARIO: &str = "managed_asset_delete_after_first_scan";
 pub const SLIDER_RESPONSE_LOSS_SCENARIO: &str = "slider_response_loss_after_commit";
+pub const SLIDER_TRANSACTION_PROBE_SCENARIO: &str = "slider_transaction_probe_unavailable";
+pub const SLIDER_BEFORE_TRANSACTION_START_SCENARIO: &str = "slider_before_transaction_start";
+pub const SLIDER_AFTER_CLAIM_FENCE_SCENARIO: &str = "slider_after_claim_fence_before_write";
+pub const SLIDER_AFTER_REGISTRY_WRITE_SCENARIO: &str = "slider_after_registry_write";
+pub const SLIDER_AFTER_DOMAIN_WRITE_SCENARIO: &str = "slider_after_domain_write";
+pub const SLIDER_AUDIT_FAILURE_SCENARIO: &str = "slider_audit_failure";
+pub const SLIDER_COMMIT_UNKNOWN_SCENARIO: &str = "slider_commit_unknown_unresolved";
+pub const SLIDER_COMPLETE_DURING_UNKNOWN_SCENARIO: &str = "slider_complete_during_commit_unknown_mark";
+pub const SLIDER_FROZEN_RESPONSE_OVERSIZE_SCENARIO: &str = "slider_frozen_response_oversize";
+pub const SLIDER_REFERENCE_COUNT_MISMATCH_SCENARIO: &str = "slider_reference_count_mismatch";
+pub const SLIDER_UNLINK_FAILURE_SCENARIO: &str = "slider_unlink_failure";
+pub const SLIDER_REVISION_CONFLICT_SCENARIO: &str = "slider_revision_conflict";
+pub const SLIDER_CREATE_CONTENTION_SCENARIO: &str = "slider_create_contention";
+pub const SLIDER_ORDER_CONTENTION_SCENARIO: &str = "slider_order_contention";
+pub const SLIDER_LIMIT_CONTENTION_SCENARIO: &str = "slider_limit_contention";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -73,25 +92,75 @@ pub async fn consume_site_config_commit_unknown_fault() -> bool {
     consume_site_config_fault(SITE_CONFIG_COMMIT_UNKNOWN_SCENARIO).await
 }
 
-/// Guarded one-shot seam used only by local disposable upload verification. It is deliberately
-/// consumed after the deletion transaction commits and before unlink, so a fault leaves the asset
-/// in its durable `deleting` reconciliation state and cannot accidentally authorize removal.
+/// Compatibility shim retained for the existing mutation call site. Slider response-loss is
+/// intentionally gateway-owned: the loopback fault proxy consumes this lease after Rust has
+/// completed the transaction and destroys only the downstream response. Rust never consumes or
+/// synthesizes response-loss evidence, so the ownership boundary cannot race.
 pub async fn consume_slider_response_loss_fault() -> bool {
+    false
+}
+
+/// Consume one of the closed slider-only Rust seams. Every caller is expected to place the seam
+/// at a specific transaction boundary; this module only owns the guarded one-shot capability.
+/// Public only to the Rust route module so each named boundary can remain explicit in source
+/// review; the scenario string is still checked against the exact lease before consumption.
+pub async fn consume_slider_rust_fault(scenario: &str) -> bool {
     let Some((state_dir, capability)) = guarded_fault_context() else {
         return false;
     };
     consume_named_fault_files(
         &state_dir,
         &capability,
-        SLIDER_RESPONSE_LOSS_SCENARIO,
+        scenario,
         serde_json::json!({
             "activationId": "",
-            "scenario": SLIDER_RESPONSE_LOSS_SCENARIO,
+            "scenario": scenario,
             "rustOnly": true,
             "consumed": true,
         }),
     )
     .await
+}
+
+pub async fn consume_slider_transaction_probe_fault() -> bool { consume_slider_rust_fault(SLIDER_TRANSACTION_PROBE_SCENARIO).await }
+pub async fn consume_slider_before_transaction_start_fault() -> bool { consume_slider_rust_fault(SLIDER_BEFORE_TRANSACTION_START_SCENARIO).await }
+pub async fn consume_slider_after_claim_fence_fault() -> bool { consume_slider_rust_fault(SLIDER_AFTER_CLAIM_FENCE_SCENARIO).await }
+pub async fn consume_slider_after_registry_write_fault() -> bool { consume_slider_rust_fault(SLIDER_AFTER_REGISTRY_WRITE_SCENARIO).await }
+pub async fn consume_slider_after_domain_write_fault() -> bool { consume_slider_rust_fault(SLIDER_AFTER_DOMAIN_WRITE_SCENARIO).await }
+pub async fn consume_slider_audit_failure_fault() -> bool { consume_slider_rust_fault(SLIDER_AUDIT_FAILURE_SCENARIO).await }
+pub async fn consume_slider_commit_unknown_fault() -> bool { consume_slider_rust_fault(SLIDER_COMMIT_UNKNOWN_SCENARIO).await }
+pub async fn consume_slider_complete_during_unknown_fault() -> bool { consume_slider_rust_fault(SLIDER_COMPLETE_DURING_UNKNOWN_SCENARIO).await }
+pub async fn consume_slider_frozen_response_oversize_fault() -> bool { consume_slider_rust_fault(SLIDER_FROZEN_RESPONSE_OVERSIZE_SCENARIO).await }
+pub async fn consume_slider_reference_count_mismatch_fault() -> bool { consume_slider_rust_fault(SLIDER_REFERENCE_COUNT_MISMATCH_SCENARIO).await }
+pub async fn consume_slider_unlink_failure_fault() -> bool { consume_slider_rust_fault(SLIDER_UNLINK_FAILURE_SCENARIO).await }
+pub async fn consume_slider_revision_conflict_fault() -> bool { consume_slider_rust_fault(SLIDER_REVISION_CONFLICT_SCENARIO).await }
+pub async fn consume_slider_create_contention_fault() -> bool { consume_slider_rust_fault(SLIDER_CREATE_CONTENTION_SCENARIO).await }
+pub async fn consume_slider_order_contention_fault() -> bool { consume_slider_rust_fault(SLIDER_ORDER_CONTENTION_SCENARIO).await }
+pub async fn consume_slider_limit_contention_fault() -> bool { consume_slider_rust_fault(SLIDER_LIMIT_CONTENTION_SCENARIO).await }
+
+/// Pause one deletion transaction after its first legacy/reference scan. This is deliberately
+/// local-only and one-shot so the integration can synchronize a writer commit into the race.
+pub async fn consume_managed_asset_delete_after_first_scan_fault() -> bool {
+    let Some((state_dir, capability)) = guarded_fault_context() else {
+        return false;
+    };
+    if !consume_named_fault_files(
+        &state_dir,
+        &capability,
+        MANAGED_ASSET_DELETE_AFTER_FIRST_SCAN_SCENARIO,
+        serde_json::json!({
+            "activationId": "",
+            "scenario": MANAGED_ASSET_DELETE_AFTER_FIRST_SCAN_SCENARIO,
+            "rustOnly": true,
+            "consumed": true,
+        }),
+    )
+    .await
+    {
+        return false;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    true
 }
 
 pub async fn consume_managed_asset_unlink_fault() -> bool {

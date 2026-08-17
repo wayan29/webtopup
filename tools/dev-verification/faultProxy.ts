@@ -3,6 +3,7 @@ import { activeFault, clearFaultEvidence, consumeFault, writeBarrierEvidence, wr
 
 export const MAX_TARGET_RESPONSE_BYTES = 64 * 1024;
 export type FaultProxyOptions = { stateDir: string; upstreamOrigin: string; host: '127.0.0.1'; port: number; beforeBarrierConsume?: () => Promise<void> };
+type ResponseLossScenario = 'refresh_response_loss_after_commit' | 'finance_balance_response_loss_after_commit' | 'finance_refund_response_loss_after_commit' | 'site_config_response_loss_after_commit' | 'slider_response_loss_after_commit';
 
 const hopByHop = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
 function forwardedHeaders(headers: IncomingHttpHeaders, buffered = false): IncomingHttpHeaders {
@@ -17,12 +18,16 @@ export async function startFaultProxy(options: FaultProxyOptions): Promise<http.
   const barrierQueue: Array<{ activationId: string; request: IncomingMessage; response: ServerResponse; timeout: ReturnType<typeof setTimeout> }> = [];
   const faultTimers = new Set<ReturnType<typeof setTimeout>>();
   let barrierReleasing = false;
-  const lossScenario = (request: IncomingMessage): 'refresh_response_loss_after_commit' | 'finance_balance_response_loss_after_commit' | 'finance_refund_response_loss_after_commit' | 'site_config_response_loss_after_commit' | null => {
-    if (request.method === 'PUT' && (request.url ?? '').split('?')[0] === '/v2/settings/admin/update') return 'site_config_response_loss_after_commit';
-    if (request.method !== 'POST') return null;
-    if (request.url === '/v2/auth/refresh') return 'refresh_response_loss_after_commit';
-    if (/^\/v2\/users\/[a-f0-9]{24}\/balance$/u.test(request.url ?? '')) return 'finance_balance_response_loss_after_commit';
-    if (/^\/v2\/transactions\/[a-f0-9]{24}\/refund$/u.test(request.url ?? '')) return 'finance_refund_response_loss_after_commit';
+  const lossScenario = (request: IncomingMessage): ResponseLossScenario | null => {
+    const requestPath = (request.url ?? '').split('?')[0] ?? '';
+    if (request.method === 'PUT' && requestPath === '/v2/settings/admin/update') return 'site_config_response_loss_after_commit';
+    if (request.method === 'POST' && request.url === '/v2/auth/refresh') return 'refresh_response_loss_after_commit';
+    if (request.method === 'POST' && /^\/v2\/users\/[a-f0-9]{24}\/balance$/u.test(requestPath)) return 'finance_balance_response_loss_after_commit';
+    if (request.method === 'POST' && /^\/v2\/transactions\/[a-f0-9]{24}\/refund$/u.test(requestPath)) return 'finance_refund_response_loss_after_commit';
+    const sliderRequestTarget = request.url ?? '';
+    const sliderMutation = (request.method === 'POST' && (/^\/v2\/sliders\/admin\/create$/u.test(sliderRequestTarget) || /^\/v2\/sliders\/admin\/[a-f0-9]{24}\/(?:archive|restore)$/u.test(sliderRequestTarget)))
+      || (request.method === 'PUT' && (/^\/v2\/sliders\/admin\/[a-f0-9]{24}$/u.test(sliderRequestTarget) || sliderRequestTarget === '/v2/sliders/admin/reorder'));
+    if (sliderMutation) return 'slider_response_loss_after_commit';
     return null;
   };
   const forward = (request: IncomingMessage, response: ServerResponse, onUpstreamResponse?: () => void) => {

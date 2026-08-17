@@ -163,6 +163,19 @@ export function fixtureDefinitions(fixtureRunId: string, now = new Date()): Fixt
       twoFactorEnabled: true,
       permissions: { viewDashboard: true, manageSettings: true },
     }),
+    make('slider-denied', 'slider-permission-denied', 'cs', {
+      twoFactorEnabled: false,
+      permissions: { viewDashboard: true, manageSettings: false },
+    }),
+    make('slider-manager', 'slider-permission-manager', 'cs', {
+      twoFactorEnabled: true,
+      permissions: { viewDashboard: true, manageSettings: true },
+    }),
+    make('slider-inactive', 'slider-permission-inactive', 'cs', {
+      active: false,
+      twoFactorEnabled: true,
+      permissions: { viewDashboard: true, manageSettings: true },
+    }),
     make('identifier-member', 'identifier-integrity-member', 'member', {
       twoFactorEnabled: false,
       syntheticBalance: 100_000,
@@ -238,8 +251,8 @@ async function seedFixtureDefinitions(
           ...(fixture.scenario.startsWith('staff-login-return') ? { manageVendors: true } : {}),
         },
         points: 0, twoFactorEnabled: fixture.twoFactorEnabled, twoFactorEnrollmentRequiredAt: fixture.twoFactorEnrollmentRequiredAt,
-        twoFactorSecret: fixture.twoFactorEnabled && (fixture.role === 'admin' || fixture.scenario.startsWith('all-device-logout-') || fixture.scenario.startsWith('staff-step-up-') || fixture.scenario === 'staff-login-return-2fa' || fixture.scenario === 'audit-permission-manager' || fixture.scenario === 'site-config-permission-manager' || fixture.scenario === 'site-config-permission-inactive') ? syntheticTotpSecret() : undefined,
-        twoFactorEnrollmentCompletedAt: fixture.twoFactorEnabled && (fixture.role === 'admin' || fixture.scenario.startsWith('all-device-logout-')) ? new Date() : undefined,
+        twoFactorSecret: fixture.twoFactorEnabled && (fixture.role === 'admin' || fixture.scenario.startsWith('all-device-logout-') || fixture.scenario.startsWith('staff-step-up-') || fixture.scenario === 'staff-login-return-2fa' || fixture.scenario === 'audit-permission-manager' || fixture.scenario === 'site-config-permission-manager' || fixture.scenario === 'site-config-permission-inactive' || fixture.scenario === 'slider-permission-manager' || fixture.scenario === 'slider-permission-inactive' || fixture.scenario === 'slider-permission-denied') ? syntheticTotpSecret() : undefined,
+        twoFactorEnrollmentCompletedAt: fixture.twoFactorEnabled && (fixture.role === 'admin' || fixture.scenario.startsWith('all-device-logout-') || fixture.scenario === 'slider-permission-manager' || fixture.scenario === 'slider-permission-inactive') ? new Date() : undefined,
         sessionVersion: 0, active: fixture.active,
       });
       await user.save();

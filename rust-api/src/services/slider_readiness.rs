@@ -429,7 +429,18 @@ async fn inspect_slider_data(db: &Database, upload_root: &Path) -> Result<Vec<Sl
     let mut current_orders = Vec::new();
     let mut current_count = 0_i64;
     let mut active_count = 0_i64;
-    let metadata = db.collection::<Document>(SLIDER_METADATA_COLLECTION).find_one(doc! { "_id": GLOBAL_SLIDER_METADATA_ID }).await.map_err(storage_error)?;
+    // A fresh disposable database has no metadata collection yet. Mongo reports that lookup as
+    // NamespaceNotFound; treat only this exact probe as an absent revision so the approved
+    // --apply path can create the collection. Every other storage error remains fail-closed.
+    let metadata = match db
+        .collection::<Document>(SLIDER_METADATA_COLLECTION)
+        .find_one(doc! { "_id": GLOBAL_SLIDER_METADATA_ID })
+        .await
+    {
+        Ok(value) => value,
+        Err(error) if namespace_missing(&error) => None,
+        Err(error) => return Err(storage_error(error)),
+    };
     match metadata {
         None => add(SliderReadinessFinding::blocking("missing_slider_revision_metadata", 1, vec![GLOBAL_SLIDER_METADATA_ID.to_string()])),
         Some(document) => match integer_field(&document, "revision") {
@@ -655,7 +666,14 @@ pub async fn apply_slider_foundation(db: &Database, upload_root: &Path) -> Resul
 
     for requirement in slider_foundation_index_requirements() {
         let collection = db.collection::<Document>(requirement.collection);
-        let listed = list_indexes(collection.clone()).await.map_err(storage_error)?;
+        let listed = match list_indexes(collection.clone()).await {
+            Ok(listed) => listed,
+            // A fresh disposable database may not have any foundation collection yet. This
+            // mapping is deliberately confined to the apply loop; inspect/read paths remain
+            // fail-closed for all storage errors.
+            Err(error) if namespace_missing(&error) => Vec::new(),
+            Err(error) => return Err(storage_error(error)),
+        };
         if listed.iter().any(|model| model.keys == requirement.keys && index_matches(&requirement, model)) { continue; }
         // MongoDB creates the built-in _id index when metadata is first inserted.  Creating it
         // explicitly is both unnecessary and rejected by some server versions.
@@ -740,6 +758,14 @@ mod tests {
             .options(IndexOptions::builder().name("_id_".to_string()).build())
             .build();
         assert!(index_matches(&requirement, &builtin));
+    }
+
+    #[test]
+    fn missing_slider_metadata_namespace_is_treated_as_absent_for_apply() {
+        let source = include_str!("slider_readiness.rs");
+        assert!(source.contains("Err(error) if namespace_missing(&error) => None"));
+        assert!(source.contains("Err(error) if namespace_missing(&error) => Vec::new()"));
+        assert!(source.contains("Err(error) => return Err(storage_error(error))"));
     }
 
     #[test]
