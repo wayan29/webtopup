@@ -89,7 +89,7 @@ test('admin slider lifecycle is accessible, revisioned, and split-deploy gated',
     await expect(page.getByRole('tab', { name: 'Aktif & Draft' })).toBeVisible({ timeout: 30_000 });
     await expect(page.getByText('Revision', { exact: true })).toBeVisible();
     if (testInfo.project.name === 'chromium-mobile') {
-      await expect(page.getByText('Move Up', { exact: true })).toHaveCount(0);
+      await expect(page.getByText('Move Up', { exact: true }).first()).toBeVisible();
     } else {
       await expect(page.locator('table')).toBeVisible();
     }
@@ -123,15 +123,16 @@ test('admin slider lifecycle is accessible, revisioned, and split-deploy gated',
     const dialogs = page.locator('[data-accessible-dialog="true"]');
     await expect(dialogs).toHaveCount(2);
     await expect(dialogs.first()).toHaveAttribute('inert', '');
+    const uploadedFilename = `task17-${crypto.randomUUID()}.png`;
     const uploadResponse = page.waitForResponse((response) => response.request().method() === 'POST' && response.url().includes('/api/v2/upload?type=covers'));
-    await page.getByLabel('Upload gambar baru').setInputFiles({ name: `task17-${crypto.randomUUID()}.png`, mimeType: 'image/png', buffer: PNG_1X1 });
+    await page.getByLabel('Upload gambar baru').setInputFiles({ name: uploadedFilename, mimeType: 'image/png', buffer: PNG_1X1 });
     const uploadBody = await (await uploadResponse).json() as { url?: string };
     expect(uploadBody.url).toMatch(/^\/uploads\/covers\//u);
     uploadedCoverUrl = uploadBody.url;
     const uploadedAsset = await db.collection('managedassets').findOne({ canonicalPath: uploadedCoverUrl });
     expect(uploadedAsset?._id).toBeTruthy();
     await db.collection('managedassets').updateOne({ _id: uploadedAsset!._id }, { $set: { task17Fixture: true, fixtureRunId } });
-    const imageButton = picker.locator('button[aria-pressed]').last();
+    const imageButton = picker.getByRole('button', { name: new RegExp(`Pilih ${uploadedFilename}`) });
     await expect(imageButton).toBeVisible({ timeout: 20_000 });
     await imageButton.click();
     await page.getByRole('button', { name: 'Konfirmasi pilih gambar' }).click();
@@ -164,9 +165,13 @@ test('admin slider lifecycle is accessible, revisioned, and split-deploy gated',
     await expect(page.getByText('Aktif', { exact: true }).first()).toBeVisible();
 
     // Archive and restore use explicit accessible dialogs and preserve draft restore semantics.
-    await page.getByRole('button', { name: `Arsipkan slider ${createdName}` }).click();
+    await page.getByRole('button', { name: `Arsipkan slider ${createdName}` }).first().click();
     await expect(page.getByRole('dialog', { name: 'Arsipkan slider?' })).toBeVisible();
     await page.getByRole('button', { name: 'Arsipkan Slider' }).click();
+    await expect(page.getByRole('heading', { name: 'Verifikasi ulang diperlukan' })).toBeVisible({ timeout: 20_000 });
+    await page.getByLabel('Password', { exact: true }).fill((await loginFixture('slider-manager')).password);
+    await page.getByLabel('Kode OTP').fill(await fixtureOtp('slider-manager'));
+    await page.getByRole('button', { name: 'Lanjutkan' }).click();
     await expect(page.getByText(`Slider "${createdName}" berhasil diarsipkan`, { exact: false })).toBeVisible({ timeout: 20_000 });
     await page.getByRole('tab', { name: 'Arsip' }).click();
     await expect(page.getByText(createdName, { exact: true })).toBeVisible();

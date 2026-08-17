@@ -24,6 +24,7 @@ Status: **DONE_WITH_CONCERNS / BROWSER ENVIRONMENT-BLOCKED**
 - `npm --prefix server run build` — exit 0.
 - `git diff --check` — pass.
 - Browser fixture cleanup was rechecked to remove marked uploaded cover registry rows/files and slider claim/audit/reference rows.
+- Admin browser fixture now seeds a marked current draft for full-ID context, verifies mobile Move Up visibility, selects the exact uploaded file, and handles active archive step-up explicitly.
 
 ## Browser execution blocker
 
