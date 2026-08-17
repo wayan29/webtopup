@@ -32,7 +32,7 @@ test('aggregate matrix names every required evidence group exactly once', () => 
   assert.equal(matrix.find(({ name }) => name === 'finance-idempotency')?.profile, 'session-finance-fault');
   assert.equal(matrix.find(({ name }) => name === 'giveaway-atomic')?.profile, 'session-finance-policy');
   assert.deepEqual(matrix.find(({ name }) => name === 'upload-security'), {
-    name: 'upload-security', required: true, profile: 'session-cs', isolated: true,
+    name: 'upload-security', required: true, profile: 'session-cs-fault', isolated: true,
     command: 'node', args: ['--import', 'tsx', '--test', 'tools/dev-verification/integration/uploadSecurity.test.ts'],
   });
   assert.deepEqual(matrix.find(({ name }) => name === 'identifier-integrity'), {
