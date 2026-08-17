@@ -23,6 +23,9 @@ Status: **DONE_WITH_CONCERNS / BROWSER ENVIRONMENT-BLOCKED**
 - `npm --prefix client run build` — exit 0.
 - `npm --prefix server run build` — exit 0.
 - `git diff --check` — pass.
+- `npm run dev-verify -- test` — **LOCAL DEV FAILED** at the first browser-dependent check, `public-origin`; unit, client-build, server-build, rust-build, and mongo checks completed as `LOCAL DEV VERIFIED` before the browser launch blocker.
+- `npm run dev-verify -- infra-status` after teardown — `{"serviceCount":0}`.
+- `npm run dev-verify -- status` after teardown — no host processes, no compose services, rollout disabled, and no replica set connected.
 - Browser fixture cleanup was rechecked to remove marked uploaded cover registry rows/files and slider claim/audit/reference rows.
 - Admin browser fixture now seeds a marked current draft for full-ID context, verifies mobile Move Up visibility, selects the exact uploaded file, and handles active archive step-up explicitly.
 
@@ -32,8 +35,8 @@ The approved disposable host was started with the required profile and exact dat
 
 `error while loading shared libraries: libatk-1.0.so.0: cannot open shared object file: No such file or directory`
 
-No browser assertions are claimed as passed. No package was installed and no system configuration was changed. Both desktop cases failed at browser launch for this environment reason; mobile execution was not claimed after the same launch prerequisite failed.
+No browser assertions are claimed as passed. No package was installed and no system configuration was changed. The aggregate run stopped at `public-origin`; the Task 17 desktop/mobile cases were therefore not run by the matrix. Earlier focused desktop launch attempts showed the same prerequisite failure; mobile execution was not claimed.
 
 ## Disposable boundary
 
-The browser attempt used only `webtopup_task14_dev`, mock provider mode, loopback Mongo/host ports, and the approved session fault profile. Host teardown was run after the attempt. Production was not touched. Final aggregate `LOCAL DEV VERIFIED` and final `serviceCount:0` remain pending Task 17 completion once a browser-capable environment is available; the current infrastructure may remain at `serviceCount:2` until the approved final `infra-down` lifecycle.
+The browser attempt used only `webtopup_task14_dev`, mock provider mode, loopback Mongo/host ports, and the approved session fault profile. Host teardown and the approved `infra-down` lifecycle were run after the aggregate attempt. Production was not touched. The final aggregate is explicitly `LOCAL DEV FAILED` because the browser prerequisite is unavailable; the final disposable infrastructure proof is `serviceCount:0`.
