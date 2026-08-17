@@ -1,6 +1,6 @@
 # Task 17 report — browser, smoke, matrix, and verification expansion
 
-Status: **IN PROGRESS / FOCUSED BROWSER GREEN**
+Status: **DONE**
 
 ## Implemented
 
@@ -19,23 +19,23 @@ Status: **IN PROGRESS / FOCUSED BROWSER GREEN**
 
 - `npx playwright install-deps chromium` installed the missing OS libraries; `ldd` on bundled Chromium and `chrome-headless-shell` then reported no missing libraries.
 - Direct Playwright launch probe: `playwright_launch=ok`.
-- `node --import tsx --test tools/dev-verification/unit/verificationMatrix.test.ts` — **2/2 pass**.
-- `node --import tsx --test tools/dev-verification/unit/adminPageChrome.test.ts` — **13/13 pass**.
-- `node --import tsx --test client/src/lib/sliderCarousel.test.ts` — **8/8 pass**.
-- `cargo test --manifest-path rust-api/Cargo.toml --bin webtopup-rust-api trusted_group_rejection_includes_action_group -- --nocapture` — **1 pass**.
-- `cargo build --manifest-path rust-api/Cargo.toml --bin webtopup-rust-api` — exit 0.
-- `npm --prefix client run build` — exit 0.
 - Focused disposable browser cases after `db-reset` + `db-seed`:
   - `sliders.spec.ts` chromium-desktop — **1 passed**
   - `sliders.spec.ts` chromium-mobile — **1 passed**
   - `home-slider.spec.ts` chromium-desktop — **1 passed**
   - `home-slider.spec.ts` chromium-mobile — **1 passed**
-- `git diff --check` — pass.
-
-## Remaining
-
-The full aggregate `npm run dev-verify -- test` is the remaining Task 17 gate. Focused Task 17 browser cases are green, but this report does not claim `LOCAL DEV VERIFIED` until the aggregate completes with every required check verified.
+- `npm run dev-verify -- test` — **LOCAL DEV VERIFIED**
+  - runId `1657ce88-43bd-4f19-9256-d994dc8ac42b`
+  - started `2026-08-17T07:22:58.161Z`
+  - completed `2026-08-17T07:42:23.662Z`
+  - commit `e1aba218418bf2c73d90c2e0fcfab0b949a13258`
+  - **64/64** required checks `LOCAL DEV VERIFIED`, including `slider-management`, `sliders-desktop`, `sliders-mobile`, `home-slider-desktop`, `home-slider-mobile`, `upload-security`, `diff-check`, `report-secrecy`, and `stopped-state`
+- `npm run dev-verify -- infra-down` — exit 0
+- `npm run dev-verify -- infra-status` after teardown — `{"serviceCount":0}`
+- `npm run dev-verify -- status` after teardown — no host processes, no compose services, rollout disabled, and no replica set connected
+- Host process manifest absent
+- `git diff --check` — pass
 
 ## Disposable boundary
 
-All verification used only `webtopup_task14_dev`, mock provider mode, and loopback Mongo/host ports. Host processes were stopped after focused browser runs. Production was not touched. No GitHub push, production restart, or production data mutation was performed.
+All verification used only `webtopup_task14_dev`, mock provider mode, and loopback Mongo/host ports. Host teardown and the approved `infra-down` lifecycle were run after the aggregate. Production was not touched. No GitHub push, production restart, or production data mutation was performed.
