@@ -28,6 +28,10 @@ npm run dev-verify:login-return-to:list # list the seven canonical Task 4 deskto
 npm run dev-verify:login-return-to      # fresh disposable stack + fixtures + 7 cases + guaranteed cleanup
 npm run dev-verify:public-routes:list   # list canonical desktop/mobile public behavior cases
 npm run dev-verify:public-routes        # disposable HTTPS stack + 16 cases + guaranteed cleanup
+npx playwright test --config tools/dev-verification/playwright.config.ts sliders.spec.ts --project=chromium-desktop --workers=1
+npx playwright test --config tools/dev-verification/playwright.config.ts sliders.spec.ts --project=chromium-mobile --workers=1
+npx playwright test --config tools/dev-verification/playwright.config.ts home-slider.spec.ts --project=chromium-desktop --workers=1
+npx playwright test --config tools/dev-verification/playwright.config.ts home-slider.spec.ts --project=chromium-mobile --workers=1
 make dev-verify-down       # stop owned processes and containers, preserve volume
 ```
 

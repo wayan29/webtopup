@@ -13,6 +13,7 @@ const memberPassword = process.env.SMOKE_MEMBER_PASSWORD || '';
 const smokeMongoUri = (process.env.SMOKE_MONGO_URI || process.env.MONGO_URI || '').trim();
 const smokeMongoDb = (process.env.SMOKE_MONGO_DB || process.env.MONGO_DB || '').trim();
 const requireMutationSmokeMongo = process.env.REQUIRE_MUTATION_SMOKE_MONGO === '1';
+const SMOKE_PNG_1X1 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64');
 let passedChecks = 0;
 let skippedChecks = 0;
 let optionalDepositE2eChecks = 0;
@@ -152,6 +153,16 @@ function objectId(value, label) {
 
 function objectIdFromAny(value, label) {
   return objectId(value?._id || value?.id, label);
+}
+
+async function uploadSmokeCover(token, filename) {
+  const form = new FormData();
+  form.append('file', new Blob([SMOKE_PNG_1X1], { type: 'image/png' }), filename);
+  return request('/api/v2/upload?type=covers', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  });
 }
 
 async function authedJson(token, method, path, payload, extraHeaders = {}) {
@@ -1689,7 +1700,9 @@ async function main() {
   let vendorId = null;
   let productId = null;
   let sliderId = null;
-  let sliderOrders = null;
+  let sliderRevision = null;
+  let sliderCoverFilename = null;
+  let sliderArchived = false;
   let articleId = null;
   let rewardId = null;
   let voucherId = null;
@@ -2211,31 +2224,64 @@ async function main() {
     console.log(`ok product update ${productUpdate.response.status}`);
 
     const slidersBefore = await authedJson(token, 'GET', '/api/v2/sliders/admin/all');
-    assertStatus('slider order snapshot', slidersBefore.response, slidersBefore.body, 200);
-    if (!Array.isArray(slidersBefore.body)) {
-      throw new Error('slider order snapshot expected array');
+    assertStatus('slider revisioned snapshot', slidersBefore.response, slidersBefore.body, 200);
+    if (!Number.isSafeInteger(slidersBefore.body?.revision) || !Array.isArray(slidersBefore.body?.sliders)) {
+      throw new Error('slider revisioned snapshot expected revision and sliders');
     }
-    sliderOrders = slidersBefore.body.map((slider) => ({ id: objectIdFromAny(slider, 'slider order snapshot'), sortOrder: slider.sortOrder || 0 }));
-    console.log(`ok slider order snapshot ${slidersBefore.response.status}`);
-
+    sliderRevision = slidersBefore.body.revision;
+    const sliderUploadFilename = `smoke-slider-${suffix}.png`;
+    const sliderUpload = await uploadSmokeCover(token, sliderUploadFilename);
+    assertStatus('slider cover upload', sliderUpload.response, sliderUpload.body, 200);
+    if (!/^\/uploads\/covers\/[\w.-]+\.png$/u.test(String(sliderUpload.body?.url || ''))) {
+      throw new Error(`slider cover upload returned non-canonical URL: ${JSON.stringify(sliderUpload.body)}`);
+    }
+    sliderCoverFilename = sliderUpload.body.filename;
+    const sliderImage = sliderUpload.body.url;
+    const sliderCreateKey = `smoke-slider-create-${suffix}`;
     const sliderCreate = await authedJson(token, 'POST', '/api/v2/sliders/admin/create', {
-      name: sliderName,
-      image: '/uploads/covers/smoke-slider.svg',
-      link: '/smoke-slider',
-      status: false,
-    });
+      expectedRevision: sliderRevision,
+      slider: { name: sliderName, image: sliderImage, link: '/smoke-slider', status: false },
+    }, { 'Idempotency-Key': sliderCreateKey });
     assertStatus('slider create', sliderCreate.response, sliderCreate.body, 201);
     sliderId = objectId(sliderCreate.body?.slider?._id, 'slider create');
+    sliderRevision = sliderCreate.body.revision;
     console.log(`ok slider create ${sliderCreate.response.status}`);
 
     const sliderUpdate = await authedJson(token, 'PUT', `/api/v2/sliders/admin/${sliderId}`, {
-      name: `${sliderName} Updated`,
-      image: '/uploads/covers/smoke-slider-updated.svg',
-      link: '/smoke-slider-updated',
-      status: false,
-    });
+      expectedRevision: sliderRevision,
+      changes: { name: `${sliderName} Updated`, link: '/smoke-slider-updated' },
+    }, { 'Idempotency-Key': `smoke-slider-update-${suffix}` });
     assertStatus('slider update', sliderUpdate.response, sliderUpdate.body, 200);
+    sliderRevision = sliderUpdate.body.revision;
     console.log(`ok slider update ${sliderUpdate.response.status}`);
+
+    const sliderArchive = await authedJson(token, 'POST', `/api/v2/sliders/admin/${sliderId}/archive`, {
+      expectedRevision: sliderRevision,
+    }, { 'Idempotency-Key': `smoke-slider-archive-${suffix}` });
+    assertStatus('slider archive', sliderArchive.response, sliderArchive.body, 200);
+    sliderRevision = sliderArchive.body.revision;
+    sliderArchived = true;
+    console.log(`ok slider archive ${sliderArchive.response.status}`);
+
+    const sliderRestore = await authedJson(token, 'POST', `/api/v2/sliders/admin/${sliderId}/restore`, {
+      expectedRevision: sliderRevision,
+    }, { 'Idempotency-Key': `smoke-slider-restore-${suffix}` });
+    assertStatus('slider restore', sliderRestore.response, sliderRestore.body, 200);
+    sliderRevision = sliderRestore.body.revision;
+    sliderArchived = false;
+    console.log(`ok slider restore ${sliderRestore.response.status}`);
+
+    const sliderCurrent = await authedJson(token, 'GET', '/api/v2/sliders/admin/all');
+    assertStatus('slider reorder snapshot', sliderCurrent.response, sliderCurrent.body, 200);
+    sliderRevision = sliderCurrent.body.revision;
+    const sliderOrders = sliderCurrent.body.sliders.map((slider, index) => ({ id: objectIdFromAny(slider, 'slider reorder snapshot'), sortOrder: index }));
+    const sliderReorder = await authedJson(token, 'PUT', '/api/v2/sliders/admin/reorder', {
+      expectedRevision: sliderRevision,
+      orders: sliderOrders,
+    }, { 'Idempotency-Key': `smoke-slider-reorder-${suffix}` });
+    assertStatus('slider reorder', sliderReorder.response, sliderReorder.body, 200);
+    sliderRevision = sliderReorder.body.revision;
+    console.log(`ok slider reorder ${sliderReorder.response.status}`);
 
     const articleCreate = await authedJson(token, 'POST', '/api/v2/articles', {
       title: articleTitle,
@@ -2335,25 +2381,31 @@ async function main() {
         cleanupErrors.push(error);
       }
     }
-    if (sliderId) {
+    if (sliderId && !sliderArchived) {
       try {
-        const sliderDelete = await authedJson(token, 'DELETE', `/api/v2/sliders/admin/${sliderId}`);
-        assertStatus('slider cleanup', sliderDelete.response, sliderDelete.body, 200);
-        console.log(`ok slider cleanup ${sliderDelete.response.status}`);
+        const sliderSnapshot = await authedJson(token, 'GET', '/api/v2/sliders/admin/all');
+        assertStatus('slider cleanup snapshot', sliderSnapshot.response, sliderSnapshot.body, 200);
+        const sliderCleanup = await authedJson(token, 'POST', `/api/v2/sliders/admin/${sliderId}/archive`, {
+          expectedRevision: sliderSnapshot.body.revision,
+        }, { 'Idempotency-Key': `smoke-slider-cleanup-archive-${suffix}` });
+        assertStatus('slider cleanup archive', sliderCleanup.response, sliderCleanup.body, 200);
+        sliderArchived = true;
+        console.log(`ok slider cleanup archive ${sliderCleanup.response.status}`);
       } catch (error) {
         cleanupErrors.push(error);
       }
     }
-    if (sliderOrders?.length > 0) {
+    if (sliderCoverFilename) {
       try {
-        const restoreSliderOrder = await authedJson(token, 'PUT', '/api/v2/sliders/admin/sort-order', { orders: sliderOrders });
-        assertStatus('slider order restore', restoreSliderOrder.response, restoreSliderOrder.body, 200);
-        console.log(`ok slider order restore ${restoreSliderOrder.response.status}`);
+        const coverCleanup = await request(`/api/v2/upload?type=covers&filename=${encodeURIComponent(sliderCoverFilename)}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        assertStatus('slider cover cleanup', coverCleanup.response, coverCleanup.body, 200);
+        console.log(`ok slider cover cleanup ${coverCleanup.response.status}`);
       } catch (error) {
         cleanupErrors.push(error);
       }
-    } else if (sliderOrders) {
-      skip('slider order restore', 'no existing slider order fixture');
     }
     if (productId) {
       try {

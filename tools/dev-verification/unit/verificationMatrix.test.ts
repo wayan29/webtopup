@@ -5,7 +5,16 @@ import { verificationMatrix } from '../verificationMatrix.ts';
 test('aggregate matrix names every required evidence group exactly once', () => {
   const matrix = verificationMatrix(); const names = matrix.map(({ name }) => name);
   assert.equal(new Set(names).size, names.length); assert.ok(matrix.every(({ required }) => required));
-  for (const name of ['unit', 'client-build', 'server-build', 'rust-build', 'mongo', 'public-origin', 'login-return-to-desktop', 'team-access-desktop', 'team-access-mobile', 'catalog-permissions', 'audit-logs-integration', 'audit-logs-desktop', 'audit-logs-mobile', 'finance-idempotency', 'rollout-transition', 'diff-check', 'report-secrecy', 'stopped-state']) assert.ok(names.includes(name));
+  for (const name of ['unit', 'client-build', 'server-build', 'rust-build', 'mongo', 'public-origin', 'login-return-to-desktop', 'team-access-desktop', 'team-access-mobile', 'catalog-permissions', 'audit-logs-integration', 'audit-logs-desktop', 'audit-logs-mobile', 'finance-idempotency', 'slider-management', 'sliders-desktop', 'sliders-mobile', 'home-slider-desktop', 'home-slider-mobile', 'rollout-transition', 'diff-check', 'report-secrecy', 'stopped-state']) assert.ok(names.includes(name));
+  assert.equal(matrix.find(({ name }) => name === 'slider-management')?.profile, 'session-cs-fault');
+  for (const name of ['sliders-desktop', 'sliders-mobile']) {
+    assert.equal(matrix.find(({ name: candidate }) => candidate === name)?.profile, 'session-cs-fault');
+    assert.equal(matrix.find(({ name: candidate }) => candidate === name)?.isolated, true);
+  }
+  for (const name of ['home-slider-desktop', 'home-slider-mobile']) {
+    assert.equal(matrix.find(({ name: candidate }) => candidate === name)?.profile, 'session-cs');
+    assert.equal(matrix.find(({ name: candidate }) => candidate === name)?.isolated, true);
+  }
   for (const platform of ['desktop', 'mobile']) for (const spec of ['session-cookies', 'session-lifecycle', 'session-multitab', 'session-device-replacement', 'session-enrollment', 'session-step-up']) assert.ok(names.includes(`${spec}-${platform}`));
   assert.equal(matrix.find(({ name }) => name === 'session-cookies-desktop')?.profile, 'session-cs');
   for (const name of ['team-access-desktop', 'team-access-mobile', 'catalog-permissions', 'audit-logs-integration', 'audit-logs-desktop', 'audit-logs-mobile']) {

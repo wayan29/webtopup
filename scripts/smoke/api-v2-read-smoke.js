@@ -425,6 +425,13 @@ async function runSliderFreshnessChecks(failures) {
     if (first.response.status !== 200 || !Array.isArray(first.body)) {
       throw new Error(`expected public slider HTTP 200 array, got ${first.response.status}: ${JSON.stringify(first.body)}`);
     }
+    for (const slider of first.body) {
+      if (Object.prototype.hasOwnProperty.call(slider, 'lifecycle') || Object.prototype.hasOwnProperty.call(slider, 'sortOrder')) {
+        throw new Error('public slider DTO leaked lifecycle/order fields');
+      }
+      if (typeof slider.link !== 'string') throw new Error('public slider link must be a string');
+      if (/^http:\/\//i.test(slider.link)) throw new Error('public slider disclosed an HTTP legacy link');
+    }
     const etag = first.response.headers.get('etag');
     const cacheControl = first.response.headers.get('cache-control') || '';
     if (!etag || !/^\"sliders-\\d+\"$/.test(etag)) {
