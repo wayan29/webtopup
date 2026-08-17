@@ -31,11 +31,11 @@ Status: **DONE_WITH_CONCERNS / BROWSER ENVIRONMENT-BLOCKED**
 
 ## Browser execution blocker
 
-The approved disposable host was started with the required profile and exact database, but Chromium execution failed before test code ran because the installed Playwright headless shell cannot load the system library `libatk-1.0.so.0`:
+The approved disposable host was started with the required profile and exact database, but Chromium execution failed before test code ran because the installed Playwright browser dependencies are absent. Direct `ldd` inspection reproduced the failure for both bundled Chromium and `chrome-headless-shell`; the missing set includes `libatk-1.0.so.0`, `libatk-bridge-2.0.so.0`, `libcups.so.2`, `libasound.so.2`, `libgbm.so.1`, `libcairo.so.2`, `libpango-1.0.so.0`, `libXcomposite.so.1`, `libXdamage.so.1`, `libXfixes.so.3`, `libXrandr.so.2`, and `libatspi.so.0`. The exact launch error was:
 
 `error while loading shared libraries: libatk-1.0.so.0: cannot open shared object file: No such file or directory`
 
-No browser assertions are claimed as passed. No package was installed and no system configuration was changed. The aggregate run stopped at `public-origin`; the Task 17 desktop/mobile cases were therefore not run by the matrix. Earlier focused desktop launch attempts showed the same prerequisite failure; mobile execution was not claimed.
+No system browser executable or already-running CDP browser was available, and read-only package inspection found no installed `libatk1.0-0` candidate. No package was installed and no system configuration was changed. No browser assertions are claimed as passed. The aggregate run stopped at `public-origin`; the Task 17 desktop/mobile cases were therefore not run by the matrix. Earlier focused desktop launch attempts showed the same prerequisite failure; mobile execution was not claimed.
 
 ## Disposable boundary
 
