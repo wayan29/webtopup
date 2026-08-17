@@ -46,6 +46,13 @@ test('every automatic rotation pause source disables rotation', () => {
     assert.equal(shouldAutoRotate({ ...base, focusWithin: true }), false);
 });
 
+test('explicit play is informed opt-in until the user pauses again', () => {
+    const blocked = { reducedMotion: true, userPaused: false, hovered: true, focusWithin: true, count: 3, informedPlay: true };
+    assert.equal(shouldAutoRotate(blocked), true);
+    assert.equal(shouldAutoRotate({ ...blocked, userPaused: true }), false);
+    assert.equal(shouldAutoRotate({ ...blocked, informedPlay: false }), false);
+});
+
 test('public slider links preserve safe internal query fragments and reject traversal', () => {
     assert.deepEqual(classifyPublicSliderLink('/promo?source=home#offers'), { href: '/promo?source=home#offers', external: false });
     assert.equal(classifyPublicSliderLink('//example.com/promo').href, null);

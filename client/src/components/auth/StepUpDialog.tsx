@@ -110,7 +110,7 @@ export default function StepUpDialog({
   };
 
   return (
-    <div className="fixed inset-0 z-[220] grid place-items-center bg-slate-950/80 p-4" role="presentation">
+    <div className="fixed inset-0 z-[220] grid place-items-center bg-slate-950/80 p-4" role="presentation" data-step-up-dialog="true">
       <div
         ref={dialog}
         role="dialog"

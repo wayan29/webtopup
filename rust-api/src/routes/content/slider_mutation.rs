@@ -846,13 +846,7 @@ async fn write_transaction(session: &mut ClientSession, db: &Database, operator:
                 .ok_or_else(internal_mutation_error)?;
             let sensitivity = effective_requires_step_up(action, None, Some(&after), &[], &[]);
             if sensitivity {
-                require_trusted_step_up_group(headers, SENSITIVE_GROUP).map_err(|_| {
-                    mutation_error(
-                        StatusCode::FORBIDDEN,
-                        "AUTH_STEP_UP_REQUIRED",
-                        "Verifikasi ulang diperlukan untuk aksi sensitif",
-                    )
-                })?;
+                require_trusted_step_up_group(headers, SENSITIVE_GROUP)?;
             }
             if current_documents.len() as i64 >= MAX_CURRENT_SLIDERS {
                 return Err(mutation_error(
@@ -951,13 +945,7 @@ async fn write_transaction(session: &mut ClientSession, db: &Database, operator:
                 &[],
             );
             if sensitivity {
-                require_trusted_step_up_group(headers, SENSITIVE_GROUP).map_err(|_| {
-                    mutation_error(
-                        StatusCode::FORBIDDEN,
-                        "AUTH_STEP_UP_REQUIRED",
-                        "Verifikasi ulang diperlukan untuk aksi sensitif",
-                    )
-                })?;
+                require_trusted_step_up_group(headers, SENSITIVE_GROUP)?;
             }
             if !before.status
                 && input.status
@@ -1086,13 +1074,7 @@ async fn write_transaction(session: &mut ClientSession, db: &Database, operator:
                 &new_public_order,
             );
             if sensitivity {
-                require_trusted_step_up_group(headers, SENSITIVE_GROUP).map_err(|_| {
-                    mutation_error(
-                        StatusCode::FORBIDDEN,
-                        "AUTH_STEP_UP_REQUIRED",
-                        "Verifikasi ulang diperlukan untuk aksi sensitif",
-                    )
-                })?;
+                require_trusted_step_up_group(headers, SENSITIVE_GROUP)?;
             }
             let mut released = Vec::new();
             let (reference_released, classification) = if is_registered_asset(
@@ -1343,13 +1325,7 @@ async fn write_transaction(session: &mut ClientSession, db: &Database, operator:
                 &new_public_order,
             );
             if sensitivity {
-                require_trusted_step_up_group(headers, SENSITIVE_GROUP).map_err(|_| {
-                    mutation_error(
-                        StatusCode::FORBIDDEN,
-                        "AUTH_STEP_UP_REQUIRED",
-                        "Verifikasi ulang diperlukan untuk aksi sensitif",
-                    )
-                })?;
+                require_trusted_step_up_group(headers, SENSITIVE_GROUP)?;
             }
             for (id, order) in &new_order {
                 db.collection::<Document>("sliders")

@@ -32,6 +32,8 @@ export interface AutoRotateOptions {
     hovered: boolean;
     focusWithin: boolean;
     count: number;
+    /** Explicit Play is an informed opt-in and wins over hover/focus/reduced-motion until Pause. */
+    informedPlay?: boolean;
 }
 
 /** Return an index in the range [0, count), or zero when there are no slides. */
@@ -144,9 +146,12 @@ export const shouldAutoRotate = ({
     hovered,
     focusWithin,
     count,
-}: AutoRotateOptions): boolean => (
-    count > 1 && !reducedMotion && !userPaused && !hovered && !focusWithin
-);
+    informedPlay = false,
+}: AutoRotateOptions): boolean => {
+    if (count <= 1 || userPaused) return false;
+    if (informedPlay) return true;
+    return !reducedMotion && !hovered && !focusWithin;
+};
 
 /**
  * Classify a pointer movement. A horizontal movement must clear the threshold

@@ -248,7 +248,7 @@ test('audit detail dialog preserves accessible interaction semantics', () => {
 test('accessible dialog primitive protects focus, scroll, nesting, and busy close', () => {
     const dialog = fs.readFileSync(path.join(root, 'client/src/components/admin/AccessibleDialog.tsx'), 'utf8');
     assert.match(dialog, /role="dialog"/);
-    assert.match(dialog, /aria-modal="true"/);
+    assert.match(dialog, /aria-modal=\{exclusiveModal \? 'true' : 'false'\}/);
     assert.match(dialog, /aria-labelledby=\{titleId\}/);
     assert.match(dialog, /aria-describedby=\{descriptionId\}/);
     assert.match(dialog, /initialFocusRef/);
@@ -341,6 +341,12 @@ test('slider form preserves edit-trigger focus and explains public impact', () =
 
 test('slider step-up dialog remains interactive above an inert app background', () => {
     const orchestration = fs.readFileSync(path.join(root, 'client/src/auth/useStepUpOrchestration.tsx'), 'utf8');
+    const dialog = fs.readFileSync(path.join(root, 'client/src/components/admin/AccessibleDialog.tsx'), 'utf8');
+    const stepUp = fs.readFileSync(path.join(root, 'client/src/components/auth/StepUpDialog.tsx'), 'utf8');
     assert.match(orchestration, /createPortal/);
     assert.match(orchestration, /document\.body/);
+    assert.match(stepUp, /data-step-up-dialog="true"/);
+    assert.match(dialog, /data-step-up-dialog/);
+    assert.match(dialog, /MutationObserver/);
+    assert.match(dialog, /aria-modal/);
 });

@@ -1,5 +1,5 @@
 import { createPortal } from 'react-dom';
-import { useEffect, useRef, type ReactNode, type RefObject } from 'react';
+import { useEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
 
 const focusableSelector = [
     'a[href]',
@@ -43,8 +43,13 @@ export default function AccessibleDialog({
     const dialogRef = useRef<HTMLDivElement>(null);
     const busyRef = useRef(busy);
     const onCloseRef = useRef(onClose);
+    const [exclusiveModal, setExclusiveModal] = useState(true);
     busyRef.current = busy;
     onCloseRef.current = onClose;
+
+    const isStepUpHost = (element: HTMLElement) =>
+        element.matches('[data-step-up-dialog="true"]')
+        || element.querySelector('[data-step-up-dialog="true"]') !== null;
 
     useEffect(() => {
         if (!open) return undefined;
@@ -70,11 +75,23 @@ export default function AccessibleDialog({
             // and any unrelated portal roots. The modal host itself stays interactive.
             for (const child of Array.from(document.body.children)) {
                 const element = child as HTMLElement;
-                if (element === dialogHost) continue;
+                if (element === dialogHost || isStepUpHost(element)) continue;
                 previousSiblingInert.set(element, element.inert);
                 element.inert = true;
             }
         }
+
+        const syncStepUpExclusive = () => {
+            const stepUpOpen = document.querySelector('[data-step-up-dialog="true"]') !== null;
+            setExclusiveModal(!stepUpOpen);
+            for (const child of Array.from(document.body.children)) {
+                const element = child as HTMLElement;
+                if (isStepUpHost(element)) element.inert = false;
+            }
+        };
+        syncStepUpExclusive();
+        const observer = new MutationObserver(syncStepUpExclusive);
+        observer.observe(document.body, { childList: true, subtree: true });
 
         const focusInitial = () => {
             const requestedFocus = initialFocusRef?.current;
@@ -86,6 +103,7 @@ export default function AccessibleDialog({
         const focusTimer = window.setTimeout(focusInitial, 0);
 
         const isOwnedByNestedDialog = () => {
+            if (document.querySelector('[data-step-up-dialog="true"]')) return true;
             const activeElement = document.activeElement;
             if (!(activeElement instanceof HTMLElement)) return false;
             const owningDialog = activeElement.closest<HTMLElement>('[data-accessible-dialog="true"]');
@@ -128,6 +146,7 @@ export default function AccessibleDialog({
 
         document.addEventListener('keydown', handleKeyDown);
         return () => {
+            observer.disconnect();
             window.clearTimeout(focusTimer);
             document.removeEventListener('keydown', handleKeyDown);
             document.body.style.overflow = previousOverflow;
@@ -161,7 +180,7 @@ export default function AccessibleDialog({
                     if (externalDialogRef) externalDialogRef.current = node;
                 }}
                 role="dialog"
-                aria-modal="true"
+                aria-modal={exclusiveModal ? 'true' : 'false'}
                 aria-labelledby={titleId}
                 aria-describedby={descriptionId}
                 aria-busy={busy ? 'true' : undefined}

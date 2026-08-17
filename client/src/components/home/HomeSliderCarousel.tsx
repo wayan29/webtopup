@@ -133,7 +133,14 @@ export default function HomeSliderCarousel({ sliders, defaultSlides, categoryCou
     useEffect(() => {
         // Reduced motion pauses rotation by default, but an explicit Play press is an
         // informed opt-in and wins over the media query until the user chooses Pause.
-        if (!shouldAutoRotate({ reducedMotion: reducedMotion && !motionOverride, userPaused, hovered, focusWithin, count })) {
+        if (!shouldAutoRotate({
+            reducedMotion,
+            userPaused,
+            hovered,
+            focusWithin,
+            count,
+            informedPlay: motionOverride && !userPaused,
+        })) {
             return undefined;
         }
 

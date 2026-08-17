@@ -126,13 +126,15 @@ test('admin slider lifecycle is accessible, revisioned, and split-deploy gated',
     const uploadedFilename = `task17-${crypto.randomUUID()}.png`;
     const uploadResponse = page.waitForResponse((response) => response.request().method() === 'POST' && response.url().includes('/api/v2/upload?type=covers'));
     await page.getByLabel('Upload gambar baru').setInputFiles({ name: uploadedFilename, mimeType: 'image/png', buffer: PNG_1X1 });
-    const uploadBody = await (await uploadResponse).json() as { url?: string };
+    const uploadBody = await (await uploadResponse).json() as { url?: string; filename?: string };
     expect(uploadBody.url).toMatch(/^\/uploads\/covers\//u);
+    expect(uploadBody.filename).toMatch(/\.png$/u);
     uploadedCoverUrl = uploadBody.url;
     const uploadedAsset = await db.collection('managedassets').findOne({ canonicalPath: uploadedCoverUrl });
     expect(uploadedAsset?._id).toBeTruthy();
     await db.collection('managedassets').updateOne({ _id: uploadedAsset!._id }, { $set: { task17Fixture: true, fixtureRunId } });
-    const imageButton = picker.getByRole('button', { name: new RegExp(`Pilih ${uploadedFilename}`) });
+    const storedFilename = String(uploadBody.filename);
+    const imageButton = picker.getByRole('button', { name: new RegExp(`^Pilih ${storedFilename.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')}`) });
     await expect(imageButton).toBeVisible({ timeout: 20_000 });
     await imageButton.click();
     await page.getByRole('button', { name: 'Konfirmasi pilih gambar' }).click();
@@ -162,20 +164,19 @@ test('admin slider lifecycle is accessible, revisioned, and split-deploy gated',
     await expect(page.getByText('Slider berhasil diperbarui', { exact: false })).toBeVisible({ timeout: 20_000 });
     await expect.poll(() => requestKeys.length, { timeout: 20_000 }).toBe(2);
     expect(requestKeys[0]).toBe(requestKeys[1]);
-    await expect(page.getByText('Aktif', { exact: true }).first()).toBeVisible();
+    const publishedRow = page.getByRole('button', { name: `Arsipkan slider ${createdName}` }).first().locator('xpath=ancestor::*[self::tr or self::article][1]');
+    await expect(publishedRow.getByText('Aktif', { exact: true }).first()).toBeVisible();
 
     // Archive and restore use explicit accessible dialogs and preserve draft restore semantics.
+    // The five-minute settings.sensitive grant from publish remains valid, so archive must not invent a second prompt.
     await page.getByRole('button', { name: `Arsipkan slider ${createdName}` }).first().click();
     await expect(page.getByRole('dialog', { name: 'Arsipkan slider?' })).toBeVisible();
-    await page.getByRole('button', { name: 'Arsipkan Slider' }).click();
-    await expect(page.getByRole('heading', { name: 'Verifikasi ulang diperlukan' })).toBeVisible({ timeout: 20_000 });
-    await page.getByLabel('Password', { exact: true }).fill((await loginFixture('slider-manager')).password);
-    await page.getByLabel('Kode OTP').fill(await fixtureOtp('slider-manager'));
-    await page.getByRole('button', { name: 'Lanjutkan' }).click();
+    await page.getByRole('button', { name: 'Arsipkan Slider', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Verifikasi ulang diperlukan' })).toHaveCount(0);
     await expect(page.getByText(`Slider "${createdName}" berhasil diarsipkan`, { exact: false })).toBeVisible({ timeout: 20_000 });
     await page.getByRole('tab', { name: 'Arsip' }).click();
-    await expect(page.getByText(createdName, { exact: true })).toBeVisible();
-    await page.getByRole('button', { name: `Restore slider ${createdName}` }).click();
+    await expect(page.getByRole('button', { name: `Restore slider ${createdName}` }).first()).toBeVisible();
+    await page.getByRole('button', { name: `Restore slider ${createdName}` }).first().click();
     await expect(page.getByRole('dialog', { name: 'Restore slider?' })).toBeVisible();
     await page.getByRole('button', { name: 'Restore sebagai Draft' }).click();
     await expect(page.getByText(`Slider "${createdName}" berhasil direstore sebagai draft`, { exact: false })).toBeVisible({ timeout: 20_000 });

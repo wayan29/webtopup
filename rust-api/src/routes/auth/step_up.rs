@@ -427,11 +427,17 @@ pub fn require_trusted_step_up_group(
     if provided == expected_group && is_known_action_group(expected_group) {
         return Ok(());
     }
-    Err(auth_error(
+    Err((
         StatusCode::FORBIDDEN,
-        "AUTH_STEP_UP_REQUIRED",
-        "Verifikasi ulang diperlukan untuk aksi sensitif",
-    ))
+        Json(json!({
+            "error": {
+                "code": "AUTH_STEP_UP_REQUIRED",
+                "actionGroup": expected_group,
+                "message": "Verifikasi ulang diperlukan untuk aksi sensitif"
+            }
+        })),
+    )
+        .into_response())
 }
 
 pub async fn orchestrate_step_up<S: StepUpStore>(
@@ -1404,6 +1410,19 @@ mod tests {
         let mut spoofed = HeaderMap::new();
         spoofed.insert("x-step-up-group", "finance.adjust_balance".parse().unwrap());
         assert!(require_trusted_step_up_group(&spoofed, "finance.adjust_balance").is_err());
+    }
+
+    #[tokio::test]
+    async fn trusted_group_rejection_includes_action_group() {
+        let response = require_trusted_step_up_group(&HeaderMap::new(), "settings.sensitive")
+            .expect_err("missing grant must fail closed");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read step-up body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json step-up body");
+        assert_eq!(value["error"]["code"], "AUTH_STEP_UP_REQUIRED");
+        assert_eq!(value["error"]["actionGroup"], "settings.sensitive");
     }
 
     #[test]

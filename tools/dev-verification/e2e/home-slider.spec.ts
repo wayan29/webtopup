@@ -70,8 +70,8 @@ test('homepage slider exposes only active safe links and accessible controls', a
     await expect(first).toBeVisible({ timeout: 20_000 });
     await expect(first).toHaveAttribute('target', '_blank');
     await expect(first).toHaveAttribute('rel', /noopener noreferrer/);
-    await expect(page.getByRole('link', { name: 'Lihat Produk' })).toHaveAttribute('href', '#kategori-produk');
-    await expect(page.getByRole('link', { name: 'Cek Pesanan' })).toHaveAttribute('href', '/check-transaction');
+    await expect(carousel.getByRole('link', { name: 'Lihat Produk' })).toHaveAttribute('href', '#kategori-produk');
+    await expect(carousel.getByRole('link', { name: 'Cek Pesanan' })).toHaveAttribute('href', '/check-transaction');
     await expect(page.getByRole('button', { name: 'Slide sebelumnya' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Slide berikutnya' })).toBeVisible();
 
