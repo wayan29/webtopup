@@ -47,7 +47,7 @@ async function markedMongo() {
   return { client, db: client.db(shared.MONGO_DB), fixtureRunId: fixtureRunId as string };
 }
 
-async function cleanupSliderFixture(db: ReturnType<MongoClient['db']>, fixtureRunId: string, prefix: string) {
+async function cleanupSliderFixture(db: ReturnType<MongoClient['db']>, fixtureRunId: string, prefix: string, uploadedCoverUrl?: string) {
   const sliders = await db.collection('sliders').find({ task17Fixture: true, fixtureRunId, name: { $regex: `^${prefix}` } }, { projection: { _id: 1 } }).toArray();
   const ids = sliders.map((slider) => slider._id);
   for (const slider of sliders) {
@@ -57,6 +57,14 @@ async function cleanupSliderFixture(db: ReturnType<MongoClient['db']>, fixtureRu
   if (ids.length) {
     await db.collection('slideridempotencyclaims').deleteMany({ $or: [{ targetId: { $in: ids } }, { candidateSliderId: { $in: ids } }] });
     await db.collection('slideraudits').deleteMany({ targetId: { $in: ids } });
+  }
+  if (uploadedCoverUrl) {
+    const asset = await db.collection('managedassets').findOne({ canonicalPath: uploadedCoverUrl, task17Fixture: true, fixtureRunId }, { projection: { _id: 1 } });
+    if (asset) {
+      await db.collection('managedassetreferences').deleteMany({ assetId: asset._id });
+      await db.collection('managedassets').deleteOne({ _id: asset._id, task17Fixture: true, fixtureRunId });
+      await fs.rm(path.join(root, uploadedCoverUrl.replace(/^\/uploads\//u, 'uploads/')), { force: true });
+    }
   }
 }
 
@@ -75,6 +83,7 @@ test('admin slider lifecycle is accessible, revisioned, and split-deploy gated',
   await db.collection('sliders').insertOne({ _id: seedId, name: `${prefix} seed`, image: '/uploads/covers/task17-seed-missing.png', link: '/task17-seed', sortOrder: 0, status: false, lifecycle: 'active', createdAt: new Date(), updatedAt: new Date(), task17Fixture: true, fixtureRunId });
   let createdName = `${prefix} draft`;
   let createdId: ObjectId | undefined;
+  let uploadedCoverUrl: string | undefined;
   try {
     await page.goto('/admin/sliders');
     await expect(page.getByRole('tab', { name: 'Aktif & Draft' })).toBeVisible({ timeout: 30_000 });
@@ -114,7 +123,14 @@ test('admin slider lifecycle is accessible, revisioned, and split-deploy gated',
     const dialogs = page.locator('[data-accessible-dialog="true"]');
     await expect(dialogs).toHaveCount(2);
     await expect(dialogs.first()).toHaveAttribute('inert', '');
+    const uploadResponse = page.waitForResponse((response) => response.request().method() === 'POST' && response.url().includes('/api/v2/upload?type=covers'));
     await page.getByLabel('Upload gambar baru').setInputFiles({ name: `task17-${crypto.randomUUID()}.png`, mimeType: 'image/png', buffer: PNG_1X1 });
+    const uploadBody = await (await uploadResponse).json() as { url?: string };
+    expect(uploadBody.url).toMatch(/^\/uploads\/covers\//u);
+    uploadedCoverUrl = uploadBody.url;
+    const uploadedAsset = await db.collection('managedassets').findOne({ canonicalPath: uploadedCoverUrl });
+    expect(uploadedAsset?._id).toBeTruthy();
+    await db.collection('managedassets').updateOne({ _id: uploadedAsset!._id }, { $set: { task17Fixture: true, fixtureRunId } });
     const imageButton = picker.locator('button[aria-pressed]').last();
     await expect(imageButton).toBeVisible({ timeout: 20_000 });
     await imageButton.click();
@@ -170,7 +186,7 @@ test('admin slider lifecycle is accessible, revisioned, and split-deploy gated',
     await page.unroute(`**/api/v2/sliders/admin/${createdId.toHexString()}`);
     await page.getByRole('button', { name: 'Discard Draft' }).click();
   } finally {
-    await cleanupSliderFixture(db, fixtureRunId, prefix);
+    await cleanupSliderFixture(db, fixtureRunId, prefix, uploadedCoverUrl);
     await client.close();
   }
 });

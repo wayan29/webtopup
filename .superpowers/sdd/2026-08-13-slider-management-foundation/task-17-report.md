@@ -13,6 +13,7 @@ Status: **DONE_WITH_CONCERNS / BROWSER ENVIRONMENT-BLOCKED**
 
 ## Fresh verification
 
+- `npm run test:dev-verify:unit` — **234/234 pass** (including the matrix contracts).
 - `node --import tsx --test tools/dev-verification/unit/verificationMatrix.test.ts` — **2/2 pass**.
 - `node --check scripts/smoke/api-v2-read-smoke.js` — exit 0.
 - `node --check scripts/smoke/api-v2-mutation-smoke.js` — exit 0.
@@ -22,6 +23,7 @@ Status: **DONE_WITH_CONCERNS / BROWSER ENVIRONMENT-BLOCKED**
 - `npm --prefix client run build` — exit 0.
 - `npm --prefix server run build` — exit 0.
 - `git diff --check` — pass.
+- Browser fixture cleanup was rechecked to remove marked uploaded cover registry rows/files and slider claim/audit/reference rows.
 
 ## Browser execution blocker
 
