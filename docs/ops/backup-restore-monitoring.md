@@ -85,13 +85,16 @@ scripts/ops/status-report.sh --json     # JSON; kirim ke webhook bila ALERT_WEBH
 
 Cek: unit systemd (`webtopup-rust`, `webtopup-node`, `docker`), health lokal Rust/Node, health publik via Cloudflare, ping Mongo + keberadaan PRIMARY, kesegaran backup (default maks 25 jam), dan pemakaian disk (`/` dan `/var/backups`; WARN ≥ 85%, FAIL ≥ 95%). Exit 0 hanya bila tidak ada FAIL.
 
-## Usulan cron (BELUM dipasang — butuh persetujuan terpisah)
+## Cron ops (TERPASANG 2026-08-17)
+
+File `/etc/cron.d/webtopup-ops` (root:root 644) aktif di daemon cron:
 
 ```cron
-# /etc/cron.d/webtopup-ops  (root)
 15 2 * * *  root /home/danayasa/proyek/webtopup/scripts/ops/backup-mongo.sh daily  >> /var/log/webtopup/backup.log 2>&1
 20 2 * * 0  root /home/danayasa/proyek/webtopup/scripts/ops/backup-mongo.sh weekly >> /var/log/webtopup/backup.log 2>&1
 */10 * * * * root /home/danayasa/proyek/webtopup/scripts/ops/status-report.sh --quiet >> /var/log/webtopup/status.log 2>&1
 ```
 
-Dengan `sudo mkdir -p /var/log/webtopup` sebelumnya. Pengiriman alert (opsional) cukup menyetel `ALERT_WEBHOOK` di cron line status.
+Bukti pasang: journal cron `22:10:01` mengeksekusi status-report tepat jadwal (`SUMMARY pass=10 warn=0 fail=0` di `/var/log/webtopup/status.log`, file 600 root:root); backup daily/weekly disimulasikan manual sukses sebelum pemasangan. Higienitas: direktori `/var/backups/webtopup/{daily,weekly}` 700 root:root, arsip 600, log 600.
+
+Saat ini `ALERT_WEBHOOK` belum diset (monitoring pasif via log). Bila ingin notifikasi aktif, tambahkan variabel tersebut pada baris status di file cron.
