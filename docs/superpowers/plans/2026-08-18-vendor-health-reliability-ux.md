@@ -83,7 +83,7 @@ Each issue is serialized as `{ "code": string, "source": string }`; `source` is 
 - Produces internal testable helpers `fetch_digiflazz_balance_with_timeout(..., timeout: Duration)` and `fetch_tokovoucher_balance_with_timeout(..., timeout: Duration)`.
 - Consumes: existing `VendorCredentials` and provider JSON schemas.
 
-- [ ] **Step 1: Add failing local-server tests for success, HTTP/schema failure, and timeout**
+- [x] **Step 1: Add failing local-server tests for success, HTTP/schema failure, and timeout**
 
 Append a `#[cfg(test)] mod tests` in `providers.rs`. Use `std::net::TcpListener` plus `std::thread` so tests require no new Tokio features or dependency:
 
@@ -156,7 +156,7 @@ async fn both_provider_probes_accept_numeric_balances_only() {
 
 The test helper returns only generic strings such as `provider request timeout`, `provider HTTP status`, or `provider balance response invalid`; never include URLs or raw bodies.
 
-- [ ] **Step 2: Run focused Rust tests to verify RED**
+- [x] **Step 2: Run focused Rust tests to verify RED**
 
 ```bash
 cd rust-api
@@ -165,7 +165,7 @@ cargo test routes::vendors::providers::tests -- --nocapture
 
 Expected: FAIL because timeout helpers do not exist and Digiflazz still returns `Value`.
 
-- [ ] **Step 3: Implement one strict probe contract**
+- [x] **Step 3: Implement one strict probe contract**
 
 In `providers.rs`:
 
@@ -194,7 +194,7 @@ Both internal helpers must:
 
 Public functions call their timeout variants with `PROVIDER_HEALTH_TIMEOUT`.
 
-- [ ] **Step 4: Adapt every caller without reintroducing fake zero**
+- [x] **Step 4: Adapt every caller without reintroducing fake zero**
 
 Use these exact behaviors:
 
@@ -204,7 +204,7 @@ Use these exact behaviors:
 - Existing Tokovoucher endpoints keep their current generic client messages while consuming the unified timeout/error contract.
 - `health.rs` adaptation is deferred to Task 3 and must remain compile-broken until that task only if both tasks are implemented in one working batch; otherwise adapt it temporarily with an explicit `match` returning `(false, Value::Null, message)`.
 
-- [ ] **Step 5: Run focused tests and compile checks to verify GREEN**
+- [x] **Step 5: Run focused tests and compile checks to verify GREEN**
 
 ```bash
 cd rust-api
@@ -216,7 +216,7 @@ git diff --check
 
 Expected: provider tests PASS, Rust compiles, no whitespace errors. Record that `cargo fmt --check` is unavailable because `rustfmt` is not installed.
 
-- [ ] **Step 6: Commit the provider contract checkpoint**
+- [x] **Step 6: Commit the provider contract checkpoint**
 
 ```bash
 git add rust-api/src/routes/vendors/providers.rs \
@@ -245,7 +245,7 @@ git commit -m "fix: make vendor balance probes fail closed"
 - Produces: health state `disabled` for intentionally inactive vendors.
 - Consumes: issue codes and exact sources from Global Constraints.
 
-- [ ] **Step 1: Add failing classification and response-shape tests**
+- [x] **Step 1: Add failing classification and response-shape tests**
 
 Append/update the `health.rs` test module:
 
@@ -290,7 +290,7 @@ fn core_failure_is_503_and_auxiliary_failure_is_partial_200() {
 }
 ```
 
-- [ ] **Step 2: Run focused tests to verify RED**
+- [x] **Step 2: Run focused tests to verify RED**
 
 ```bash
 cd rust-api
@@ -299,7 +299,7 @@ cargo test routes::vendors::health::tests -- --nocapture
 
 Expected: FAIL because issue types/partial state/disabled classification are absent.
 
-- [ ] **Step 3: Implement issue types and fail-closed snapshot assembly**
+- [x] **Step 3: Implement issue types and fail-closed snapshot assembly**
 
 In `types.rs`:
 
@@ -326,7 +326,7 @@ Add `partial` and `issues` to `VendorHealthSnapshotResponse`. In `vendor_health_
 
 Return `(StatusCode, Json(response)).into_response()` for both success and failure so status is testable.
 
-- [ ] **Step 4: Implement disabled semantics and seller callback correctness**
+- [x] **Step 4: Implement disabled semantics and seller callback correctness**
 
 - `resolve_snapshot_health(configured, active, ...)`: check `!active` first and return `("disabled", "Vendor dinonaktifkan")`.
 - `resolve_realtime_health(...)`: return `disabled` before configured/balance rules.
@@ -357,7 +357,7 @@ fn seller_callback_pending_requires_undelivered_callback() {
 }
 ```
 
-- [ ] **Step 5: Run focused tests and compile checks to verify GREEN**
+- [x] **Step 5: Run focused tests and compile checks to verify GREEN**
 
 ```bash
 cd rust-api
@@ -369,7 +369,7 @@ git diff --check
 
 Expected: tests PASS, Rust compiles, no whitespace errors.
 
-- [ ] **Step 6: Commit the snapshot contract checkpoint**
+- [x] **Step 6: Commit the snapshot contract checkpoint**
 
 ```bash
 git add rust-api/src/routes/vendors/types.rs rust-api/src/routes/vendors/health.rs
@@ -391,7 +391,7 @@ git commit -m "fix: make vendor health snapshot diagnostics honest"
 - Produces: `persist_vendor_health_snapshot(...) -> mongodb::error::Result<()>`.
 - Consumes: Task 1 probe errors and Task 2 `VendorHealthIssue`.
 
-- [ ] **Step 1: Add failing tests for partial issue aggregation and persistence mapping**
+- [x] **Step 1: Add failing tests for partial issue aggregation and persistence mapping**
 
 Add pure helpers and tests first:
 
@@ -447,7 +447,7 @@ fn csv_exposes_only_stable_diagnostics() {
 }
 ```
 
-- [ ] **Step 2: Run focused tests to verify RED**
+- [x] **Step 2: Run focused tests to verify RED**
 
 ```bash
 cd rust-api
@@ -456,7 +456,7 @@ cargo test routes::vendors::health::tests -- --nocapture
 
 Expected: FAIL because typed response/issue helpers/persistence result are absent.
 
-- [ ] **Step 3: Build realtime data without `unwrap_or_default` ambiguity**
+- [x] **Step 3: Build realtime data without `unwrap_or_default` ambiguity**
 
 Refactor `build_vendor_health_payload` into a typed response builder. Do **not** use `config::find_vendor_by_name()` here because it converts Mongo errors to `None`. Add `load_vendor_health_documents()` that performs one `vendors.find({})`, collects the cursor with `?`, then selects case-insensitive Digiflazz/Tokovoucher documents from the returned vector:
 
@@ -470,7 +470,7 @@ Refactor `build_vendor_health_payload` into a typed response builder. Do **not**
 
 Do not include Rust/Mongo/Reqwest error strings in response or CSV.
 
-- [ ] **Step 4: Return and surface persistence result**
+- [x] **Step 4: Return and surface persistence result**
 
 Change:
 
@@ -492,7 +492,7 @@ After building the realtime payload:
 
 Export builds the same honest payload, requires persistence outcome, and adds CSV columns `Partial`, `Snapshot Persisted`, `Issue Codes` (semicolon-separated stable codes).
 
-- [ ] **Step 5: Preserve notification compatibility**
+- [x] **Step 5: Preserve notification compatibility**
 
 Add a test serializing the typed response to BSON and proving each persisted vendor still has:
 
@@ -501,7 +501,7 @@ Add a test serializing the typed response to BSON and proving each persisted ven
 
 Do not change `vendor_health_snapshot_alerts()` behavior in this task.
 
-- [ ] **Step 6: Run focused Rust tests and compile checks to verify GREEN**
+- [x] **Step 6: Run focused Rust tests and compile checks to verify GREEN**
 
 ```bash
 cd rust-api
@@ -513,7 +513,7 @@ git diff --check
 
 Expected: tests PASS, Rust compiles, no whitespace errors.
 
-- [ ] **Step 7: Commit realtime and persistence correctness**
+- [x] **Step 7: Commit realtime and persistence correctness**
 
 ```bash
 git add rust-api/src/routes/vendors/types.rs rust-api/src/routes/vendors/health.rs
@@ -538,7 +538,7 @@ git commit -m "fix: expose partial vendor health and snapshot persistence"
 - Produces: `vendorHealthErrorMessage(error: unknown, fallback: string): string` that reads only nested public `response.data.error.message` or `response.data.message` strings and otherwise returns the fallback.
 - Produces: `vendorHealthMeta(state)`, `vendorFreshness(generatedAt, nowMs?)`, `vendorSuccessRateLabel(total, rate)`, and `vendorBalanceLabel(balanceOk, balance)`.
 
-- [ ] **Step 1: Write failing pure contract tests**
+- [x] **Step 1: Write failing pure contract tests**
 
 Create `client/src/lib/vendorHealth.test.ts`:
 
@@ -597,7 +597,7 @@ test('error copy reads only the public response message', () => {
 
 Also test deduplication/allowlisting of issue codes and that unknown health strings normalize to `unknown`.
 
-- [ ] **Step 2: Run pure tests to verify RED**
+- [x] **Step 2: Run pure tests to verify RED**
 
 ```bash
 node --import tsx --test client/src/lib/vendorHealth.test.ts
@@ -605,7 +605,7 @@ node --import tsx --test client/src/lib/vendorHealth.test.ts
 
 Expected: FAIL with module-not-found.
 
-- [ ] **Step 3: Implement the pure parser and presentation module**
+- [x] **Step 3: Implement the pure parser and presentation module**
 
 Use record/type guards only; no React, DOM, Axios, Zustand, or browser globals. Requirements:
 
@@ -619,11 +619,11 @@ Use record/type guards only; no React, DOM, Axios, Zustand, or browser globals. 
 - preserve server `ok:false` and `partial:true`; never synthesize success;
 - `vendorFreshness` returns `{ state, ageSeconds, relativeLabel, absoluteLabel }` using Indonesian `Intl.DateTimeFormat` and the exact 120-second boundary.
 
-- [ ] **Step 4: Wire the test into the aggregate unit runner**
+- [x] **Step 4: Wire the test into the aggregate unit runner**
 
 Append `client/src/lib/vendorHealth.test.ts` to the `test:dev-verify:unit` command in root `package.json`. Do not use a wildcard that would accidentally include browser-only tests.
 
-- [ ] **Step 5: Run focused tests and client build to verify GREEN**
+- [x] **Step 5: Run focused tests and client build to verify GREEN**
 
 ```bash
 node --import tsx --test client/src/lib/vendorHealth.test.ts
@@ -634,7 +634,7 @@ git diff --check
 
 Expected: all tests PASS, client build exits 0, no whitespace errors.
 
-- [ ] **Step 6: Commit the client contract checkpoint**
+- [x] **Step 6: Commit the client contract checkpoint**
 
 ```bash
 git add client/src/lib/vendorHealth.ts client/src/lib/vendorHealth.test.ts package.json
@@ -655,7 +655,7 @@ git commit -m "test: define fail-closed vendor health client contracts"
 - Preserves: `useStepUpOrchestration`, `stepUp.run('exports.sensitive', ...)`, `/vendors/health/export`, provider settings links, and `stepUp.dialog`.
 - Produces: global refresh listener that loads realtime + diagnostics with latest-request-wins guards.
 
-- [ ] **Step 1: Change source-contract tests first to verify the old page fails**
+- [x] **Step 1: Change source-contract tests first to verify the old page fails**
 
 Replace the Vendor Health refresh assertion in `adminPageChrome.test.ts` and add contracts:
 
@@ -678,7 +678,7 @@ assert.doesNotMatch(vendorHealth, /Refresh Snapshot|Snapshot Read-only Vendor|Co
 
 Retain assertions for `handleExport`, `exports.sensitive`, and `stepUp.dialog`.
 
-- [ ] **Step 2: Run the source-contract test to verify RED**
+- [x] **Step 2: Run the source-contract test to verify RED**
 
 ```bash
 node --import tsx --test tools/dev-verification/unit/adminPageChrome.test.ts
@@ -686,7 +686,7 @@ node --import tsx --test tools/dev-verification/unit/adminPageChrome.test.ts
 
 Expected: the Vendor Health contract test FAILS against old local refresh controls and English/duplicate snapshot UI.
 
-- [ ] **Step 3: Replace duplicate fetch state with guarded orchestration**
+- [x] **Step 3: Replace duplicate fetch state with guarded orchestration**
 
 In `VendorHealth.tsx`:
 
@@ -727,7 +727,7 @@ useEffect(() => {
 
 Split `healthError`, `diagnosticsError`, and `exportError`. Export must not clear health errors.
 
-- [ ] **Step 4: Render the approved hierarchy and honest states**
+- [x] **Step 4: Render the approved hierarchy and honest states**
 
 Replace duplicate snapshot vendor cards with:
 
@@ -748,7 +748,7 @@ Exact presentation rules:
 - settings action text is **Pengaturan**;
 - generation copy is **Diperbarui ...**.
 
-- [ ] **Step 5: Remove local refresh controls and complete accessibility semantics**
+- [x] **Step 5: Remove local refresh controls and complete accessibility semantics**
 
 - Keep only **Ekspor CSV** locally.
 - Root: `aria-busy={healthLoading || diagnosticsLoading || exporting ? 'true' : 'false'}`.
@@ -758,7 +758,7 @@ Exact presentation rules:
 - Errors and partial/stale warnings use `role="alert"` without duplicating the same announcement.
 - Keep `{stepUp.dialog}` as a sibling after page content.
 
-- [ ] **Step 6: Run focused tests and client build to verify GREEN**
+- [x] **Step 6: Run focused tests and client build to verify GREEN**
 
 ```bash
 node --import tsx --test \
@@ -770,7 +770,7 @@ git diff --check
 
 Expected: tests PASS, client build exits 0, no local refresh/duplicate authoritative snapshot cards/English status copy remains.
 
-- [ ] **Step 7: Commit the monitoring UI checkpoint**
+- [x] **Step 7: Commit the monitoring UI checkpoint**
 
 ```bash
 git add client/src/pages/admin/VendorHealth.tsx tools/dev-verification/unit/adminPageChrome.test.ts
@@ -790,7 +790,7 @@ git commit -m "feat: make vendor health monitoring honest and concise"
 - Consumes: existing `authenticate`, `hasPermission('manageVendors')`, `requireStepUp('exports.sensitive')`, and Rust trusted step-up verification.
 - Produces: source-contract regression tests; no production route behavior change is intended.
 
-- [ ] **Step 1: Add failing/locking source-contract tests**
+- [x] **Step 1: Add failing/locking source-contract tests**
 
 Append:
 
@@ -808,7 +808,7 @@ test('vendor health reads and export retain exact permission and step-up boundar
 
 Also assert `server/src/app.ts` does not register legacy `vendorRoutes`, preventing a non-step-up legacy export from becoming active.
 
-- [ ] **Step 2: Run the source test**
+- [x] **Step 2: Run the source test**
 
 ```bash
 node --import tsx --test server/src/routes/apiV2ProxyRoutes.test.ts
@@ -816,7 +816,7 @@ node --import tsx --test server/src/routes/apiV2ProxyRoutes.test.ts
 
 Expected: PASS if boundaries remain correct; this is a locking test, not a behavior change.
 
-- [ ] **Step 3: Build server and verify no route changes**
+- [x] **Step 3: Build server and verify no route changes**
 
 ```bash
 npm --prefix server run build
@@ -826,7 +826,7 @@ git diff -- server/src/routes/apiV2ProxyRoutes.ts rust-api/src/routes/vendors/he
 
 Expected: server build exits 0; the diff shows no permission/action-group weakening.
 
-- [ ] **Step 4: Commit the security regression checkpoint**
+- [x] **Step 4: Commit the security regression checkpoint**
 
 ```bash
 git add server/src/routes/apiV2ProxyRoutes.test.ts
@@ -848,7 +848,7 @@ git commit -m "test: pin vendor health permission and export step-up"
 - Produces required matrix checks: `vendor-health-integration`, `vendor-health-desktop`, `vendor-health-mobile`.
 - Consumes: exact API/UI contracts from Tasks 2-6.
 
-- [ ] **Step 1: Add marked Vendor Health fixture definitions**
+- [x] **Step 1: Add marked Vendor Health fixture definitions**
 
 In `fixtureDefinitions()` add:
 
@@ -865,7 +865,7 @@ make('vendor-health-denied', 'vendor-health-permission-denied', 'cs', {
 
 Extend the synthetic TOTP-secret condition for `vendor-health-permission-manager`, following the existing `audit-permission-manager` pattern. Do not add vendor documents to global `seedFixtureDefinitions`; browser tests use route interception and unrelated matrix checks must not inherit Vendor Health state.
 
-- [ ] **Step 2: Write the disposable integration test**
+- [x] **Step 2: Write the disposable integration test**
 
 Create `vendorHealth.test.ts` following `integration/auditLogs.test.ts` login/step-up helpers. After asserting the exact marker/database, insert two **test-local** marked vendor documents:
 
@@ -902,7 +902,7 @@ Prove:
 
 The test must assert the marker and database name before any fixture mutation and clean only `task14Fixture` documents.
 
-- [ ] **Step 3: Write desktop/mobile Playwright behavior tests**
+- [x] **Step 3: Write desktop/mobile Playwright behavior tests**
 
 Create `vendor-health.spec.ts`. Install routes **before** navigation. Use this exact fixture builder and race pattern:
 
@@ -987,7 +987,7 @@ test('vendor health is authoritative, refreshable, and honest', async ({ page },
 
 Do not intercept or click the export endpoint in this browser test; integration proves export and step-up. Browser only checks **Ekspor CSV** remains present, while the existing `stepUp.dialog` source contract remains pinned by `adminPageChrome.test.ts`.
 
-- [ ] **Step 4: Add required verification-matrix checks**
+- [x] **Step 4: Add required verification-matrix checks**
 
 After audit checks in `verificationMatrix.ts` add:
 
@@ -1006,7 +1006,7 @@ check('vendor-health-mobile', 'session-cs', 'npx', [
 ], true),
 ```
 
-- [ ] **Step 5: Start a fresh disposable stack**
+- [x] **Step 5: Start a fresh disposable stack**
 
 ```bash
 npm run dev-verify -- setup
@@ -1018,7 +1018,7 @@ npm run dev-verify -- host-up-session
 
 Expected: exact DB `webtopup_task14_dev`, marked fixture state, host processes healthy. If re-bootstrap occurs while host is already running, run `host-down` first and restart after seeding to avoid stale in-memory state.
 
-- [ ] **Step 6: Run focused integration and desktop/mobile checks**
+- [x] **Step 6: Run focused integration and desktop/mobile checks**
 
 ```bash
 npx playwright test \
@@ -1036,7 +1036,7 @@ npx playwright test \
 
 Expected: all three checks PASS. If repeated login attempts exhaust device slots, re-bootstrap/seed and restart hosts before the canonical desktop→mobile run; do not weaken device policy.
 
-- [ ] **Step 7: Tear down and prove no disposable services remain**
+- [x] **Step 7: Tear down and prove no disposable services remain**
 
 ```bash
 npm run dev-verify -- host-down
@@ -1046,7 +1046,7 @@ npm run dev-verify -- infra-status
 
 Expected: `{"serviceCount":0}`.
 
-- [ ] **Step 8: Commit the end-to-end coverage checkpoint**
+- [x] **Step 8: Commit the end-to-end coverage checkpoint**
 
 ```bash
 git add tools/dev-verification/seed.ts \
@@ -1068,7 +1068,7 @@ git commit -m "test: verify vendor health reliability end to end"
 - Consumes: complete implementation and required matrix entries.
 - Produces: fresh evidence for code review and a production-release handoff; no production action.
 
-- [ ] **Step 1: Run all focused unit/source checks**
+- [x] **Step 1: Run all focused unit/source checks**
 
 ```bash
 cd rust-api
@@ -1085,7 +1085,7 @@ npm run test:dev-verify:unit
 
 Expected: all tests PASS and Rust compiles. Report `rustfmt` unavailable; do not claim formatter success.
 
-- [ ] **Step 2: Run client/server builds and diff checks**
+- [x] **Step 2: Run client/server builds and diff checks**
 
 ```bash
 npm --prefix client run build
@@ -1095,7 +1095,7 @@ git diff --check
 
 Expected: both builds exit 0 and no whitespace errors.
 
-- [ ] **Step 3: Bring up infrastructure and run the full disposable matrix**
+- [x] **Step 3: Bring up infrastructure and run the full disposable matrix**
 
 The aggregate runner expects Mongo infrastructure to be running:
 
@@ -1106,7 +1106,7 @@ npm run dev-verify -- test
 
 Expected: final result `LOCAL DEV VERIFIED`, now including the three required Vendor Health checks.
 
-- [ ] **Step 4: Prove teardown and report secrecy**
+- [x] **Step 4: Prove teardown and report secrecy**
 
 ```bash
 npm run dev-verify -- down
@@ -1116,7 +1116,7 @@ node --import tsx tools/dev-verification/cli.ts audit-reports
 
 Expected: zero host processes, zero disposable compose services, rollout disabled, retained report secrecy PASS. Production `webtopup-mongo` remains untouched.
 
-- [ ] **Step 5: Inspect final repository state**
+- [x] **Step 5: Inspect final repository state**
 
 ```bash
 git status --short --branch
@@ -1126,7 +1126,7 @@ git log --oneline -12
 
 Expected: implementation is committed, no fixture secrets/generated verification state staged, only intentional plan progress may remain.
 
-- [ ] **Step 6: Request independent read-only review**
+- [x] **Step 6: Request independent read-only review**
 
 Reviewer checklist:
 
@@ -1144,7 +1144,7 @@ Reviewer checklist:
 
 Any valid finding receives a focused RED/GREEN regression test, a separate checkpoint commit, and rerun of affected checks.
 
-- [ ] **Step 7: Mark plan complete and present release handoff**
+- [x] **Step 7: Mark plan complete and present release handoff**
 
 Report:
 
