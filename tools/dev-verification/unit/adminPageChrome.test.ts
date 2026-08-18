@@ -119,7 +119,7 @@ test('operations pages remove hero copy while retaining controls and data sectio
     assertChromeRemoved(
         'VendorHealth.tsx',
         [/Vendor Health Dashboard<\/h1>/],
-        [/Export CSV/, /handleExport/, /fetchHealth/]
+        [/Ekspor CSV/, /handleExport/, /fetchHealth/]
     );
     assertChromeRemoved(
         'Notifications.tsx',
@@ -167,10 +167,26 @@ test('refresh controls remain reachable after local hero refresh removal', () =>
     );
 
     const vendorHealth = readAdminPage('VendorHealth.tsx');
-    assert.match(
+    assert.match(vendorHealth, /admin:refresh-current-page/, 'Vendor Health must load both datasets from the global refresh action');
+    assert.match(vendorHealth, /Promise\.all/);
+    assert.match(vendorHealth, /latestHealthRequestId/);
+    assert.match(vendorHealth, /latestDiagnosticsRequestId/);
+    assert.match(vendorHealth, /parseVendorHealthResponse/);
+    assert.match(vendorHealth, /parseVendorHealthDiagnostics/);
+    assert.match(vendorHealth, /role="status"/);
+    assert.match(vendorHealth, /role="alert"/);
+    assert.match(vendorHealth, /aria-busy/);
+    assert.match(vendorHealth, /Ekspor CSV/);
+    assert.match(vendorHealth, /Tidak tersedia/);
+    assert.match(vendorHealth, /vendorSuccessRateLabel\(/, 'zero-transaction copy is served by the pure module and wired here');
+    assert.match(vendorHealth, /handleExport/);
+    assert.match(vendorHealth, /exports\.sensitive/);
+    assert.match(vendorHealth, /stepUp\.dialog/);
+    assert.doesNotMatch(vendorHealth, /onClick=\{fetchHealth\}/);
+    assert.doesNotMatch(
         vendorHealth,
-        /onClick=\{fetchHealth\}/,
-        'Vendor Health must retain a reachable refresh action for its primary dataset'
+        /Refresh Snapshot|Snapshot Read-only Vendor|Connected|Degraded|Healthy|Warning|Critical|Success Rate|Generated:/,
+        'Vendor Health must speak Indonesian and keep exactly one authoritative dataset'
     );
 });
 
