@@ -126,9 +126,23 @@ impl Serialize for VendorItem {
     }
 }
 
+#[derive(Clone, Serialize)]
+pub(super) struct VendorHealthIssue {
+    pub(super) code: &'static str,
+    pub(super) source: &'static str,
+}
+
+impl VendorHealthIssue {
+    pub(super) const fn new(code: &'static str, source: &'static str) -> Self {
+        Self { code, source }
+    }
+}
+
 #[derive(Serialize)]
 pub(super) struct VendorHealthSnapshotResponse {
     pub(super) ok: bool,
+    pub(super) partial: bool,
+    pub(super) issues: Vec<VendorHealthIssue>,
     pub(super) service: &'static str,
     pub(super) api_prefix: &'static str,
     pub(super) generated_at: String,

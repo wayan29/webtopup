@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::{
     routes::auth::require_trusted_step_up_group,
-    security::{require_proxy_context, ErrorResponse},
+    security::{require_proxy_context, ErrorResponse, ProxyContextResponse},
     state::AppState,
     utils::{
         bson::{read_i64, read_string},
@@ -29,9 +29,9 @@ use super::{
     json::{date_key, date_time_to_mongoose_string},
     providers::{fetch_digiflazz_balance_with_base_url, fetch_tokovoucher_balance_with_base_url},
     types::{
-        SellerHealthSummary, TransactionStats, VendorHealthSnapshotResponse,
-        VendorRealtimeHealthItem, VendorSnapshot, VendorSnapshotTotals, VendorStatsResponse,
-        WebhookStats,
+        SellerHealthSummary, TransactionStats, VendorHealthIssue,
+        VendorHealthSnapshotResponse, VendorRealtimeHealthItem, VendorSnapshot,
+        VendorSnapshotTotals, VendorStatsResponse, WebhookStats,
     },
     unavailable,
 };
@@ -46,25 +46,27 @@ pub async fn vendor_health_snapshot(
     };
 
     let Some(client) = &state.mongo_client else {
-        return Json(VendorHealthSnapshotResponse {
-            ok: false,
-            service: "webtopup-api-v2",
-            api_prefix: "/v2",
-            generated_at: timestamp_now(),
-            source: "mongodb-snapshot",
-            user: proxy_context.into_response(),
-            vendors: Vec::new(),
-            totals: VendorSnapshotTotals::default(),
-        })
-        .into_response();
+        return vendor_health_snapshot_failure(proxy_context.into_response());
     };
 
     let db = client.database(&state.mongo_db);
     let vendor_docs = match db.collection::<Document>("vendors").find(doc! {}).await {
-        Ok(cursor) => cursor.try_collect::<Vec<_>>().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
+        Ok(cursor) => match cursor.try_collect::<Vec<_>>().await {
+            Ok(documents) => documents,
+            Err(_) => return vendor_health_snapshot_failure(proxy_context.into_response()),
+        },
+        Err(_) => return vendor_health_snapshot_failure(proxy_context.into_response()),
     };
-    let tx_stats = transaction_stats_today(&db).await.unwrap_or_default();
+    let (tx_stats, issues) = match transaction_stats_today(&db).await {
+        Ok(stats) => (stats, Vec::new()),
+        Err(_) => (
+            HashMap::new(),
+            vec![VendorHealthIssue::new(
+                "TRANSACTION_STATS_UNAVAILABLE",
+                "mongodb.transactions",
+            )],
+        ),
+    };
 
     let mut vendors: Vec<VendorSnapshot> = vendor_docs
         .iter()
@@ -89,17 +91,74 @@ pub async fn vendor_health_snapshot(
         },
     );
 
-    Json(VendorHealthSnapshotResponse {
-        ok: true,
-        service: "webtopup-api-v2",
-        api_prefix: "/v2",
-        generated_at: timestamp_now(),
-        source: "mongodb-snapshot",
-        user: proxy_context.into_response(),
+    let (status, ok, partial) = snapshot_response_status(true, &issues);
+    snapshot_response(
+        status,
+        ok,
+        partial,
+        issues,
+        timestamp_now(),
         vendors,
         totals,
-    })
-    .into_response()
+        proxy_context.into_response(),
+    )
+}
+
+fn snapshot_response_status(
+    core_available: bool,
+    issues: &[VendorHealthIssue],
+) -> (StatusCode, bool, bool) {
+    if !core_available {
+        return (StatusCode::SERVICE_UNAVAILABLE, false, false);
+    }
+    let partial = !issues.is_empty();
+    (StatusCode::OK, true, partial)
+}
+
+#[allow(clippy::type_complexity)]
+fn snapshot_response(
+    status: StatusCode,
+    ok: bool,
+    partial: bool,
+    issues: Vec<VendorHealthIssue>,
+    generated_at: String,
+    vendors: Vec<VendorSnapshot>,
+    totals: VendorSnapshotTotals,
+    user: Option<ProxyContextResponse>,
+) -> Response {
+    (
+        status,
+        Json(VendorHealthSnapshotResponse {
+            ok,
+            partial,
+            issues,
+            service: "webtopup-api-v2",
+            api_prefix: "/v2",
+            generated_at,
+            source: "mongodb-snapshot",
+            user,
+            vendors,
+            totals,
+        }),
+    )
+        .into_response()
+}
+
+fn vendor_health_snapshot_failure(user: Option<ProxyContextResponse>) -> Response {
+    let (status, ok, partial) = snapshot_response_status(false, &[]);
+    snapshot_response(
+        status,
+        ok,
+        partial,
+        vec![VendorHealthIssue::new(
+            "VENDOR_COLLECTION_UNAVAILABLE",
+            "mongodb.vendors",
+        )],
+        timestamp_now(),
+        Vec::new(),
+        VendorSnapshotTotals::default(),
+        user,
+    )
 }
 
 pub async fn vendor_health(
@@ -469,7 +528,9 @@ fn resolve_realtime_health(
     failed_count: i64,
     rejected_webhook_count: i64,
 ) -> &'static str {
-    if !configured || !active || !balance_ok || failed_count > 5 || rejected_webhook_count > 0 {
+    if !active {
+        "disabled"
+    } else if !configured || !balance_ok || failed_count > 5 || rejected_webhook_count > 0 {
         "critical"
     } else if low_balance || pending_count > 10 || failed_count > 0 {
         "warning"
@@ -549,6 +610,16 @@ async fn last_webhook_stats(
     Ok(stats)
 }
 
+fn seller_callback_pending_expression() -> Document {
+    doc! { "$and": [
+        { "$eq": ["$callbackRequired", true] },
+        { "$eq": [
+            { "$ifNull": ["$callbackDeliveredAt", Bson::Null] },
+            Bson::Null
+        ] }
+    ] }
+}
+
 async fn seller_health_summary(
     db: &mongodb::Database,
 ) -> mongodb::error::Result<SellerHealthSummary> {
@@ -558,7 +629,7 @@ async fn seller_health_summary(
             "total": { "$sum": 1 },
             "pending": { "$sum": { "$cond": [{ "$eq": ["$status", "pending"] }, 1, 0] } },
             "failed": { "$sum": { "$cond": [{ "$eq": ["$status", "failed"] }, 1, 0] } },
-            "callbackPending": { "$sum": { "$cond": [{ "$eq": ["$callbackRequired", true] }, 1, 0] } },
+            "callbackPending": { "$sum": { "$cond": [seller_callback_pending_expression(), 1, 0] } },
             "callbackDelivered": { "$sum": { "$cond": [{ "$ne": [{ "$ifNull": ["$callbackDeliveredAt", Bson::Null] }, Bson::Null] }, 1, 0] } }
         }
     }];
@@ -701,12 +772,12 @@ fn resolve_snapshot_health(
     active: bool,
     stats: &TransactionStats,
 ) -> (&'static str, String) {
-    if !configured {
-        return ("critical", "Credentials belum dikonfigurasi".to_string());
+    if !active {
+        return ("disabled", "Vendor dinonaktifkan".to_string());
     }
 
-    if !active {
-        return ("critical", "Vendor tidak aktif".to_string());
+    if !configured {
+        return ("critical", "Credentials belum dikonfigurasi".to_string());
     }
 
     if stats.pending > 10 || stats.failed > 5 {
@@ -766,5 +837,71 @@ fn csv_escape(value: &str) -> String {
         format!("\"{}\"", safe.replace('"', "\"\""))
     } else {
         safe
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inactive_vendor_is_disabled_and_failures_are_not_healthy_zeroes() {
+        let empty = TransactionStats::default();
+        assert_eq!(resolve_snapshot_health(true, false, &empty).0, "disabled");
+        assert_eq!(
+            resolve_realtime_health(true, false, true, false, 0, 0, 0),
+            "disabled"
+        );
+        assert_eq!(
+            resolve_realtime_health(true, true, false, false, 0, 0, 0),
+            "critical"
+        );
+        assert_eq!(
+            resolve_realtime_health(true, true, true, false, 0, 1, 0),
+            "warning"
+        );
+    }
+
+    #[test]
+    fn snapshot_issue_contract_uses_stable_non_secret_codes() {
+        let issue = VendorHealthIssue::new("VENDOR_COLLECTION_UNAVAILABLE", "mongodb.vendors");
+        let json = serde_json::to_value(issue).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "code": "VENDOR_COLLECTION_UNAVAILABLE",
+                "source": "mongodb.vendors"
+            })
+        );
+    }
+
+    #[test]
+    fn core_failure_is_503_and_auxiliary_failure_is_partial_200() {
+        assert_eq!(
+            snapshot_response_status(false, &[]),
+            (StatusCode::SERVICE_UNAVAILABLE, false, false),
+        );
+        let issues = vec![VendorHealthIssue::new(
+            "TRANSACTION_STATS_UNAVAILABLE",
+            "mongodb.transactions",
+        )];
+        assert_eq!(
+            snapshot_response_status(true, &issues),
+            (StatusCode::OK, true, true),
+        );
+    }
+
+    #[test]
+    fn seller_callback_pending_requires_undelivered_callback() {
+        assert_eq!(
+            seller_callback_pending_expression(),
+            doc! { "$and": [
+                { "$eq": ["$callbackRequired", true] },
+                { "$eq": [
+                    { "$ifNull": ["$callbackDeliveredAt", Bson::Null] },
+                    Bson::Null
+                ] }
+            ] },
+        );
     }
 }
