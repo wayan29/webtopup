@@ -40,7 +40,7 @@ fn vendor_balance_bad_request(message: &str) -> Response {
         axum::http::StatusCode::BAD_REQUEST,
         Json(VendorBalanceErrorResponse {
             message: message.to_string(),
-            balance: 0,
+            balance: None,
         }),
     )
         .into_response()

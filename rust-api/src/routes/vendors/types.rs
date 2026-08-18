@@ -60,7 +60,7 @@ impl Serialize for VendorBalanceResponse {
 
 pub(super) struct VendorBalanceErrorResponse {
     pub(super) message: String,
-    pub(super) balance: i64,
+    pub(super) balance: Option<i64>,
 }
 
 impl Serialize for VendorBalanceErrorResponse {
@@ -72,6 +72,21 @@ impl Serialize for VendorBalanceErrorResponse {
         state.serialize_field("message", &self.message)?;
         state.serialize_field("balance", &self.balance)?;
         state.end()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VendorBalanceErrorResponse;
+
+    #[test]
+    fn vendor_balance_error_does_not_serialize_a_fake_numeric_balance() {
+        let value = serde_json::to_value(VendorBalanceErrorResponse {
+            message: "Saldo vendor tidak tersedia".to_string(),
+            balance: None,
+        })
+        .unwrap();
+        assert_eq!(value.get("balance"), Some(&serde_json::Value::Null));
     }
 }
 

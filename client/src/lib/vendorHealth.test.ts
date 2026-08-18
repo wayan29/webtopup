@@ -50,6 +50,7 @@ test('freshness and unavailable value labels are explicit', () => {
     assert.equal(vendorHealthMeta('unknown').label, 'Tidak diketahui');
     assert.equal(vendorHealthMeta('healthy').label, 'Sehat');
     assert.equal(vendorHealthMeta('warning').label, 'Perlu perhatian');
+    assert.equal(vendorHealthMeta('critical').label, 'Kritis');
 });
 
 test('error copy reads only the public response message', () => {

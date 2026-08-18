@@ -373,7 +373,7 @@ export function vendorHealthMeta(state: VendorHealthState): VendorHealthMeta {
         case 'warning':
             return { label: 'Perlu perhatian', tone: 'warning' };
         case 'critical':
-            return { label: 'Tidak sehat', tone: 'danger' };
+            return { label: 'Kritis', tone: 'danger' };
         case 'disabled':
             return { label: 'Dinonaktifkan', tone: 'neutral' };
         default:

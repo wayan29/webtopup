@@ -528,9 +528,17 @@ pub(super) async fn build_vendor_realtime_payload(
     })
 }
 
+fn balance_probe_allowed(vendor: Option<&Document>, configured: bool) -> bool {
+    configured
+        && vendor
+            .and_then(|document| document.get_bool("status").ok())
+            .unwrap_or(true)
+}
+
 async fn digiflazz_health_balance(vendor: Option<&Document>) -> Option<(bool, Value, String)> {
     let credentials = digiflazz_credentials(vendor);
-    if credentials.username.is_empty() || credentials.secret.is_empty() {
+    let configured = !credentials.username.is_empty() && !credentials.secret.is_empty();
+    if !balance_probe_allowed(vendor, configured) {
         return None;
     }
     match fetch_digiflazz_balance_with_base_url(
@@ -552,7 +560,8 @@ async fn digiflazz_health_balance(vendor: Option<&Document>) -> Option<(bool, Va
 
 async fn tokovoucher_health_balance(vendor: Option<&Document>) -> Option<(bool, Value, String)> {
     let credentials = tokovoucher_credentials(vendor);
-    if credentials.username.is_empty() || credentials.secret.is_empty() {
+    let configured = !credentials.username.is_empty() && !credentials.secret.is_empty();
+    if !balance_probe_allowed(vendor, configured) {
         return None;
     }
     match fetch_tokovoucher_balance_with_base_url(
@@ -1172,6 +1181,13 @@ mod tests {
         assert!(csv.contains("SNAPSHOT_PERSISTENCE_FAILED"));
         assert!(!csv.contains("password"));
         assert!(!csv.contains("apiKey"));
+    }
+
+    #[test]
+    fn disabled_vendor_does_not_allow_a_balance_probe() {
+        let vendor = doc! { "status": false, "config": { "username": "fixture", "apiKey": "fixture" } };
+        assert!(!balance_probe_allowed(Some(&vendor), true));
+        assert!(balance_probe_allowed(Some(&doc! { "status": true }), true));
     }
 
     #[test]

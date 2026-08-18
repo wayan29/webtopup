@@ -398,7 +398,7 @@ fn vendor_balance_upstream_error(message: &'static str) -> Response {
         StatusCode::BAD_GATEWAY,
         Json(VendorBalanceErrorResponse {
             message: message.to_string(),
-            balance: 0,
+            balance: None,
         }),
     )
         .into_response()

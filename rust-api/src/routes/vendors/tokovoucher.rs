@@ -227,7 +227,7 @@ pub async fn tokovoucher_balance(
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(VendorBalanceErrorResponse {
                 message,
-                balance: 0,
+                balance: None,
             }),
         )
             .into_response(),
