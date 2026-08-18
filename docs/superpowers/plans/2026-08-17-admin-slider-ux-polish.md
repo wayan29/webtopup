@@ -51,7 +51,7 @@
 - Produces: `ADMIN_MENU_NAME_ALIASES` entries `Slider → Slider Beranda`, `Vouchers → Kampanye`, and `Laporan Promo → Kampanye`.
 - Consumes: `ADMIN_DEFAULT_MENU_ORDER` and `ADMIN_NAV_BLUEPRINT` from `adminNav.ts`.
 
-- [ ] **Step 1: Add failing tests for unique paths, canonical campaign locations, label migration, and deduplication**
+- [x] **Step 1: Add failing tests for unique paths, canonical campaign locations, label migration, and deduplication**
 
 Append focused tests to `client/src/lib/adminNav.test.ts`:
 
@@ -106,7 +106,7 @@ test('legacy Slider and campaign preferences migrate without duplicate menu name
 });
 ```
 
-- [ ] **Step 2: Run the navigation tests to verify RED**
+- [x] **Step 2: Run the navigation tests to verify RED**
 
 Run:
 
@@ -116,7 +116,7 @@ node --import tsx --test client/src/lib/adminNav.test.ts
 
 Expected: FAIL because duplicate route declarations remain, `Slider Beranda` aliases are absent, and the exported normalizer functions do not exist.
 
-- [ ] **Step 3: Implement canonical menu entries and pure normalizers**
+- [x] **Step 3: Implement canonical menu entries and pure normalizers**
 
 In `client/src/lib/adminNav.ts`:
 
@@ -192,7 +192,7 @@ normalizeAdminPinnedMenus(storedPinned, MAX_PINNED_MENUS)
 
 Do not change favorite rendering: `unpinnedNavItems` must continue removing pinned entries from the regular list.
 
-- [ ] **Step 4: Run focused tests and client build to verify GREEN**
+- [x] **Step 4: Run focused tests and client build to verify GREEN**
 
 Run:
 
@@ -204,7 +204,7 @@ git diff --check
 
 Expected: all tests PASS, client build exits 0, and no whitespace errors.
 
-- [ ] **Step 5: Commit the canonical navigation checkpoint**
+- [x] **Step 5: Commit the canonical navigation checkpoint**
 
 ```bash
 git add client/src/lib/adminNav.ts client/src/lib/adminNav.test.ts client/src/layouts/AdminLayout.tsx
@@ -228,7 +228,7 @@ git commit -m "fix: remove duplicate admin campaign destinations"
 - Produces: `formatArchivedMeta(slider: SliderAdminItem): string | null`
 - Consumes: `SliderAdminItem` and `SliderLimits` from `client/src/lib/sliderManagement.ts`.
 
-- [ ] **Step 1: Write failing pure presentation tests**
+- [x] **Step 1: Write failing pure presentation tests**
 
 Create `client/src/lib/sliderPresentation.test.ts`:
 
@@ -284,7 +284,7 @@ test('archive metadata is shown only when a valid archive timestamp exists', () 
 });
 ```
 
-- [ ] **Step 2: Run the pure tests to verify RED**
+- [x] **Step 2: Run the pure tests to verify RED**
 
 ```bash
 node --import tsx --test client/src/lib/sliderPresentation.test.ts
@@ -292,7 +292,7 @@ node --import tsx --test client/src/lib/sliderPresentation.test.ts
 
 Expected: FAIL with module-not-found for `sliderPresentation.ts`.
 
-- [ ] **Step 3: Implement the pure presentation module**
+- [x] **Step 3: Implement the pure presentation module**
 
 Create `client/src/lib/sliderPresentation.ts`:
 
@@ -339,7 +339,7 @@ export const formatArchivedMeta = (slider: SliderAdminItem) => {
 
 Keep formatting pure and independent from React/Axios/browser globals.
 
-- [ ] **Step 4: Run pure tests to verify GREEN**
+- [x] **Step 4: Run pure tests to verify GREEN**
 
 ```bash
 node --import tsx --test client/src/lib/sliderPresentation.test.ts
@@ -348,7 +348,7 @@ git diff --check
 
 Expected: 4 tests PASS, no whitespace errors.
 
-- [ ] **Step 5: Commit the helper checkpoint**
+- [x] **Step 5: Commit the helper checkpoint**
 
 ```bash
 git add client/src/lib/sliderPresentation.ts client/src/lib/sliderPresentation.test.ts
@@ -369,7 +369,7 @@ git commit -m "test: define admin slider presentation contracts"
 - Preserves: `ParsedSliderAdminSnapshot`, `SliderIntent`, `createSliderRequest`, `useStepUpOrchestration`, and all existing mutation endpoints.
 - Produces UI: current summary (`Revisi`, `Slider saat ini`, `Kapasitas total`, `Kapasitas aktif`) and archive summary (`Revisi`, `Total arsip`).
 
-- [ ] **Step 1: Change source-contract assertions first so they fail against the old UI**
+- [x] **Step 1: Change source-contract assertions first so they fail against the old UI**
 
 Update `slider administration uses the revisioned lifecycle and accessible state contracts` in `tools/dev-verification/unit/adminPageChrome.test.ts` to require the new copy and reject old mixed copy:
 
@@ -388,7 +388,7 @@ assert.doesNotMatch(sliders, /Snapshot baca saja/);
 
 Keep every existing safety assertion for endpoints, `SLIDER_VERSION_CONFLICT`, `SLIDER_COMMIT_UNKNOWN`, no hard delete, dialogs, rollback, and accessible action names.
 
-- [ ] **Step 2: Run the source-contract test to verify RED**
+- [x] **Step 2: Run the source-contract test to verify RED**
 
 ```bash
 node --import tsx --test tools/dev-verification/unit/adminPageChrome.test.ts
@@ -396,7 +396,7 @@ node --import tsx --test tools/dev-verification/unit/adminPageChrome.test.ts
 
 Expected: FAIL because old summary/status copy remains and helpers are not consumed.
 
-- [ ] **Step 3: Implement view-specific filtering, labels, metadata, and summaries**
+- [x] **Step 3: Implement view-specific filtering, labels, metadata, and summaries**
 
 In `Sliders.tsx`:
 
@@ -447,7 +447,7 @@ Exact archive copy:
 
 Do not modify fetch behavior: both current and archive snapshots are still loaded initially and by global refresh.
 
-- [ ] **Step 4: Run source contracts, helper tests, and build to verify GREEN**
+- [x] **Step 4: Run source contracts, helper tests, and build to verify GREEN**
 
 ```bash
 node --import tsx --test \
@@ -459,7 +459,7 @@ git diff --check
 
 Expected: tests PASS and build exits 0.
 
-- [ ] **Step 5: Commit view semantics**
+- [x] **Step 5: Commit view semantics**
 
 ```bash
 git add client/src/pages/admin/Sliders.tsx tools/dev-verification/unit/adminPageChrome.test.ts
@@ -480,7 +480,7 @@ git commit -m "fix: distinguish current and archived slider views"
 - Preserves: global `admin:refresh-current-page` listener, mutation intent/replay identity, dialog focus behavior, keyboard sorting, and step-up retry.
 - Produces: one visible refresh button per Slider route (the global header button), tab/tabpanel relationships, predictable empty-state CTAs, and Indonesian operational copy.
 
-- [ ] **Step 1: Add failing source-contract assertions for one refresh path, tab semantics, capacity guard, mobile order, and Indonesian copy**
+- [x] **Step 1: Add failing source-contract assertions for one refresh path, tab semantics, capacity guard, mobile order, and Indonesian copy**
 
 Add/replace assertions in `adminPageChrome.test.ts`:
 
@@ -503,7 +503,7 @@ assert.doesNotMatch(sliders, /Move Up|Move Down|Load Latest Snapshot|Open Audit/
 
 The `/> Segarkan</` rejection targets page-local text; `AdminLayout.tsx` retains the global refresh.
 
-- [ ] **Step 2: Run source contract to verify RED**
+- [x] **Step 2: Run source contract to verify RED**
 
 ```bash
 node --import tsx --test tools/dev-verification/unit/adminPageChrome.test.ts
@@ -511,7 +511,7 @@ node --import tsx --test tools/dev-verification/unit/adminPageChrome.test.ts
 
 Expected: FAIL on old page-local refresh, missing tabpanel semantics, old English labels, and absent capacity/position helpers.
 
-- [ ] **Step 3: Remove duplicate page refresh and keep the global event path**
+- [x] **Step 3: Remove duplicate page refresh and keep the global event path**
 
 In `Sliders.tsx`:
 
@@ -527,7 +527,7 @@ window.addEventListener('admin:refresh-current-page', handler);
 
 The global header button in `AdminLayout.tsx` will now have accessible name `Segarkan Slider Beranda` because Task 1 changed route metadata.
 
-- [ ] **Step 4: Add the client-side active-capacity guard without weakening backend authority**
+- [x] **Step 4: Add the client-side active-capacity guard without weakening backend authority**
 
 Compute:
 
@@ -559,7 +559,7 @@ Disable the publish checkbox only when activation would add one active slot:
 
 Show `activeCapacityMessage` next to the checkbox. Existing active sliders (`editingBase.status === true`) remain editable and can be unpublished.
 
-- [ ] **Step 5: Add authoritative mobile position, tabpanel semantics, empty actions, and Indonesian copy**
+- [x] **Step 5: Add authoritative mobile position, tabpanel semantics, empty actions, and Indonesian copy**
 
 1. Replace mobile `index + 1 / total` with:
 
@@ -615,7 +615,7 @@ Internal action names and endpoint paths remain unchanged.
 - Current/archive with nonempty items but no filtered results: show **Hapus filter**, calling `resetFilters`.
 - Archive with zero items: show informational `Belum ada slider yang diarsipkan.` without a create CTA.
 
-- [ ] **Step 6: Run focused contracts and build to verify GREEN**
+- [x] **Step 6: Run focused contracts and build to verify GREEN**
 
 ```bash
 node --import tsx --test \
@@ -627,7 +627,7 @@ git diff --check
 
 Expected: all PASS, build exits 0, and no page-local refresh/old English action copy remains.
 
-- [ ] **Step 7: Commit control and accessibility polish**
+- [x] **Step 7: Commit control and accessibility polish**
 
 ```bash
 git add client/src/pages/admin/Sliders.tsx tools/dev-verification/unit/adminPageChrome.test.ts
@@ -647,7 +647,7 @@ git commit -m "feat: polish slider controls and accessibility"
 - Preserves: existing marked fixture cleanup, managed asset cleanup, revisioned create/publish/archive/restore, same-key step-up replay, conflict dialog, and desktop/mobile projects.
 - Produces: browser proof that one refresh, archive semantics, capacity guard, tabpanel semantics, and mobile order are correct.
 
-- [ ] **Step 1: Update existing assertions to the approved Indonesian copy**
+- [x] **Step 1: Update existing assertions to the approved Indonesian copy**
 
 In `sliders.spec.ts`, replace exact old names:
 
@@ -662,7 +662,7 @@ In `sliders.spec.ts`, replace exact old names:
 
 Keep backend response/status assertions and fixture cleanup unchanged.
 
-- [ ] **Step 2: Add browser assertions for the new navigation/view contracts before implementation is considered complete**
+- [x] **Step 2: Add browser assertions for the new navigation/view contracts before implementation is considered complete**
 
 After `page.goto('/admin/sliders')`, assert:
 
@@ -684,7 +684,7 @@ await expect(page.getByText('Total arsip', { exact: true })).toBeVisible();
 
 For mobile, assert `Naikkan`/`Turunkan` and authoritative order copy rather than filtered index.
 
-- [ ] **Step 3: Add a versioned full-active snapshot browser scenario**
+- [x] **Step 3: Add a versioned full-active snapshot browser scenario**
 
 Use Playwright route interception to return a valid writable current snapshot with:
 
@@ -718,7 +718,7 @@ await expect(page.getByRole('checkbox', { name: 'Publikasikan sebagai slider akt
 
 Then unroute and reload before continuing lifecycle mutations. This mock must never call a mutation endpoint.
 
-- [ ] **Step 4: Start the disposable stack for focused browser RED/GREEN verification**
+- [x] **Step 4: Start the disposable stack for focused browser RED/GREEN verification**
 
 Run from the repository root:
 
@@ -732,7 +732,7 @@ npm run dev-verify -- host-up-session-fault
 
 Expected: infrastructure healthy, exact DB `webtopup_task14_dev` seeded, host processes healthy.
 
-- [ ] **Step 5: Run focused desktop and mobile Slider browser tests**
+- [x] **Step 5: Run focused desktop and mobile Slider browser tests**
 
 ```bash
 npx playwright test \
@@ -746,7 +746,7 @@ npx playwright test \
 
 Expected: both projects PASS, including existing step-up retry, lifecycle, nested dialog, and conflict assertions.
 
-- [ ] **Step 6: Tear down and prove no disposable services remain**
+- [x] **Step 6: Tear down and prove no disposable services remain**
 
 ```bash
 npm run dev-verify -- host-down
@@ -756,7 +756,7 @@ npm run dev-verify -- infra-status
 
 Expected final status: `{"serviceCount":0}`.
 
-- [ ] **Step 7: Commit browser coverage**
+- [x] **Step 7: Commit browser coverage**
 
 ```bash
 git add tools/dev-verification/e2e/sliders.spec.ts
@@ -775,7 +775,7 @@ git commit -m "test: cover polished slider admin UX"
 - Consumes: complete UI/navigation implementation.
 - Produces: fresh local evidence that focused unit/build/browser checks and the full disposable verification matrix pass.
 
-- [ ] **Step 1: Run all focused pure/source tests**
+- [x] **Step 1: Run all focused pure/source tests**
 
 ```bash
 node --import tsx --test \
@@ -787,7 +787,7 @@ node --import tsx --test \
 
 Expected: all tests PASS with zero failures.
 
-- [ ] **Step 2: Run client build and diff validation**
+- [x] **Step 2: Run client build and diff validation**
 
 ```bash
 npm --prefix client run build
@@ -796,7 +796,7 @@ git diff --check
 
 Expected: TypeScript/Vite build exits 0 and no whitespace errors.
 
-- [ ] **Step 3: Run full disposable aggregate verification**
+- [x] **Step 3: Run full disposable aggregate verification**
 
 ```bash
 npm run dev-verify -- test
@@ -804,7 +804,7 @@ npm run dev-verify -- test
 
 Expected final result: `LOCAL DEV VERIFIED`. Do not accept a partial matrix or prior run as evidence.
 
-- [ ] **Step 4: Prove teardown after aggregate verification**
+- [x] **Step 4: Prove teardown after aggregate verification**
 
 ```bash
 npm run dev-verify -- down
@@ -813,7 +813,7 @@ npm run dev-verify -- status
 
 Expected: stopped disposable state and no host process manifest/services left running. If `test` already stopped the stack, `down` remains an idempotent proof step.
 
-- [ ] **Step 5: Inspect final repository state**
+- [x] **Step 5: Inspect final repository state**
 
 ```bash
 git status --short --branch
@@ -823,7 +823,7 @@ git log --oneline -8
 
 Expected: only intentional plan/spec documentation may remain uncommitted; implementation files are covered by checkpoint commits; no generated verification secrets/reports are staged.
 
-- [ ] **Step 6: Request independent read-only code review**
+- [x] **Step 6: Request independent read-only code review**
 
 Reviewer checklist:
 
@@ -839,7 +839,7 @@ Reviewer checklist:
 
 Any valid finding must be fixed with a focused RED/GREEN test and a separate checkpoint commit, followed by the affected focused commands again.
 
-- [ ] **Step 7: Present release handoff without deploying**
+- [x] **Step 7: Present release handoff without deploying**
 
 Report:
 
