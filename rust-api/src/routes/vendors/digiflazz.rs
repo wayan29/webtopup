@@ -24,7 +24,7 @@ use super::{
         send_digiflazz_transaction,
     },
     status_message,
-    types::VendorBalanceResponse,
+    types::{VendorBalanceErrorResponse, VendorBalanceResponse},
     unavailable, vendor_balance_bad_request,
 };
 
@@ -373,20 +373,35 @@ pub async fn digiflazz_balance(
         return vendor_balance_bad_request("Digiflazz credentials not configured");
     }
 
-    let balance = fetch_digiflazz_balance_with_base_url(
+    let balance = match fetch_digiflazz_balance_with_base_url(
         &credentials,
         &vendor
             .as_ref()
             .map(|vendor| vendor_base_url(vendor, "https://api.digiflazz.com/v1"))
             .unwrap_or_else(|| "https://api.digiflazz.com/v1".to_string()),
     )
-    .await;
+    .await
+    {
+        Ok(balance) => balance,
+        Err(_) => return vendor_balance_upstream_error("Digiflazz balance unavailable"),
+    };
     Json(VendorBalanceResponse {
         provider_field: "username",
         provider_value: short_mask(&credentials.username),
         balance,
     })
     .into_response()
+}
+
+fn vendor_balance_upstream_error(message: &'static str) -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(VendorBalanceErrorResponse {
+            message: message.to_string(),
+            balance: 0,
+        }),
+    )
+        .into_response()
 }
 
 fn build_digiflazz_pricelist_filter(query: &HashMap<String, String>) -> Document {

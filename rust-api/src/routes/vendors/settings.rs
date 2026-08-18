@@ -100,7 +100,15 @@ pub async fn save_digiflazz_settings(
         .as_ref()
         .map(|vendor| vendor_base_url(vendor, "https://api.digiflazz.com/v1"))
         .unwrap_or_else(|| "https://api.digiflazz.com/v1".to_string());
-    let balance = fetch_digiflazz_balance_with_base_url(&credentials, &base_url).await;
+    let balance = match fetch_digiflazz_balance_with_base_url(&credentials, &base_url).await {
+        Ok(balance) => balance,
+        Err(_) => {
+            return status_message(
+                axum::http::StatusCode::BAD_REQUEST,
+                "Failed to save settings. Check your credentials.",
+            )
+        }
+    };
 
     let vendor_id = if let Some(vendor) = vendor {
         let Ok(object_id) = vendor.get_object_id("_id") else {

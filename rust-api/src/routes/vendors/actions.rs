@@ -48,11 +48,22 @@ pub async fn test_vendor_connection(
     let vendor_name = read_string(&vendor, "name").to_lowercase();
     if vendor_name.contains("digiflazz") {
         let credentials = digiflazz_credentials(Some(&vendor));
-        let balance = fetch_digiflazz_balance_with_base_url(
+        let balance = match fetch_digiflazz_balance_with_base_url(
             &credentials,
             &vendor_base_url(&vendor, "https://api.digiflazz.com/v1"),
         )
-        .await;
+        .await
+        {
+            Ok(balance) => balance,
+            Err(message) => {
+                return Json(serde_json::json!({
+                    "success": false,
+                    "message": format!("Connection failed: {message}"),
+                    "balance": null
+                }))
+                .into_response();
+            }
+        };
         return Json(serde_json::json!({
             "success": true,
             "message": "Connection successful",
@@ -74,7 +85,7 @@ pub async fn test_vendor_connection(
                 return Json(serde_json::json!({
                     "success": false,
                     "message": format!("Connection failed: {message}"),
-                    "balance": 0
+                    "balance": null
                 }))
                 .into_response();
             }

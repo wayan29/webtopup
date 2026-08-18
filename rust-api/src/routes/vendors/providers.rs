@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use mongodb::{
     bson::{doc, Bson, DateTime, Document},
     Database,
@@ -17,10 +19,46 @@ use super::{
     types::{TokovoucherAccess, VendorCredentials},
 };
 
+pub(in crate::routes::vendors) const PROVIDER_HEALTH_TIMEOUT: Duration = Duration::from_secs(8);
+
+fn request_failure_message(error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        "provider request timeout".to_string()
+    } else {
+        "provider request failed".to_string()
+    }
+}
+
+fn numeric_balance(value: Option<&Value>) -> Result<Value, String> {
+    let Some(value) = value else {
+        return Err("provider balance response invalid".into());
+    };
+    let valid = value
+        .as_i64()
+        .map(|number| number >= 0)
+        .unwrap_or(false)
+        || value.as_u64().is_some()
+        || value
+            .as_f64()
+            .map(|number| number.is_finite() && number >= 0.0)
+            .unwrap_or(false);
+    valid
+        .then(|| value.clone())
+        .ok_or_else(|| "provider balance response invalid".into())
+}
+
 pub(in crate::routes::vendors) async fn fetch_digiflazz_balance_with_base_url(
     credentials: &VendorCredentials,
     base_url: &str,
-) -> Value {
+) -> Result<Value, String> {
+    fetch_digiflazz_balance_with_timeout(credentials, base_url, PROVIDER_HEALTH_TIMEOUT).await
+}
+
+async fn fetch_digiflazz_balance_with_timeout(
+    credentials: &VendorCredentials,
+    base_url: &str,
+    timeout: Duration,
+) -> Result<Value, String> {
     let signature = format!(
         "{:x}",
         md5::compute(format!(
@@ -34,22 +72,24 @@ pub(in crate::routes::vendors) async fn fetch_digiflazz_balance_with_base_url(
         "sign": signature
     });
 
-    let Ok(response) = reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|_| "provider request failed".to_string())?;
+    let response = client
         .post(format!("{}/cek-saldo", base_url.trim_end_matches('/')))
         .json(&payload)
         .send()
         .await
-    else {
-        return Value::from(0);
-    };
-
-    let Ok(body) = response.json::<Value>().await else {
-        return Value::from(0);
-    };
-
-    body.pointer("/data/deposit")
-        .cloned()
-        .unwrap_or(Value::from(0))
+        .map_err(|error| request_failure_message(&error))?;
+    if !response.status().is_success() {
+        return Err("provider HTTP status".to_string());
+    }
+    let body = response
+        .json::<Value>()
+        .await
+        .map_err(|_| "provider balance response invalid".to_string())?;
+    numeric_balance(body.pointer("/data/deposit"))
 }
 
 pub(in crate::routes::vendors) struct DigiflazzTransactionResult {
@@ -622,11 +662,23 @@ pub(in crate::routes::vendors) async fn fetch_tokovoucher_balance_with_base_url(
     credentials: &VendorCredentials,
     base_url: &str,
 ) -> Result<Value, String> {
+    fetch_tokovoucher_balance_with_timeout(credentials, base_url, PROVIDER_HEALTH_TIMEOUT).await
+}
+
+async fn fetch_tokovoucher_balance_with_timeout(
+    credentials: &VendorCredentials,
+    base_url: &str,
+    timeout: Duration,
+) -> Result<Value, String> {
     let signature = format!(
         "{:x}",
         md5::compute(format!("{}:{}", credentials.username, credentials.secret))
     );
-    let response = reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .map_err(|_| "provider request failed".to_string())?;
+    let response = client
         .get(format!("{}/member", base_url.trim_end_matches('/')))
         .query(&[
             ("member_code", credentials.username.as_str()),
@@ -634,20 +686,15 @@ pub(in crate::routes::vendors) async fn fetch_tokovoucher_balance_with_base_url(
         ])
         .send()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| request_failure_message(&error))?;
+    if !response.status().is_success() {
+        return Err("provider HTTP status".to_string());
+    }
     let body = response
         .json::<Value>()
         .await
-        .map_err(|error| error.to_string())?;
-
-    if let Some(balance) = body.pointer("/data/saldo") {
-        return Ok(balance.clone());
-    }
-    if let Some(error_message) = body.get("error_msg").and_then(Value::as_str) {
-        return Err(error_message.to_string());
-    }
-
-    Ok(Value::from(0))
+        .map_err(|_| "provider balance response invalid".to_string())?;
+    numeric_balance(body.pointer("/data/saldo"))
 }
 
 pub(in crate::routes::vendors) struct TokovoucherProductLookupResult {
@@ -870,4 +917,108 @@ pub(super) async fn fetch_tokovoucher_list(
             .unwrap_or_default();
     }
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn serve_once(response: &'static str, delay: Duration) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            std::thread::sleep(delay);
+            let _ = stream.write_all(response.as_bytes());
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn digiflazz_balance_probe_rejects_missing_balance_and_times_out() {
+        let credentials = VendorCredentials {
+            username: "fixture".into(),
+            secret: "fixture".into(),
+        };
+        let malformed = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":{}}",
+            Duration::ZERO,
+        );
+        assert!(
+            fetch_digiflazz_balance_with_timeout(&credentials, &malformed, Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+
+        let slow = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 28\r\nConnection: close\r\n\r\n{\"data\":{\"deposit\":1000000}}",
+            Duration::from_millis(100),
+        );
+        let error =
+            fetch_digiflazz_balance_with_timeout(&credentials, &slow, Duration::from_millis(10))
+                .await
+                .unwrap_err();
+        assert!(error.contains("timeout"));
+    }
+
+    #[tokio::test]
+    async fn both_provider_probes_accept_numeric_balances_only() {
+        let credentials = VendorCredentials {
+            username: "fixture".into(),
+            secret: "fixture".into(),
+        };
+        let digiflazz = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 28\r\nConnection: close\r\n\r\n{\"data\":{\"deposit\":1000000}}",
+            Duration::ZERO,
+        );
+        assert_eq!(
+            fetch_digiflazz_balance_with_timeout(&credentials, &digiflazz, Duration::from_secs(1))
+                .await
+                .unwrap(),
+            serde_json::json!(1000000),
+        );
+
+        let tokovoucher = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 26\r\nConnection: close\r\n\r\n{\"data\":{\"saldo\":2000000}}",
+            Duration::ZERO,
+        );
+        assert_eq!(
+            fetch_tokovoucher_balance_with_timeout(
+                &credentials,
+                &tokovoucher,
+                Duration::from_secs(1)
+            )
+            .await
+            .unwrap(),
+            serde_json::json!(2000000),
+        );
+
+        let invalid = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 30\r\nConnection: close\r\n\r\n{\"data\":{\"deposit\":\"unknown\"}}",
+            Duration::ZERO,
+        );
+        assert!(
+            fetch_digiflazz_balance_with_timeout(&credentials, &invalid, Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+
+        let rejected = serve_once(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno",
+            Duration::ZERO,
+        );
+        assert!(
+            fetch_tokovoucher_balance_with_timeout(
+                &credentials,
+                &rejected,
+                Duration::from_secs(1)
+            )
+            .await
+            .is_err()
+        );
+    }
 }

@@ -333,14 +333,18 @@ async fn digiflazz_health_balance(vendor: Option<&Document>) -> (bool, Value, St
             "Credentials belum dikonfigurasi".to_string(),
         );
     }
-    let balance = fetch_digiflazz_balance_with_base_url(
+    let balance = match fetch_digiflazz_balance_with_base_url(
         &credentials,
         &vendor
             .map(|vendor| vendor_base_url(vendor, "https://api.digiflazz.com/v1"))
             .unwrap_or_else(|| "https://api.digiflazz.com/v1".to_string()),
     )
-    .await;
-    (true, balance, "OK".to_string())
+    .await
+    {
+        Ok(balance) => (true, balance, "OK".to_string()),
+        Err(message) => (false, Value::Null, message),
+    };
+    balance
 }
 
 async fn tokovoucher_health_balance(vendor: Option<&Document>) -> (bool, Value, String) {
