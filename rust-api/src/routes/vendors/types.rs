@@ -250,6 +250,19 @@ pub(super) struct VendorCredentials {
     pub(super) secret: String,
 }
 
+#[derive(Serialize)]
+pub(super) struct VendorRealtimeHealthResponse {
+    pub(super) ok: bool,
+    pub(super) partial: bool,
+    pub(super) issues: Vec<VendorHealthIssue>,
+    #[serde(rename = "snapshotPersisted")]
+    pub(super) snapshot_persisted: bool,
+    #[serde(rename = "generatedAt")]
+    pub(super) generated_at: String,
+    pub(super) vendors: Vec<VendorRealtimeHealthItem>,
+    pub(super) seller: SellerHealthSummary,
+}
+
 pub(super) struct TokovoucherAccess {
     pub(super) credentials: VendorCredentials,
     pub(super) base_url: String,

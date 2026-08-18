@@ -21,17 +21,14 @@ use crate::{
 };
 
 use super::{
-    config::{
-        digiflazz_credentials, find_vendor_by_name, has_any_non_empty_value,
-        tokovoucher_credentials, vendor_base_url,
-    },
+    config::{digiflazz_credentials, has_any_non_empty_value, tokovoucher_credentials, vendor_base_url},
     internal_error,
     json::{date_key, date_time_to_mongoose_string},
     providers::{fetch_digiflazz_balance_with_base_url, fetch_tokovoucher_balance_with_base_url},
     types::{
         SellerHealthSummary, TransactionStats, VendorHealthIssue,
-        VendorHealthSnapshotResponse, VendorRealtimeHealthItem, VendorSnapshot,
-        VendorSnapshotTotals, VendorStatsResponse, WebhookStats,
+        VendorHealthSnapshotResponse, VendorRealtimeHealthItem, VendorRealtimeHealthResponse,
+        VendorSnapshot, VendorSnapshotTotals, VendorStatsResponse, WebhookStats,
     },
     unavailable,
 };
@@ -172,13 +169,26 @@ pub async fn vendor_health(
     let Some(client) = &state.mongo_client else {
         return unavailable();
     };
-    match build_vendor_health_payload(client, &state.mongo_db).await {
-        Ok(payload) => {
-            persist_vendor_health_snapshot(&client.database(&state.mongo_db), &payload).await;
-            Json(payload).into_response()
-        }
-        Err(_) => internal_error(),
+    let mut payload = match build_vendor_realtime_payload(client, &state.mongo_db).await {
+        Ok(payload) => payload,
+        Err(_) => return unavailable(),
+    };
+    payload.snapshot_persisted = true;
+    let db = client.database(&state.mongo_db);
+    let persistence = persist_vendor_health_snapshot(&db, &payload).await;
+    let (partial, persisted, issues) =
+        apply_persistence_outcome(persistence.is_ok(), payload.issues.clone());
+    if persistence.is_err() {
+        tracing::warn!(
+            code = "SNAPSHOT_PERSISTENCE_FAILED",
+            source = "mongodb.settings",
+            "vendor health snapshot persistence failed"
+        );
     }
+    payload.partial = partial;
+    payload.snapshot_persisted = persisted;
+    payload.issues = issues;
+    Json(payload).into_response()
 }
 
 pub async fn export_vendor_health_csv(
@@ -195,12 +205,29 @@ pub async fn export_vendor_health_csv(
     let Some(client) = &state.mongo_client else {
         return unavailable();
     };
-    let payload = match build_vendor_health_payload(client, &state.mongo_db).await {
+    let mut payload = match build_vendor_realtime_payload(client, &state.mongo_db).await {
         Ok(payload) => payload,
-        Err(_) => return internal_error(),
+        Err(_) => return unavailable(),
     };
-    persist_vendor_health_snapshot(&client.database(&state.mongo_db), &payload).await;
-    let csv = build_vendor_health_csv(&payload);
+    payload.snapshot_persisted = true;
+    let db = client.database(&state.mongo_db);
+    let persistence = persist_vendor_health_snapshot(&db, &payload).await;
+    let (partial, persisted, issues) =
+        apply_persistence_outcome(persistence.is_ok(), payload.issues.clone());
+    if persistence.is_err() {
+        tracing::warn!(
+            code = "SNAPSHOT_PERSISTENCE_FAILED",
+            source = "mongodb.settings",
+            "vendor health snapshot persistence failed"
+        );
+    }
+    payload.partial = partial;
+    payload.snapshot_persisted = persisted;
+    payload.issues = issues;
+    let Ok(value) = serde_json::to_value(&payload) else {
+        return internal_error();
+    };
+    let csv = build_vendor_health_csv(&value);
     let filename = format!("vendor-health-{}.csv", date_key(DateTime::now()));
     let mut response_headers = HeaderMap::new();
     response_headers.insert(
@@ -342,20 +369,134 @@ pub(super) async fn transaction_stats_today(
     Ok(stats)
 }
 
-pub(super) async fn build_vendor_health_payload(
+async fn load_vendor_health_documents(
+    db: &mongodb::Database,
+) -> mongodb::error::Result<(Option<Document>, Option<Document>)> {
+    let mut cursor = db.collection::<Document>("vendors").find(doc! {}).await?;
+    let mut documents = Vec::new();
+    while let Some(document) = cursor.try_next().await? {
+        documents.push(document);
+    }
+    let digiflazz = documents
+        .iter()
+        .find(|document| read_string(document, "name").to_lowercase().contains("digiflazz"))
+        .cloned();
+    let tokovoucher = documents
+        .iter()
+        .find(|document| {
+            read_string(document, "name")
+                .to_lowercase()
+                .contains("tokovoucher")
+        })
+        .cloned();
+    Ok((digiflazz, tokovoucher))
+}
+
+fn realtime_issue_set(
+    transaction_stats_available: bool,
+    webhook_stats_available: bool,
+    last_webhook_available: bool,
+    seller_available: bool,
+    digiflazz_balance_available: bool,
+    tokovoucher_balance_available: bool,
+) -> Vec<VendorHealthIssue> {
+    let mut issues = Vec::new();
+    if !transaction_stats_available {
+        issues.push(VendorHealthIssue::new(
+            "TRANSACTION_STATS_UNAVAILABLE",
+            "mongodb.transactions",
+        ));
+    }
+    if !webhook_stats_available {
+        issues.push(VendorHealthIssue::new(
+            "WEBHOOK_STATS_UNAVAILABLE",
+            "mongodb.webhooks",
+        ));
+    }
+    if !last_webhook_available {
+        issues.push(VendorHealthIssue::new(
+            "LAST_WEBHOOK_UNAVAILABLE",
+            "mongodb.webhooks.last",
+        ));
+    }
+    if !seller_available {
+        issues.push(VendorHealthIssue::new(
+            "SELLER_SUMMARY_UNAVAILABLE",
+            "mongodb.seller",
+        ));
+    }
+    if !digiflazz_balance_available {
+        issues.push(VendorHealthIssue::new(
+            "DIGIFLAZZ_BALANCE_UNAVAILABLE",
+            "provider.digiflazz",
+        ));
+    }
+    if !tokovoucher_balance_available {
+        issues.push(VendorHealthIssue::new(
+            "TOKOVOUCHER_BALANCE_UNAVAILABLE",
+            "provider.tokovoucher",
+        ));
+    }
+    issues
+}
+
+fn apply_persistence_outcome(
+    persisted: bool,
+    mut issues: Vec<VendorHealthIssue>,
+) -> (bool, bool, Vec<VendorHealthIssue>) {
+    if !persisted {
+        issues.insert(
+            0,
+            VendorHealthIssue::new("SNAPSHOT_PERSISTENCE_FAILED", "mongodb.settings"),
+        );
+    }
+    let partial = !issues.is_empty();
+    (partial, persisted, issues)
+}
+
+pub(super) async fn build_vendor_realtime_payload(
     client: &mongodb::Client,
     db_name: &str,
-) -> mongodb::error::Result<Value> {
+) -> mongodb::error::Result<VendorRealtimeHealthResponse> {
     let db = client.database(db_name);
-    let digiflazz_vendor = find_vendor_by_name(client, db_name, "digiflazz").await;
-    let tokovoucher_vendor = find_vendor_by_name(client, db_name, "tokovoucher").await;
-    let tx_stats = transaction_stats_today(&db).await.unwrap_or_default();
-    let webhook_stats = webhook_stats_today(&db).await.unwrap_or_default();
-    let last_webhooks = last_webhook_stats(&db).await.unwrap_or_default();
-    let seller = seller_health_summary(&db).await.unwrap_or_default();
+    let (digiflazz_vendor, tokovoucher_vendor) = load_vendor_health_documents(&db).await?;
+
+    let (tx_stats, tx_available) = match transaction_stats_today(&db).await {
+        Ok(stats) => (stats, true),
+        Err(_) => (HashMap::new(), false),
+    };
+    let (webhook_stats, webhook_available) = match webhook_stats_today(&db).await {
+        Ok(stats) => (stats, true),
+        Err(_) => (HashMap::new(), false),
+    };
+    let (last_webhooks, last_webhook_available) = match last_webhook_stats(&db).await {
+        Ok(stats) => (stats, true),
+        Err(_) => (HashMap::new(), false),
+    };
+    let (seller, seller_available) = match seller_health_summary(&db).await {
+        Ok(summary) => (summary, true),
+        Err(_) => (SellerHealthSummary::default(), false),
+    };
+
     let digiflazz_balance = digiflazz_health_balance(digiflazz_vendor.as_ref()).await;
     let tokovoucher_balance = tokovoucher_health_balance(tokovoucher_vendor.as_ref()).await;
+    let digiflazz_available = digiflazz_balance
+        .as_ref()
+        .map(|(ok, _, _)| *ok)
+        .unwrap_or(true);
+    let tokovoucher_available = tokovoucher_balance
+        .as_ref()
+        .map(|(ok, _, _)| *ok)
+        .unwrap_or(true);
 
+    let issues = realtime_issue_set(
+        tx_available,
+        webhook_available,
+        last_webhook_available,
+        seller_available,
+        digiflazz_available,
+        tokovoucher_available,
+    );
     let vendors = vec![
         build_realtime_vendor_health(
             "digiflazz",
@@ -376,23 +517,23 @@ pub(super) async fn build_vendor_health_payload(
             &last_webhooks,
         ),
     ];
-    Ok(serde_json::json!({
-        "generatedAt": date_time_to_mongoose_string(DateTime::now()),
-        "vendors": vendors,
-        "seller": seller
-    }))
+    Ok(VendorRealtimeHealthResponse {
+        ok: true,
+        partial: !issues.is_empty(),
+        issues,
+        snapshot_persisted: false,
+        generated_at: date_time_to_mongoose_string(DateTime::now()),
+        vendors,
+        seller,
+    })
 }
 
-async fn digiflazz_health_balance(vendor: Option<&Document>) -> (bool, Value, String) {
+async fn digiflazz_health_balance(vendor: Option<&Document>) -> Option<(bool, Value, String)> {
     let credentials = digiflazz_credentials(vendor);
     if credentials.username.is_empty() || credentials.secret.is_empty() {
-        return (
-            false,
-            Value::from(0),
-            "Credentials belum dikonfigurasi".to_string(),
-        );
+        return None;
     }
-    let balance = match fetch_digiflazz_balance_with_base_url(
+    match fetch_digiflazz_balance_with_base_url(
         &credentials,
         &vendor
             .map(|vendor| vendor_base_url(vendor, "https://api.digiflazz.com/v1"))
@@ -400,20 +541,19 @@ async fn digiflazz_health_balance(vendor: Option<&Document>) -> (bool, Value, St
     )
     .await
     {
-        Ok(balance) => (true, balance, "OK".to_string()),
-        Err(message) => (false, Value::Null, message),
-    };
-    balance
+        Ok(balance) => Some((true, balance, "OK".to_string())),
+        Err(_) => Some((
+            false,
+            Value::Null,
+            "Pemeriksaan saldo tidak tersedia".to_string(),
+        )),
+    }
 }
 
-async fn tokovoucher_health_balance(vendor: Option<&Document>) -> (bool, Value, String) {
+async fn tokovoucher_health_balance(vendor: Option<&Document>) -> Option<(bool, Value, String)> {
     let credentials = tokovoucher_credentials(vendor);
     if credentials.username.is_empty() || credentials.secret.is_empty() {
-        return (
-            false,
-            Value::from(0),
-            "Credentials belum dikonfigurasi".to_string(),
-        );
+        return None;
     }
     match fetch_tokovoucher_balance_with_base_url(
         &credentials,
@@ -423,19 +563,23 @@ async fn tokovoucher_health_balance(vendor: Option<&Document>) -> (bool, Value, 
     )
     .await
     {
-        Ok(balance) => (true, balance, "OK".to_string()),
-        Err(message) => (false, Value::from(0), message),
+        Ok(balance) => Some((true, balance, "OK".to_string())),
+        Err(_) => Some((
+            false,
+            Value::Null,
+            "Pemeriksaan saldo tidak tersedia".to_string(),
+        )),
     }
 }
 
-async fn persist_vendor_health_snapshot(db: &mongodb::Database, payload: &Value) {
+async fn persist_vendor_health_snapshot(
+    db: &mongodb::Database,
+    payload: &VendorRealtimeHealthResponse,
+) -> mongodb::error::Result<()> {
     let now = DateTime::now();
-    let Ok(value) = to_bson(payload) else {
-        return;
-    };
+    let value = to_bson(payload).map_err(mongodb::error::Error::custom)?;
 
-    let _ = db
-        .collection::<Document>("settings")
+    db.collection::<Document>("settings")
         .update_one(
             doc! { "key": "vendorHealthSnapshot" },
             doc! {
@@ -448,14 +592,15 @@ async fn persist_vendor_health_snapshot(db: &mongodb::Database, payload: &Value)
             },
         )
         .upsert(true)
-        .await;
+        .await
+        .map(|_| ())
 }
 
 fn build_realtime_vendor_health(
     key: &str,
     label: &str,
     vendor: Option<&Document>,
-    balance_result: (bool, Value, String),
+    balance_result: Option<(bool, Value, String)>,
     tx_stats: &HashMap<String, TransactionStats>,
     webhook_stats: &HashMap<String, WebhookStats>,
     last_webhooks: &HashMap<String, WebhookStats>,
@@ -478,7 +623,11 @@ fn build_realtime_vendor_health(
     let low_balance_threshold = vendor
         .map(|vendor| read_i64(vendor, "lowBalanceThreshold"))
         .unwrap_or(0);
-    let (balance_ok, balance, balance_message) = balance_result;
+    let (balance_ok, balance, balance_message) = balance_result.unwrap_or((
+        false,
+        Value::Null,
+        "Credentials belum dikonfigurasi".to_string(),
+    ));
     let balance_number = json_i64(&balance);
     let low_balance =
         balance_ok && low_balance_threshold > 0 && balance_number <= low_balance_threshold;
@@ -680,44 +829,100 @@ pub(super) fn build_vendor_health_csv(payload: &Value) -> String {
         "Last Webhook At",
         "Last Webhook Status",
         "Last Webhook Message",
+        "Partial",
+        "Snapshot Persisted",
+        "Issue Codes",
         "Generated At",
     ];
     let generated_at = payload
         .get("generatedAt")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let partial = yes_no(json_bool(payload, "partial"));
+    let snapshot_persisted = yes_no(json_bool(payload, "snapshotPersisted"));
+    let issue_codes = payload
+        .get("issues")
+        .and_then(Value::as_array)
+        .map(|issues| {
+            issues
+                .iter()
+                .filter_map(|issue| issue.get("code").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(";")
+        })
+        .unwrap_or_default();
     let mut rows = vec![header
         .into_iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>()];
-    if let Some(vendors) = payload.get("vendors").and_then(Value::as_array) {
-        for vendor in vendors {
-            rows.push(vec![
-                json_string(vendor, "label"),
-                json_string(vendor, "health"),
-                yes_no(json_bool(vendor, "configured")),
-                yes_no(json_bool(vendor, "active")),
-                json_value_string(vendor.get("balance")),
-                yes_no(json_bool(vendor, "balanceOk")),
-                json_value_string(vendor.get("lowBalanceThreshold")),
-                yes_no(json_bool(vendor, "lowBalance")),
-                json_string(vendor, "balanceMessage"),
-                nested_json_value_string(vendor, "transactionsToday", "total"),
-                nested_json_value_string(vendor, "transactionsToday", "success"),
-                nested_json_value_string(vendor, "transactionsToday", "failed"),
-                nested_json_value_string(vendor, "transactionsToday", "pending"),
-                nested_json_value_string(vendor, "transactionsToday", "successRate"),
-                nested_json_value_string(vendor, "transactionsToday", "amountTotal"),
-                nested_json_value_string(vendor, "webhookToday", "total"),
-                nested_json_value_string(vendor, "webhookToday", "rejected"),
-                nested_json_value_string(vendor, "webhookToday", "failed"),
-                nested_json_value_string(vendor, "webhookToday", "delivered"),
-                nested_json_value_string(vendor, "webhookToday", "lastAt"),
-                nested_json_value_string(vendor, "webhookToday", "lastStatus"),
-                nested_json_value_string(vendor, "webhookToday", "lastMessage"),
-                generated_at.to_string(),
-            ]);
-        }
+    let vendors = payload.get("vendors").and_then(Value::as_array);
+    let vendor_rows = vendors.map(|vendors| {
+        vendors
+            .iter()
+            .map(|vendor| {
+                vec![
+                    json_string(vendor, "label"),
+                    json_string(vendor, "health"),
+                    yes_no(json_bool(vendor, "configured")),
+                    yes_no(json_bool(vendor, "active")),
+                    json_value_string(vendor.get("balance")),
+                    yes_no(json_bool(vendor, "balanceOk")),
+                    json_value_string(vendor.get("lowBalanceThreshold")),
+                    yes_no(json_bool(vendor, "lowBalance")),
+                    json_string(vendor, "balanceMessage"),
+                    nested_json_value_string(vendor, "transactionsToday", "total"),
+                    nested_json_value_string(vendor, "transactionsToday", "success"),
+                    nested_json_value_string(vendor, "transactionsToday", "failed"),
+                    nested_json_value_string(vendor, "transactionsToday", "pending"),
+                    nested_json_value_string(vendor, "transactionsToday", "successRate"),
+                    nested_json_value_string(vendor, "transactionsToday", "amountTotal"),
+                    nested_json_value_string(vendor, "webhookToday", "total"),
+                    nested_json_value_string(vendor, "webhookToday", "rejected"),
+                    nested_json_value_string(vendor, "webhookToday", "failed"),
+                    nested_json_value_string(vendor, "webhookToday", "delivered"),
+                    nested_json_value_string(vendor, "webhookToday", "lastAt"),
+                    nested_json_value_string(vendor, "webhookToday", "lastStatus"),
+                    nested_json_value_string(vendor, "webhookToday", "lastMessage"),
+                    partial.clone(),
+                    snapshot_persisted.clone(),
+                    issue_codes.clone(),
+                    generated_at.to_string(),
+                ]
+            })
+            .collect::<Vec<_>>()
+    });
+    // Export-level diagnostics are payload-wide: repeat them on every vendor row,
+    // and emit one diagnostics-only row when no vendors exist so degraded exports
+    // remain self-describing.
+    match vendor_rows {
+        Some(rows_payload) if !rows_payload.is_empty() => rows.extend(rows_payload),
+        _ => rows.push(vec![
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            partial,
+            snapshot_persisted,
+            issue_codes,
+            generated_at.to_string(),
+        ]),
     }
     rows.into_iter()
         .map(|row| {
@@ -903,5 +1108,114 @@ mod tests {
                 ] }
             ] },
         );
+    }
+
+    #[test]
+    fn realtime_auxiliary_and_probe_failures_are_explicit() {
+        let issues = realtime_issue_set(
+            false, // transaction stats unavailable
+            false, // webhook stats unavailable
+            true,  // last webhook available
+            false, // seller unavailable
+            false, // Digiflazz balance unavailable
+            true,  // Tokovoucher balance available
+        );
+        let codes = issues.iter().map(|issue| issue.code).collect::<Vec<_>>();
+        assert_eq!(
+            codes,
+            vec![
+                "TRANSACTION_STATS_UNAVAILABLE",
+                "WEBHOOK_STATS_UNAVAILABLE",
+                "SELLER_SUMMARY_UNAVAILABLE",
+                "DIGIFLAZZ_BALANCE_UNAVAILABLE",
+            ]
+        );
+    }
+
+    #[test]
+    fn persistence_failure_keeps_metrics_but_marks_partial() {
+        let (partial, persisted, issues) = apply_persistence_outcome(false, Vec::new());
+        assert!(partial);
+        assert!(!persisted);
+        assert_eq!(issues[0].code, "SNAPSHOT_PERSISTENCE_FAILED");
+
+        let kept = vec![VendorHealthIssue::new(
+            "TRANSACTION_STATS_UNAVAILABLE",
+            "mongodb.transactions",
+        )];
+        let (partial, persisted, issues) = apply_persistence_outcome(true, kept);
+        assert!(partial);
+        assert!(persisted);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, "TRANSACTION_STATS_UNAVAILABLE");
+
+        let (partial, persisted, issues) = apply_persistence_outcome(true, Vec::new());
+        assert!(!partial);
+        assert!(persisted);
+        assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn csv_exposes_only_stable_diagnostics() {
+        let payload = serde_json::json!({
+            "generatedAt": "2026-08-18T12:00:00.000Z",
+            "partial": true,
+            "snapshotPersisted": false,
+            "issues": [{ "code": "SNAPSHOT_PERSISTENCE_FAILED", "source": "mongodb.settings" }],
+            "vendors": []
+        });
+        let csv = build_vendor_health_csv(&payload);
+        let header = csv.trim_start_matches('\u{FEFF}').lines().next().unwrap();
+        assert!(header.contains("Partial"));
+        assert!(header.contains("Snapshot Persisted"));
+        assert!(header.contains("Issue Codes"));
+        assert!(csv.contains("SNAPSHOT_PERSISTENCE_FAILED"));
+        assert!(!csv.contains("password"));
+        assert!(!csv.contains("apiKey"));
+    }
+
+    #[test]
+    fn persisted_snapshot_keeps_notification_compatible_vendor_fields() {
+        let response = VendorRealtimeHealthResponse {
+            ok: true,
+            partial: false,
+            issues: Vec::new(),
+            snapshot_persisted: true,
+            generated_at: "2026-08-18T12:00:00.000Z".to_string(),
+            vendors: vec![VendorRealtimeHealthItem {
+                key: "digiflazz".to_string(),
+                label: "Digiflazz".to_string(),
+                configured: true,
+                active: true,
+                balance: serde_json::json!(1000),
+                balance_ok: true,
+                low_balance_threshold: 100,
+                low_balance: false,
+                balance_message: "OK".to_string(),
+                health: "healthy",
+                transactions_today: TransactionStats::default(),
+                webhook_today: WebhookStats::default(),
+            }],
+            seller: SellerHealthSummary::default(),
+        };
+        let bson = to_bson(&response).unwrap();
+        let document = bson.as_document().unwrap();
+        let vendors = document.get_array("vendors").unwrap();
+        let vendor = vendors.first().unwrap().as_document().unwrap();
+        for field in [
+            "key",
+            "label",
+            "balanceOk",
+            "lowBalance",
+            "balanceMessage",
+            "balance",
+            "lowBalanceThreshold",
+        ] {
+            assert!(vendor.contains_key(field), "missing persisted field {field}");
+        }
+        let serialized = format!("{document:?}");
+        assert!(!serialized.contains("apiKey"));
+        assert!(!serialized.contains("signature"));
+        assert!(!serialized.contains("Authorization"));
     }
 }
