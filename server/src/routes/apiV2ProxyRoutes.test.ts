@@ -264,3 +264,18 @@ test('legacy slider controller is not registered in the gateway app', () => {
     const appSource = readFileSync(join(__dirname, '..', '..', 'src', 'app.ts'), 'utf8');
     assert.doesNotMatch(appSource, /sliderRoutes/);
 });
+
+test('vendor health reads and export retain exact permission and step-up boundaries', () => {
+    const source = readFileSync(join(__dirname, '..', '..', 'src', 'routes', 'apiV2ProxyRoutes.ts'), 'utf8');
+    assert.match(source, /app\.get\('\/vendors\/health', \{ preHandler: \[authenticate, hasPermission\('manageVendors'\)\] \}/);
+    assert.match(source, /app\.get\('\/vendors\/health-snapshot', \{ preHandler: \[authenticate, hasPermission\('manageVendors'\)\] \}/);
+    assert.match(source, /app\.get\('\/vendors\/health\/export', \{ preHandler: \[authenticate, hasPermission\('manageVendors'\), requireStepUp\('exports\.sensitive'\)\] \}/);
+
+    const rust = readFileSync(join(__dirname, '..', '..', '..', 'rust-api', 'src', 'routes', 'vendors', 'health.rs'), 'utf8');
+    assert.match(rust, /require_trusted_step_up_group\(&headers, "exports\.sensitive"\)/);
+});
+
+test('legacy vendor routes are not registered in the gateway app', () => {
+    const appSource = readFileSync(join(__dirname, '..', '..', 'src', 'app.ts'), 'utf8');
+    assert.doesNotMatch(appSource, /vendorRoutes/);
+});
