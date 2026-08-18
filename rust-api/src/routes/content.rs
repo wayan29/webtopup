@@ -78,13 +78,13 @@ use utils::*;
 #[cfg(test)]
 mod route_contract_tests {
     #[test]
-    fn slider_create_and_update_routes_use_the_shared_json_body_limit() {
+    fn slider_mutation_routes_use_the_shared_json_body_limit() {
         let source = include_str!("mod.rs");
         assert_eq!(
             source
                 .matches("DefaultBodyLimit::max(MAX_SLIDER_JSON_BYTES)")
                 .count(),
-            2
+            5
         );
         assert!(source.contains("post(content::slider_mutation_create)"));
         assert!(source.contains("put(content::slider_mutation_update)"));

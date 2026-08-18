@@ -1995,7 +1995,10 @@ mod tests {
         let write = source
             .find("async fn write_transaction")
             .expect("write transaction helper must remain explicit");
-        assert!(!source[write..].contains("complete_slider_claim_before_transaction("));
+        let tests = source
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("source test module boundary must remain explicit");
+        assert!(!source[write..tests].contains("complete_slider_claim_before_transaction("));
     }
 
     #[test]
