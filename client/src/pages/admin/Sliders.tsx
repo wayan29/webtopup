@@ -34,6 +34,7 @@ import {
     type SliderAdminItem,
     type SliderIntent,
 } from '../../lib/sliderManagement';
+import { formatArchivedMeta, sliderStatusLabel, type SliderView } from '../../lib/sliderPresentation';
 import {
     DndContext,
     KeyboardSensor,
@@ -60,7 +61,6 @@ type SliderFormData = {
     status: boolean;
 };
 type StatusFilter = 'all' | 'active' | 'inactive';
-type SliderView = 'current' | 'archive';
 type DialogKind = 'form' | 'archive' | 'restore' | null;
 type Message = { type: 'success' | 'error' | 'warning'; text: string };
 
@@ -312,6 +312,7 @@ function SortableSliderRow({
     onRestore: (slider: Slider) => void;
 }) {
     const sortable = useSortable({ id: slider._id, disabled: !dragEnabled });
+    const archivedMeta = archived ? formatArchivedMeta(slider) : null;
     const style = {
         transform: CSS.Transform.toString(sortable.transform),
         transition: sortable.transition,
@@ -339,6 +340,7 @@ function SortableSliderRow({
             </td>
             <td className="min-w-[180px] px-4 py-3 text-sm ui-text">
                 <div className="font-semibold">{slider.name}</div>
+                {archivedMeta ? <div className="mt-1 text-xs ui-text-muted">{archivedMeta}</div> : null}
                 <div className="break-all text-xs ui-text-muted">{slider._id}</div>
             </td>
             <td className="min-w-[220px] px-4 py-3 text-sm">
@@ -346,10 +348,9 @@ function SortableSliderRow({
             </td>
             <td className="px-4 py-3 text-sm"><SliderLink link={slider.link} /></td>
             <td className="px-4 py-3 text-sm">
-                <span className={`inline-flex rounded-full border px-2 py-1 text-xs font-semibold ${slider.status ? 'ui-success-chip' : 'ui-warning-chip'}`}>
-                    {slider.status ? 'Aktif' : 'Draft'}
+                <span className={`inline-flex rounded-full border px-2 py-1 text-xs font-semibold ${archived ? 'ui-text-muted' : slider.status ? 'ui-success-chip' : 'ui-warning-chip'}`}>
+                    {sliderStatusLabel(archived ? 'archive' : 'current', slider.status)}
                 </span>
-                {archived ? <div className="mt-1 text-xs ui-text-muted">Arsip</div> : null}
             </td>
             <td className="px-4 py-3 text-sm ui-text">
                 <div className="flex items-center gap-2">
@@ -413,16 +414,18 @@ function SliderMobileCard({
     onRestore: (slider: Slider) => void;
     onMove: (index: number, direction: -1 | 1) => void;
 }) {
+    const archivedMeta = archived ? formatArchivedMeta(slider) : null;
     return (
         <article className="rounded-2xl border ui-border ui-panel-muted p-3 shadow-sm">
             <SliderImagePreview image={slider.image} name={slider.name} compact onEdit={(event) => onEdit(slider, event.currentTarget)} />
             <div className="mt-3 flex items-start justify-between gap-3">
                 <div className="min-w-0">
                     <h3 className="truncate font-semibold ui-text">{slider.name}</h3>
+                    {archivedMeta ? <p className="text-xs ui-text-muted">{archivedMeta}</p> : null}
                     <p className="break-all text-xs ui-text-muted">{slider._id}</p>
                 </div>
-                <span className={`shrink-0 rounded-full border px-2 py-1 text-xs font-semibold ${slider.status ? 'ui-success-chip' : 'ui-warning-chip'}`}>
-                    {slider.status ? 'Aktif' : 'Draft'}
+                <span className={`shrink-0 rounded-full border px-2 py-1 text-xs font-semibold ${archived ? 'ui-text-muted' : slider.status ? 'ui-success-chip' : 'ui-warning-chip'}`}>
+                    {sliderStatusLabel(archived ? 'archive' : 'current', slider.status)}
                 </span>
             </div>
             <div className="mt-3 grid gap-2 text-sm">
@@ -564,10 +567,11 @@ export default function Sliders() {
         const matchesSearch = !keyword
             || slider.name.toLowerCase().includes(keyword)
             || slider.link.toLowerCase().includes(keyword);
-        const matchesStatus = statusFilter === 'all'
+        const matchesStatus = view === 'archive'
+            || statusFilter === 'all'
             || (statusFilter === 'active' ? slider.status : !slider.status);
         return matchesSearch && matchesStatus;
-    }), [items, keyword, statusFilter]);
+    }), [items, keyword, statusFilter, view]);
     const canReorder = view === 'current'
         && mutationEnabled
         && !keyword
@@ -930,12 +934,17 @@ export default function Sliders() {
         setStatusFilter('all');
     };
 
+    const changeView = (nextView: SliderView) => {
+        setView(nextView);
+        if (nextView === 'archive') setStatusFilter('all');
+    };
+
     return (
         <div className="space-y-5" aria-busy={loading || saving || sorting ? 'true' : 'false'}>
             <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="inline-flex rounded-xl border ui-border ui-panel-muted p-1" role="tablist" aria-label="Tampilan slider">
-                    <button type="button" role="tab" aria-selected={view === 'current'} onClick={() => setView('current')} className={`rounded-lg px-4 py-2 text-sm font-semibold ${view === 'current' ? 'ui-accent-solid' : 'ui-muted-action'}`}>{'Aktif & Draft'}</button>
-                    <button type="button" role="tab" aria-selected={view === 'archive'} onClick={() => setView('archive')} className={`rounded-lg px-4 py-2 text-sm font-semibold ${view === 'archive' ? 'ui-accent-solid' : 'ui-muted-action'}`}>Arsip</button>
+                    <button type="button" role="tab" aria-selected={view === 'current'} onClick={() => changeView('current')} className={`rounded-lg px-4 py-2 text-sm font-semibold ${view === 'current' ? 'ui-accent-solid' : 'ui-muted-action'}`}>{'Aktif & Draft'}</button>
+                    <button type="button" role="tab" aria-selected={view === 'archive'} onClick={() => changeView('archive')} className={`rounded-lg px-4 py-2 text-sm font-semibold ${view === 'archive' ? 'ui-accent-solid' : 'ui-muted-action'}`}>Arsip</button>
                 </div>
                 <div className="flex flex-wrap gap-2">
                     {view === 'current' ? (
@@ -961,32 +970,39 @@ export default function Sliders() {
             {!snapshot && loadError ? <div role="alert" className="rounded-xl border p-4 text-sm ui-danger-chip">{loadError}</div> : null}
             {snapshot && loadError ? <div role="status" className="rounded-xl border p-3 text-sm ui-warning-chip">Snapshot terakhir dipertahankan. Sinkronisasi gagal: {loadError}</div> : null}
 
-            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
-                <div className="rounded-2xl border ui-border ui-panel-muted p-4"><p className="text-[11px] uppercase tracking-[0.18em] ui-text-muted">Revision</p><p className="mt-2 text-3xl font-black ui-text">{snapshot?.revision ?? '-'}</p><p className="mt-1 text-sm ui-text-muted">Snapshot baca saja</p></div>
-                <div className="rounded-2xl border ui-border ui-panel-muted p-4"><p className="text-[11px] uppercase tracking-[0.18em] ui-text-muted">Current total</p><p className="mt-2 text-3xl font-black ui-text">{limits?.currentTotal ?? summary.total}</p><p className="mt-1 text-sm ui-text-muted">{summary.total} tampil di view</p></div>
-                <div className="rounded-2xl border ui-border ui-panel-muted p-4"><p className="text-[11px] uppercase tracking-[0.18em] ui-text-muted">Current active</p><p className="mt-2 text-3xl font-black ui-text">{limits?.currentActive ?? summary.active}</p><p className="mt-1 text-sm ui-text-muted">{summary.inactive} draft/nonaktif</p></div>
-                <div className="rounded-2xl border ui-border ui-panel-muted p-4"><p className="text-[11px] uppercase tracking-[0.18em] ui-text-muted">Sisa kapasitas total</p><p className="mt-2 text-3xl font-black ui-text">{limits?.remainingTotal ?? '-'}</p><p className="mt-1 text-sm ui-text-muted">Maksimal 20 current</p></div>
-                <div className="rounded-2xl border ui-border ui-panel-muted p-4"><p className="text-[11px] uppercase tracking-[0.18em] ui-text-muted">Sisa kapasitas aktif</p><p className="mt-2 text-3xl font-black ui-text">{limits?.remainingActive ?? '-'}</p><p className="mt-1 text-sm ui-text-muted">Maksimal 8 publik</p></div>
+            <div className={`grid gap-3 ${view === 'archive' ? 'sm:grid-cols-2' : 'sm:grid-cols-2 xl:grid-cols-4'}`}>
+                <div className="rounded-2xl border ui-border ui-panel-muted p-4"><p className="text-[11px] uppercase tracking-[0.18em] ui-text-muted">Revisi</p><p className="mt-2 text-3xl font-black ui-text">{snapshot?.revision ?? '-'}</p><p className="mt-1 text-sm ui-text-muted">Versi data slider saat ini</p></div>
+                {view === 'current' ? (<>
+                    <div className="rounded-2xl border ui-border ui-panel-muted p-4"><p className="text-[11px] uppercase tracking-[0.18em] ui-text-muted">Slider saat ini</p><p className="mt-2 text-3xl font-black ui-text">{limits?.currentTotal ?? summary.total}</p><p className="mt-1 text-sm ui-text-muted">{limits?.currentActive ?? summary.active} aktif · {Math.max((limits?.currentTotal ?? summary.total) - (limits?.currentActive ?? summary.active), 0)} draft</p></div>
+                    <div className="rounded-2xl border ui-border ui-panel-muted p-4"><p className="text-[11px] uppercase tracking-[0.18em] ui-text-muted">Kapasitas total</p><p className="mt-2 text-3xl font-black ui-text">{limits ? `${limits.currentTotal} / ${limits.total}` : `${summary.total}`}</p><p className="mt-1 text-sm ui-text-muted">Sisa slot {limits?.remainingTotal ?? '-'}</p></div>
+                    <div className="rounded-2xl border ui-border ui-panel-muted p-4"><p className="text-[11px] uppercase tracking-[0.18em] ui-text-muted">Kapasitas aktif</p><p className="mt-2 text-3xl font-black ui-text">{limits ? `${limits.currentActive} / ${limits.active}` : `${summary.active}`}</p><p className="mt-1 text-sm ui-text-muted">Sisa slot aktif {limits?.remainingActive ?? '-'}</p></div>
+                </>) : (
+                    <div className="rounded-2xl border ui-border ui-panel-muted p-4"><p className="text-[11px] uppercase tracking-[0.18em] ui-text-muted">Total arsip</p><p className="mt-2 text-3xl font-black ui-text">{items.length}</p><p className="mt-1 text-sm ui-text-muted">{items.length} slider tersimpan</p></div>
+                )}
             </div>
 
             <div className="rounded-xl border ui-border ui-panel-muted p-4 space-y-4">
-                <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_220px_auto]">
+                <div className={`grid gap-3 ${view === 'current' ? 'lg:grid-cols-[minmax(0,1fr)_220px_auto]' : 'lg:grid-cols-[minmax(0,1fr)_auto]'}`}>
                     <div className="relative">
                         <label htmlFor="slider-search" className="sr-only">Cari slider</label>
                         <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 ui-text-muted" aria-hidden="true" />
                         <input id="slider-search" type="search" value={search} onChange={(event) => setSearch(event.target.value)} className="w-full rounded-lg border px-3 py-2 pl-9 text-sm ui-field" placeholder="Cari nama slider atau link..." />
                     </div>
-                    <div>
-                        <label htmlFor="slider-status-filter" className="sr-only">Filter status slider</label>
-                        <select id="slider-status-filter" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as StatusFilter)} className="w-full rounded-lg border px-3 py-2 text-sm ui-field">
-                            <option value="all">Semua Status</option><option value="active">Aktif</option><option value="inactive">Draft / Nonaktif</option>
-                        </select>
-                    </div>
+                    {view === 'current' ? (
+                        <div>
+                            <label htmlFor="slider-status-filter" className="sr-only">Filter status slider</label>
+                            <select id="slider-status-filter" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as StatusFilter)} className="w-full rounded-lg border px-3 py-2 text-sm ui-field">
+                                <option value="all">Semua Status</option><option value="active">Aktif</option><option value="inactive">Draft / Nonaktif</option>
+                            </select>
+                        </div>
+                    ) : null}
                     <button type="button" onClick={resetFilters} className="inline-flex items-center justify-center gap-2 rounded-lg border px-4 py-2 text-sm font-semibold ui-muted-action"><RotateCcw className="h-4 w-4" aria-hidden="true" /> Reset</button>
                 </div>
                 <div className="flex flex-wrap items-center gap-3 text-sm ui-text-muted">
                     <span>{filteredItems.length} slider tampil</span>
-                    {!canReorder && view === 'current' ? <span className="inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs ui-warning-chip"><AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" /> Reorder dinonaktifkan saat filter aktif, marker belum siap, atau sedang menyimpan.</span> : <span className="rounded-full border ui-border px-3 py-1 text-xs">Drag atau tombol Move Up/Down aktif</span>}
+                    {view === 'current' ? (!canReorder
+                        ? <span className="inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs ui-warning-chip"><AlertTriangle className="h-3.5 w-3.5" aria-hidden="true" /> Reorder dinonaktifkan saat filter aktif, marker belum siap, atau sedang menyimpan.</span>
+                        : <span className="rounded-full border ui-border px-3 py-1 text-xs">Drag atau tombol Move Up/Down aktif</span>) : null}
                 </div>
             </div>
 

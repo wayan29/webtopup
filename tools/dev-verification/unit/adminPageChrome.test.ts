@@ -303,8 +303,16 @@ test('slider administration uses the revisioned lifecycle and accessible state c
     assert.match(sliders, /Aktif & Draft/);
     assert.match(sliders, /Arsip/);
     assert.match(sliders, /Revision/);
-    assert.match(sliders, /Sisa kapasitas total/);
-    assert.match(sliders, /Sisa kapasitas aktif/);
+    assert.match(sliders, /Slider saat ini/);
+    assert.match(sliders, /Kapasitas total/);
+    assert.match(sliders, /Kapasitas aktif/);
+    assert.match(sliders, /Total arsip/);
+    assert.match(sliders, /sliderStatusLabel\(archived \? 'archive' : 'current', slider\.status\)/);
+    assert.match(sliders, /sliderStatusLabel/);
+    assert.match(sliders, /formatArchivedMeta/);
+    assert.doesNotMatch(sliders, /Current total/);
+    assert.doesNotMatch(sliders, /Current active/);
+    assert.doesNotMatch(sliders, /Snapshot baca saja/);
     assert.match(sliders, /\/sliders\/admin\/archived/);
     assert.match(sliders, /\/sliders\/admin\/create/);
     assert.match(sliders, /\/sliders\/admin\/.+\/archive/);
