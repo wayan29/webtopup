@@ -87,9 +87,13 @@ test('admin slider lifecycle is accessible, revisioned, and split-deploy gated',
   try {
     await page.goto('/admin/sliders');
     await expect(page.getByRole('tab', { name: 'Aktif & Draft' })).toBeVisible({ timeout: 30_000 });
-    await expect(page.getByText('Revision', { exact: true })).toBeVisible();
+    await expect(page.getByText('Revisi', { exact: true })).toBeVisible();
+    await expect(page.getByRole('tab', { name: 'Aktif & Draft' })).toHaveAttribute('aria-controls', 'slider-current-panel');
+    await expect(page.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', 'slider-current-tab');
+    await expect(page.getByRole('button', { name: 'Segarkan Slider Beranda' })).toHaveCount(1);
+    await expect(page.getByText('Current total', { exact: true })).toHaveCount(0);
     if (testInfo.project.name === 'chromium-mobile') {
-      await expect(page.getByText('Move Up', { exact: true }).first()).toBeVisible();
+      await expect(page.getByText('Naikkan', { exact: true }).first()).toBeVisible();
     } else {
       await expect(page.locator('table')).toBeVisible();
     }
@@ -175,11 +179,20 @@ test('admin slider lifecycle is accessible, revisioned, and split-deploy gated',
     await expect(page.getByRole('heading', { name: 'Verifikasi ulang diperlukan' })).toHaveCount(0);
     await expect(page.getByText(`Slider "${createdName}" berhasil diarsipkan`, { exact: false })).toBeVisible({ timeout: 20_000 });
     await page.getByRole('tab', { name: 'Arsip' }).click();
-    await expect(page.getByRole('button', { name: `Restore slider ${createdName}` }).first()).toBeVisible();
-    await page.getByRole('button', { name: `Restore slider ${createdName}` }).first().click();
-    await expect(page.getByRole('dialog', { name: 'Restore slider?' })).toBeVisible();
-    await page.getByRole('button', { name: 'Restore sebagai Draft' }).click();
-    await expect(page.getByText(`Slider "${createdName}" berhasil direstore sebagai draft`, { exact: false })).toBeVisible({ timeout: 20_000 });
+    await expect(page.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', 'slider-archive-tab');
+    await expect(page.getByLabel('Filter status slider')).toHaveCount(0);
+    await expect(page.getByText('Total arsip', { exact: true })).toBeVisible();
+    if (testInfo.project.name === 'chromium-mobile') {
+      await expect(page.locator('article').filter({ hasText: createdName }).getByText('Diarsipkan', { exact: true })).toBeVisible();
+      await expect(page.getByText(/^Urutan terakhir /).first()).toBeVisible();
+    } else {
+      await expect(page.getByText('Diarsipkan', { exact: true }).first()).toBeVisible();
+    }
+    await expect(page.getByRole('button', { name: `Pulihkan slider ${createdName}` }).first()).toBeVisible();
+    await page.getByRole('button', { name: `Pulihkan slider ${createdName}` }).first().click();
+    await expect(page.getByRole('dialog', { name: 'Pulihkan slider?' })).toBeVisible();
+    await page.getByRole('button', { name: 'Pulihkan sebagai Draft' }).click();
+    await expect(page.getByText(`Slider "${createdName}" berhasil dipulihkan sebagai draft`, { exact: false })).toBeVisible({ timeout: 20_000 });
 
     // A mocked conflict/unknown response verifies UI safety without mutating backend state.
     await page.getByRole('tab', { name: 'Aktif & Draft' }).click();
@@ -187,10 +200,35 @@ test('admin slider lifecycle is accessible, revisioned, and split-deploy gated',
     await page.getByLabel('Nama Slider').fill(`${createdName} conflict`);
     await page.route(`**/api/v2/sliders/admin/${createdId.toHexString()}`, async (route) => route.fulfill({ status: 409, contentType: 'application/json', body: JSON.stringify({ error: { code: 'SLIDER_VERSION_CONFLICT', message: 'Daftar slider telah berubah', expectedRevision: 1, currentRevision: 2, currentSnapshot: { revision: 2, sliders: [], limits: { total: 20, active: 8, currentTotal: 0, currentActive: 0, remainingTotal: 20, remainingActive: 8 } } } }) }));
     await page.getByRole('button', { name: 'Simpan Slider' }).click();
-    await expect(page.getByRole('heading', { name: 'Konflik revision slider' })).toBeVisible({ timeout: 20_000 });
-    await expect(page.getByRole('button', { name: 'Load Latest Snapshot' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Konflik revisi slider' })).toBeVisible({ timeout: 20_000 });
+    await expect(page.getByRole('button', { name: 'Muat snapshot terbaru' })).toBeVisible();
     await page.unroute(`**/api/v2/sliders/admin/${createdId.toHexString()}`);
-    await page.getByRole('button', { name: 'Discard Draft' }).click();
+    await page.getByRole('button', { name: 'Buang perubahan draft' }).click();
+
+    // A full active-capacity snapshot must block new publication client-side without a mutation call.
+    const fullCapacitySnapshot = {
+      mutationContract: 'slider-revision-v1',
+      revision: 7,
+      sliders: [{
+        _id: seedId.toHexString(),
+        name: `${prefix} full-capacity draft`,
+        image: '/uploads/covers/task17-seed-missing.png',
+        link: '/capacity',
+        sortOrder: 0,
+        status: false,
+        lifecycle: 'active',
+      }],
+      limits: { total: 20, active: 8, currentTotal: 8, currentActive: 8, remainingTotal: 12, remainingActive: 0 },
+    };
+    await page.route('**/api/v2/sliders/admin/all', async (route) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(fullCapacitySnapshot) }));
+    await page.reload();
+    await expect(page.getByRole('button', { name: `Edit slider ${prefix} full-capacity draft` }).first()).toBeVisible({ timeout: 30_000 });
+    await page.getByRole('button', { name: `Edit slider ${prefix} full-capacity draft` }).first().click();
+    await expect(page.getByText(/Kapasitas slider aktif penuh/)).toBeVisible();
+    await expect(page.getByRole('checkbox', { name: 'Publikasikan sebagai slider aktif' })).toBeDisabled();
+    await page.keyboard.press('Escape');
+    await page.unroute('**/api/v2/sliders/admin/all');
+    await page.reload();
   } finally {
     await cleanupSliderFixture(db, fixtureRunId, prefix, uploadedCoverUrl);
     await client.close();
