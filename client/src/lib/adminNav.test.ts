@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+    ADMIN_DEFAULT_MENU_ORDER,
+    ADMIN_MENU_NAME_ALIASES,
     ADMIN_NAV_BLUEPRINT,
     formatAdminBadgeCount,
     getAdminNotificationLabel,
@@ -8,6 +10,8 @@ import {
     getAdminRoutePresentation,
     getPreferredAdminLandingPath,
     normalizeAdminBadgeCount,
+    normalizeAdminMenuOrder,
+    normalizeAdminPinnedMenus,
 } from './adminNav.ts';
 
 test('notifications leave the sidebar but retain route access and presentation', () => {
@@ -96,4 +100,46 @@ test('badge normalization accepts only finite nonnegative counts', () => {
     assert.equal(normalizeAdminBadgeCount(Number.NaN), 0);
     assert.equal(normalizeAdminBadgeCount(Number.POSITIVE_INFINITY), 0);
     assert.equal(normalizeAdminBadgeCount('invalid'), 0);
+});
+
+test('sidebar destinations are unique and campaign routes have one canonical location', () => {
+    const paths = ADMIN_NAV_BLUEPRINT.flatMap((item) => [
+        item.path,
+        ...(item.submenu ?? []).map((child) => child.path),
+    ]).filter((value): value is string => Boolean(value));
+    const counts = new Map<string, number>();
+    for (const path of paths) counts.set(path, (counts.get(path) ?? 0) + 1);
+
+    assert.deepEqual(
+        [...counts.entries()].filter(([, count]) => count > 1),
+        [],
+    );
+    assert.equal(counts.get('/admin/flash-sales'), 1);
+    assert.equal(counts.get('/admin/vouchers'), 1);
+    assert.equal(counts.get('/admin/promo-report'), 1);
+
+    const campaign = ADMIN_NAV_BLUEPRINT.find((item) => item.name === 'Kampanye');
+    assert.deepEqual(
+        campaign?.submenu?.map((item) => item.path),
+        ['/admin/flash-sales', '/admin/vouchers', '/admin/promo-report'],
+    );
+    const sliderMenu = ADMIN_NAV_BLUEPRINT.find((item) => item.path === '/admin/sliders');
+    assert.equal(sliderMenu?.name, 'Slider Beranda');
+    assert.equal(sliderMenu?.subtitle, 'Kelola carousel banner halaman utama');
+});
+
+test('legacy Slider and campaign preferences migrate without duplicate menu names', () => {
+    assert.equal(ADMIN_MENU_NAME_ALIASES.Slider, 'Slider Beranda');
+    assert.equal(ADMIN_MENU_NAME_ALIASES.Vouchers, 'Kampanye');
+    assert.equal(ADMIN_MENU_NAME_ALIASES['Laporan Promo'], 'Kampanye');
+
+    const order = normalizeAdminMenuOrder(['Slider', 'Vouchers', 'Kampanye', 'Laporan Promo']);
+    assert.equal(order.filter((name) => name === 'Kampanye').length, 1);
+    assert.equal(order.filter((name) => name === 'Slider Beranda').length, 1);
+    assert.deepEqual(new Set(order), new Set(ADMIN_DEFAULT_MENU_ORDER));
+
+    assert.deepEqual(
+        normalizeAdminPinnedMenus(['Slider', 'Vouchers', 'Kampanye', 'Laporan Promo'], 6),
+        ['Slider Beranda', 'Kampanye'],
+    );
 });

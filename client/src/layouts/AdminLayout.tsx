@@ -50,7 +50,6 @@ import {
     ADMIN_DEFAULT_EXPANDED_MENUS,
     ADMIN_DEFAULT_MENU_ORDER,
     ADMIN_LEGACY_DEFAULT_MENU_ORDER,
-    ADMIN_MENU_NAME_ALIASES,
     ADMIN_NAV_BLUEPRINT,
     formatAdminBadgeCount,
     getAdminNotificationLabel,
@@ -58,6 +57,8 @@ import {
     getAdminRoutePresentation,
     getPreferredAdminLandingPath,
     isAdminRoutePathActive,
+    normalizeAdminMenuOrder,
+    normalizeAdminPinnedMenus,
     normalizeAdminBadgeCount,
     type AdminBadgeKey
 } from '../lib/adminNav';
@@ -132,50 +133,10 @@ const LEGACY_DEFAULT_MENU_ORDER = ADMIN_LEGACY_DEFAULT_MENU_ORDER;
 
 const NAV_BLUEPRINT = ADMIN_NAV_BLUEPRINT;
 const DEFAULT_MENU_ORDER = ADMIN_DEFAULT_MENU_ORDER;
-const MENU_NAME_ALIASES = ADMIN_MENU_NAME_ALIASES;
 
 const isSameMenuOrder = (left: string[], right: string[]) => (
     left.length === right.length && left.every((item, index) => item === right[index])
 );
-
-const normalizeMenuOrder = (menuOrder: string[]) => {
-    const seen = new Set<string>();
-    const nextOrder: string[] = [];
-
-    menuOrder.forEach((rawItem) => {
-        const item = MENU_NAME_ALIASES[rawItem] || rawItem;
-        if (DEFAULT_MENU_ORDER.includes(item) && !seen.has(item)) {
-            seen.add(item);
-            nextOrder.push(item);
-        }
-    });
-
-    DEFAULT_MENU_ORDER.forEach((item) => {
-        if (!seen.has(item)) {
-            seen.add(item);
-            nextOrder.push(item);
-        }
-    });
-
-    return nextOrder;
-};
-
-const normalizePinnedMenus = (value: unknown) => {
-    if (!Array.isArray(value)) {
-        return [] as string[];
-    }
-
-    const seen = new Set<string>();
-    const next: string[] = [];
-    value.forEach((item) => {
-        if (typeof item !== 'string') return;
-        const name = MENU_NAME_ALIASES[item] || item;
-        if (!DEFAULT_MENU_ORDER.includes(name) || seen.has(name)) return;
-        seen.add(name);
-        next.push(name);
-    });
-    return next.slice(0, MAX_PINNED_MENUS);
-};
 
 const routeMetaOverrides: Array<{
     match: (pathname: string) => boolean;
@@ -532,7 +493,7 @@ export default function AdminLayout() {
                 return DEFAULT_MENU_ORDER;
             }
 
-            const normalizedOrder = normalizeMenuOrder(parsed);
+            const normalizedOrder = normalizeAdminMenuOrder(parsed);
             if (isSameMenuOrder(normalizedOrder, LEGACY_DEFAULT_MENU_ORDER)) {
                 return DEFAULT_MENU_ORDER;
             }
@@ -548,7 +509,7 @@ export default function AdminLayout() {
             return [];
         }
         try {
-            return normalizePinnedMenus(JSON.parse(saved));
+            return normalizeAdminPinnedMenus(JSON.parse(saved), MAX_PINNED_MENUS);
         } catch {
             return [];
         }
@@ -901,7 +862,7 @@ export default function AdminLayout() {
     };
 
     const persistPinnedMenus = (next: string[]) => {
-        const normalized = normalizePinnedMenus(next);
+        const normalized = normalizeAdminPinnedMenus(next, MAX_PINNED_MENUS);
         setPinnedMenus(normalized);
         localStorage.setItem(PINNED_MENU_STORAGE_KEY, JSON.stringify(normalized));
         return normalized;

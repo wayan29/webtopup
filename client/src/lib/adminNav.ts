@@ -90,14 +90,6 @@ export const ADMIN_NAV_BLUEPRINT: AdminNavBlueprintItem[] = [
         subtitle: 'Analitik omset dan performa'
     },
     {
-        name: 'Laporan Promo',
-        path: '/admin/promo-report',
-        icon: Gift,
-        permission: 'viewReports',
-        section: 'Overview',
-        subtitle: 'Biaya voucher, giveaway, flash sale'
-    },
-    {
         name: 'Kampanye',
         icon: Ticket,
         id: 'kampanye',
@@ -184,8 +176,7 @@ export const ADMIN_NAV_BLUEPRINT: AdminNavBlueprintItem[] = [
             { name: '2. Operator Produk', path: '/admin/product-operators', permission: 'manageProducts', subtitle: 'Setelah kategori — brand/operator' },
             { name: '3. Jenis Produk', path: '/admin/product-types', permission: 'manageProducts', subtitle: 'Setelah operator — tipe item' },
             { name: '4. List Produk', path: '/admin/products', permission: 'viewProducts', subtitle: 'Setelah master lengkap — SKU jual' },
-            { name: '5. Flash Sale', path: '/admin/flash-sales', permission: 'manageProducts', subtitle: 'Opsional — promo di atas produk' },
-            { name: '6. Audit Katalog', path: '/admin/catalog-audit', permission: 'manageProducts', subtitle: 'Cek relasi & master kosong' },
+            { name: '5. Audit Katalog', path: '/admin/catalog-audit', permission: 'manageProducts', subtitle: 'Cek relasi & master kosong' },
         ]
     },
     {
@@ -195,14 +186,6 @@ export const ADMIN_NAV_BLUEPRINT: AdminNavBlueprintItem[] = [
         permission: 'manageProducts',
         section: 'Catalog',
         subtitle: 'Kelola loyalty dan redeem'
-    },
-    {
-        name: 'Vouchers',
-        path: '/admin/vouchers',
-        icon: Ticket,
-        permission: 'manageVouchers',
-        section: 'Catalog',
-        subtitle: 'Voucher saldo dan redeem'
     },
     {
         name: 'Margin',
@@ -268,12 +251,12 @@ export const ADMIN_NAV_BLUEPRINT: AdminNavBlueprintItem[] = [
         subtitle: 'Monitoring vendor'
     },
     {
-        name: 'Slider',
+        name: 'Slider Beranda',
         path: '/admin/sliders',
         icon: SlidersHorizontal,
         permission: 'manageSettings',
         section: 'Sistem',
-        subtitle: 'Kelola banner dan slider'
+        subtitle: 'Kelola carousel banner halaman utama'
     },
     {
         name: 'Validasi',
@@ -316,7 +299,10 @@ export const ADMIN_MENU_NAME_ALIASES: Record<string, string> = {
     Security: 'Keamanan',
     'Site Config': 'Konfigurasi Situs',
     'Vendor Health': 'Kesehatan Vendor',
-    Deposits: 'Deposit'
+    Deposits: 'Deposit',
+    Slider: 'Slider Beranda',
+    Vouchers: 'Kampanye',
+    'Laporan Promo': 'Kampanye'
 };
 
 export const ADMIN_DEFAULT_EXPANDED_MENUS: Record<string, boolean> = {
@@ -338,6 +324,55 @@ const isExactOrDescendant = (pathname: string, basePath: string) => (
 export const normalizeAdminBadgeCount = (value: unknown) => {
     const parsed = Number(value);
     return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : 0;
+};
+
+const normalizeAdminMenuName = (name: string) => ADMIN_MENU_NAME_ALIASES[name] || name;
+
+/**
+ * Normalizes persisted sidebar order: applies legacy menu-name aliases,
+ * drops unknown entries and duplicates, then appends missing defaults.
+ */
+export const normalizeAdminMenuOrder = (menuOrder: string[]): string[] => {
+    const seen = new Set<string>();
+    const nextOrder: string[] = [];
+
+    for (const rawItem of menuOrder) {
+        const item = normalizeAdminMenuName(rawItem);
+        if (ADMIN_DEFAULT_MENU_ORDER.includes(item) && !seen.has(item)) {
+            seen.add(item);
+            nextOrder.push(item);
+        }
+    }
+
+    for (const item of ADMIN_DEFAULT_MENU_ORDER) {
+        if (!seen.has(item)) {
+            seen.add(item);
+            nextOrder.push(item);
+        }
+    }
+
+    return nextOrder;
+};
+
+/**
+ * Normalizes persisted pinned favorites: applies legacy menu-name aliases,
+ * keeps only current menu names without duplicates, capped at maxPinned.
+ */
+export const normalizeAdminPinnedMenus = (value: unknown, maxPinned = 6): string[] => {
+    if (!Array.isArray(value)) {
+        return [];
+    }
+
+    const seen = new Set<string>();
+    const next: string[] = [];
+    for (const rawItem of value) {
+        if (typeof rawItem !== 'string') continue;
+        const item = normalizeAdminMenuName(rawItem);
+        if (!ADMIN_DEFAULT_MENU_ORDER.includes(item) || seen.has(item)) continue;
+        seen.add(item);
+        next.push(item);
+    }
+    return next.slice(0, maxPinned);
 };
 
 /**
