@@ -7,6 +7,9 @@
 use mongodb::bson::{doc, DateTime, Document};
 use serde_json::Value;
 
+/// Policy table for tests/hygiene verification only; the request path never
+/// needs detector-based redaction because builders are allowlist-only.
+#[cfg_attr(not(test), allow(dead_code))]
 const SENSITIVE_SELLER_KEYS: &[&str] = &[
     "apikey",
     "api_key",
@@ -54,6 +57,9 @@ pub fn safe_seller_event_document(
     }
 }
 
+/// Detector used by secrecy policy tests and hygiene verification. Runtime
+/// writes remain allowlist-only and do not depend on this check.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn contains_sensitive_seller_key(value: &Value) -> bool {
     match value {
         Value::Object(map) => map.iter().any(|(key, child)| {
