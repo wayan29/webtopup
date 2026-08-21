@@ -1,7 +1,7 @@
 # Digiflazz Seller Center Design
 
 **Date:** 2026-08-20
-**Status:** Awaiting written-spec approval
+**Status:** Approved for implementation planning
 
 ## Goal
 
@@ -50,7 +50,7 @@ The active section is URL-addressable through an allowlisted `section` query par
   - `/admin/addons/irs-seller` redirects with `replace` to `/admin/addons/digiflazz-seller-center?section=irs`.
 - Redirects do not render duplicate page implementations.
 - `ADMIN_NAV_BLUEPRINT` remains the source of truth for sidebar identity and permission resolution.
-- Legacy menu-name preferences for `Digiflazz Seller`, `IRS Seller`, and `Seller Center` normalize to `Digiflazz Seller Center` without duplicates.
+- Sidebar order/pin preferences remain top-level only; no unsupported submenu-preference migration is introduced. The canonical blueprint itself guarantees exactly one Seller Center child and no standalone IRS child.
 - Route header metadata uses title **Digiflazz Seller Center** and identifies IRS as an integration section, not a separate Add On.
 - The global `admin:refresh-current-page` action refreshes the currently active Seller Center section. Pure local refresh buttons are removed. Mutating actions such as mapping sync, callback retry, and save remain available because they are not duplicate refresh affordances.
 
@@ -135,11 +135,12 @@ An authenticated, valid, non-duplicate IRS request must use the shared active `d
 1. validate required request fields, source IP, and IRS credentials;
 2. claim `refId` idempotently;
 3. load the active shared mapping and active product;
-4. create one pending IRS order;
-5. execute paid validation when the product has validation configuration, otherwise call the existing supplier fulfillment path used by transactions;
-6. persist `success | failed | pending`, message, SN, and supplier transaction identifier where available;
-7. return the established IRS response envelope translated from the persisted outcome;
-8. repeated `refId` requests return the persisted order outcome and never execute fulfillment twice.
+4. create one pending IRS order in `ready` execution state, or load the existing order;
+5. allow any request that observes `ready` to compete for one atomic `ready -> executing` claim; requests observing `executing` or `completed` return the persisted outcome without supplier execution;
+6. execute paid validation when the product has validation configuration, otherwise call the existing supplier fulfillment path used by transactions;
+7. persist `success | failed | pending`, message, SN, and supplier transaction identifier where available;
+8. return the established IRS response envelope translated from the persisted outcome;
+9. repeated/concurrent `refId` requests can recover an unclaimed `ready` order but never execute fulfillment twice after one request holds the `executing` claim.
 
 Database errors must not become “Produk tidak ditemukan,” an empty list, or a successful/pending synthetic order. A failure before a durable idempotent claim returns the channel-compatible generic failure response without calling a provider. Tests must use local/disposable fixtures and may not call a real provider.
 
@@ -159,7 +160,8 @@ New behavior:
 - Digiflazz and IRS order documents store only explicit operational fields already needed for reconciliation; new writes do not store `rawRequest`.
 - Digiflazz and IRS request/event logs store explicit safe metadata only; new writes do not store `raw`.
 - Admin order/log handlers use typed allowlist DTOs. They never serialize a Mongo document directly and never expose `raw`, `rawRequest`, credential config, or unknown fields.
-- IRS settings reads return only `merchantId` plus masked secret indicators. Secret inputs are write-only; blank/omitted secret fields preserve existing values.
+- Digiflazz settings reads return `apiKeyConfigured: boolean`, never `apiKeyMasked` or any API-key fragment. IRS settings reads return `merchantId` plus `passwordConfigured`, `pinConfigured`, and `secretConfigured` booleans, never masks or secret fragments. Secret inputs are write-only; blank/omitted secret fields preserve existing values.
+- `server/src/app.ts` must not register `digiflazzSellerRoutes` or any other legacy Node seller controller. The live path remains Node gateway → Rust API. Leftover `rawRequest`/`apiKeyMasked` code in unused Node files is not an active API surface and must not be re-enabled.
 - IRS credential comparisons use constant-time comparison after exact-length validation.
 - Formatter input is bounded and schema-validated before persistence; arbitrary nested credential aliases are not accepted as formatter configuration.
 
@@ -183,9 +185,10 @@ The tool:
   - `--confirm-database <exact-name>`;
   - `--backup-reference <non-empty-operator-reference>`;
 - uses conditional updates so concurrent document changes are not overwritten;
-- re-runs the audit after apply and exits nonzero if sensitive raw fields remain;
-- refuses unique-index application when duplicate `refId` values exist;
-- does not run automatically during API startup or deployment.
+- re-runs the raw-field audit after apply and exits nonzero if sensitive raw fields remain;
+- reports duplicate `refId` and unique-index readiness but never creates indexes itself;
+- is paired with a separate seller-order readiness binary that refuses unique-index application when duplicate `refId` values or drifted definitions exist;
+- neither apply path runs automatically during API startup or deployment; startup is verification-only.
 
 Production execution requires a fresh backup, explicit user approval, dry-run review, apply, post-apply verification, and service smoke checks in a later operation. This design and its implementation do not authorize production mutation.
 
