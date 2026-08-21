@@ -29,21 +29,6 @@ pub(super) fn allowed_ips(value: Option<&Bson>) -> Vec<String> {
     }
 }
 
-pub(super) fn mask_api_key(api_key: &str) -> String {
-    if api_key.is_empty() {
-        return String::new();
-    }
-    let suffix = api_key
-        .chars()
-        .rev()
-        .take(4)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>();
-    format!("{}{}", "*".repeat(api_key.len().saturating_sub(4)), suffix)
-}
-
 pub(super) fn text_from_value(value: &Value) -> String {
     match value {
         Value::String(value) => value.trim().to_string(),

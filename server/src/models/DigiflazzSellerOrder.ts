@@ -23,7 +23,6 @@ export interface IDigiflazzSellerOrder extends Document {
     callbackNextRetryAt?: Date;
     callbackLastStatusCode?: number;
     callbackLastMessage?: string;
-    rawRequest?: Record<string, unknown>;
     createdAt: Date;
     updatedAt: Date;
 }
@@ -132,9 +131,6 @@ const DigiflazzSellerOrderSchema: Schema = new Schema({
         trim: true,
         maxlength: 500
     },
-    rawRequest: {
-        type: Schema.Types.Mixed
-    }
 }, {
     timestamps: true
 });

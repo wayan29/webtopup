@@ -947,7 +947,6 @@ export const getDigiflazzSellerAdminOrders = async (request: FastifyRequest, rep
             callbackLastStatusCode: order.callbackLastStatusCode || null,
             callbackLastMessage: order.callbackLastMessage || '',
             requestIp: order.requestIp || '',
-            rawRequest: order.rawRequest || null,
             createdAt: order.createdAt,
             updatedAt: order.updatedAt,
             product: order.product ? {
@@ -1385,7 +1384,6 @@ export const handleDigiflazzSellerPrepaid = async (request: FastifyRequest, repl
                 vendorSku,
                 vendorTrxId: trId,
                 requestIp,
-                rawRequest: body as Record<string, unknown>,
                 callbackRequired: Boolean(config.callbackEnabled)
             });
         } catch (createError) {

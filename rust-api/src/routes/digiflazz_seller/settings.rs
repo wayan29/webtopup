@@ -11,7 +11,7 @@ use crate::{
 
 use super::{
     allowed_ips, bool_from_value, bson_to_json, callback_pending_expression, count_documents,
-    document_string, internal_error, join_url, mask_api_key, non_negative_i64, normalize_url,
+    document_string, internal_error, join_url, non_negative_i64, normalize_url,
     optional_bool, optional_date_or_string, save_settings_error, text_from_value, unavailable,
     validate_allowed_ips, validate_http_url, EmptyStringFallback, MappingSummary, OrderSummary,
     RetryQueueHealth, SaveSettingsPayload, SaveSettingsResponse, SellerConfig,
@@ -48,7 +48,7 @@ pub async fn settings(
         configured,
         ready: configured && !config.public_base_url.is_empty() && active_mappings > 0,
         username: config.username.clone(),
-        api_key_masked: mask_api_key(&config.api_key),
+        api_key_configured: !config.api_key.is_empty(),
         public_base_url: config.public_base_url.clone(),
         digiflazz_callback_url: config.digiflazz_callback_url.clone(),
         server_ip: config.server_ip.clone(),
@@ -167,7 +167,7 @@ pub async fn save_settings(
         message: "Konfigurasi Digiflazz Seller berhasil disimpan",
         configured: true,
         username: saved_config.username,
-        api_key_masked: mask_api_key(&saved_config.api_key),
+        api_key_configured: !saved_config.api_key.is_empty(),
         public_base_url: saved_config.public_base_url,
         digiflazz_callback_url: saved_config.digiflazz_callback_url,
         server_ip: saved_config.server_ip,

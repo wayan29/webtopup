@@ -85,7 +85,6 @@ pub(super) async fn send_seller_callback(
             "skipped",
             &message,
             false,
-            None,
         )
         .await;
         return SellerActionResult {
@@ -116,7 +115,6 @@ pub(super) async fn send_seller_callback(
             "failed",
             &message,
             false,
-            Some(payload),
         )
         .await;
         return SellerActionResult {
@@ -158,7 +156,6 @@ pub(super) async fn send_seller_callback(
                 "delivered",
                 &message,
                 true,
-                Some(payload),
             )
             .await;
             SellerActionResult {
@@ -176,7 +173,6 @@ pub(super) async fn send_seller_callback(
                 "failed",
                 &message,
                 false,
-                Some(payload),
             )
             .await;
             SellerActionResult {
@@ -261,21 +257,16 @@ async fn log_seller_callback(
     status: &str,
     message: &str,
     verified: bool,
-    raw: Option<Value>,
 ) {
-    let mut document = doc! {
-        "provider": "digiflazz_seller",
-        "event": event,
-        "refId": document_string(order, "refId"),
-        "status": status,
-        "message": message,
-        "verified": verified,
-        "createdAt": DateTime::now(),
-        "updatedAt": DateTime::now(),
-    };
-    if let Some(raw) = raw {
-        document.insert("raw", mongodb::bson::to_bson(&raw).unwrap_or(Bson::Null));
-    }
+    let document = crate::services::seller_secrecy::safe_seller_event_document(
+        "digiflazz_seller",
+        event,
+        &document_string(order, "refId"),
+        status,
+        message,
+        verified,
+        "unknown",
+    );
     let _ = db
         .collection::<Document>("webhookeventlogs")
         .insert_one(document)

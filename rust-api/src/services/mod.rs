@@ -6,4 +6,5 @@ pub mod local_fault;
 pub mod managed_asset_registry;
 pub mod managed_assets;
 pub mod product_id;
+pub mod seller_secrecy;
 pub mod slider_readiness;

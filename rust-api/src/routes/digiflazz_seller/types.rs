@@ -21,8 +21,8 @@ pub(super) struct SellerSettingsResponse {
     pub(super) configured: bool,
     pub(super) ready: bool,
     pub(super) username: String,
-    #[serde(rename = "apiKeyMasked")]
-    pub(super) api_key_masked: String,
+    #[serde(rename = "apiKeyConfigured")]
+    pub(super) api_key_configured: bool,
     #[serde(rename = "publicBaseUrl")]
     pub(super) public_base_url: String,
     #[serde(rename = "digiflazzCallbackUrl")]
@@ -76,8 +76,8 @@ pub(super) struct SaveSettingsResponse {
     pub(super) message: &'static str,
     pub(super) configured: bool,
     pub(super) username: String,
-    #[serde(rename = "apiKeyMasked")]
-    pub(super) api_key_masked: String,
+    #[serde(rename = "apiKeyConfigured")]
+    pub(super) api_key_configured: bool,
     #[serde(rename = "publicBaseUrl")]
     pub(super) public_base_url: String,
     #[serde(rename = "digiflazzCallbackUrl")]
@@ -384,8 +384,6 @@ pub(super) struct SellerAdminOrderItem {
     pub(super) callback_last_message: String,
     #[serde(rename = "requestIp")]
     pub(super) request_ip: String,
-    #[serde(rename = "rawRequest")]
-    pub(super) raw_request: Option<Value>,
     #[serde(rename = "createdAt")]
     pub(super) created_at: String,
     #[serde(rename = "updatedAt")]

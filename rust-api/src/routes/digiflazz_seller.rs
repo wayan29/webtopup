@@ -692,7 +692,6 @@ fn seller_admin_order_from_doc(
         callback_last_status_code: optional_i64(&document, "callbackLastStatusCode"),
         callback_last_message: document_string(&document, "callbackLastMessage"),
         request_ip: document_string(&document, "requestIp"),
-        raw_request: document.get("rawRequest").map(bson_to_json),
         created_at: date_string(&document, "createdAt"),
         updated_at: date_string(&document, "updatedAt"),
         product: products
@@ -899,4 +898,138 @@ fn unavailable() -> Response {
         }),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn admin_order_item_fixture() -> SellerAdminOrderItem {
+        SellerAdminOrderItem {
+            id: "507f1f77bcf86cd799439011".to_string(),
+            ref_id: "seller-ref-fixture".to_string(),
+            tr_id: "DSFIXTURE123456".to_string(),
+            pulsa_code: "tsel10".to_string(),
+            target: "081200000000".to_string(),
+            price: 12_000,
+            status: "success".to_string(),
+            rc: "00".to_string(),
+            message: "Success".to_string(),
+            sn: "SN0001".to_string(),
+            vendor_name: "TokoVoucher".to_string(),
+            vendor_sku: "TSEL10".to_string(),
+            vendor_trx_id: "VENDORTRX1".to_string(),
+            callback_required: false,
+            callback_attempt_count: 0,
+            callback_delivered_at: None,
+            callback_last_attempt_at: None,
+            callback_next_retry_at: None,
+            callback_last_status_code: None,
+            callback_last_message: String::new(),
+            request_ip: "127.0.0.1".to_string(),
+            created_at: "2026-08-20T00:00:00.000Z".to_string(),
+            updated_at: "2026-08-20T00:00:00.000Z".to_string(),
+            product: None,
+        }
+    }
+
+    fn mapping_summary_fixture() -> MappingSummary {
+        MappingSummary { total: 2, active: 1 }
+    }
+
+    fn order_summary_fixture() -> OrderSummary {
+        OrderSummary {
+            total: 3,
+            pending: 1,
+            callback_pending: 1,
+            callback_due_retry: 0,
+            callback_high_attempt: 0,
+        }
+    }
+
+    fn retry_queue_health_fixture() -> RetryQueueHealth {
+        RetryQueueHealth {
+            status: "idle".to_string(),
+            source: "local".to_string(),
+            last_run_at: None,
+            processed: 0,
+            success_count: 0,
+            failed_count: 0,
+            remaining_due: 0,
+            last_error: String::new(),
+        }
+    }
+
+    fn settings_response_fixture() -> SellerSettingsResponse {
+        SellerSettingsResponse {
+            configured: true,
+            ready: true,
+            username: "seller-fixture".to_string(),
+            api_key_configured: true,
+            public_base_url: "https://seller.example".to_string(),
+            digiflazz_callback_url: "https://callback.example".to_string(),
+            server_ip: "127.0.0.1".to_string(),
+            reported_balance: 1_000_000,
+            seller_margin_flat: 250,
+            allowed_ips: vec!["127.0.0.1".to_string()],
+            callback_enabled: true,
+            prepaid_endpoint_path: "/api/v2/digiflazz-seller/prepaid".to_string(),
+            prepaid_endpoint_url: "https://seller.example/api/v2/digiflazz-seller/prepaid".to_string(),
+            mapping_summary: mapping_summary_fixture(),
+            order_summary: order_summary_fixture(),
+            retry_queue_health: retry_queue_health_fixture(),
+        }
+    }
+
+    fn save_settings_response_fixture() -> SaveSettingsResponse {
+        SaveSettingsResponse {
+            success: true,
+            message: "saved",
+            configured: true,
+            username: "seller-fixture".to_string(),
+            api_key_configured: true,
+            public_base_url: "https://seller.example".to_string(),
+            digiflazz_callback_url: "https://callback.example".to_string(),
+            server_ip: "127.0.0.1".to_string(),
+            reported_balance: 1_000_000,
+            seller_margin_flat: 250,
+            allowed_ips: vec!["127.0.0.1".to_string()],
+            callback_enabled: true,
+            prepaid_endpoint_url: "https://seller.example/api/v2/digiflazz-seller/prepaid".to_string(),
+        }
+    }
+
+    #[test]
+    fn admin_order_item_json_never_exposes_raw_request() {
+        let json = serde_json::to_value(admin_order_item_fixture()).unwrap();
+        assert!(
+            json.get("rawRequest").is_none(),
+            "admin seller order DTO must not expose rawRequest"
+        );
+        assert!(!json.to_string().contains("fixture-signature"));
+    }
+
+    #[test]
+    fn production_prepaid_source_never_inserts_raw_request() {
+        let source = include_str!("digiflazz_seller/prepaid.rs");
+        let tests = source.find("\n#[cfg(test)]").unwrap_or(source.len());
+        let production = &source[..tests];
+        assert!(
+            !production.contains("\"rawRequest\":"),
+            "production seller order writes must not persist rawRequest"
+        );
+    }
+
+    #[test]
+    fn settings_responses_expose_configured_boolean_without_key_fragments() {
+        let read_json = serde_json::to_value(settings_response_fixture()).unwrap();
+        assert_eq!(read_json["apiKeyConfigured"], serde_json::Value::Bool(true));
+        assert!(read_json.get("apiKeyMasked").is_none());
+        assert!(!read_json.to_string().contains("1234"));
+
+        let save_json = serde_json::to_value(save_settings_response_fixture()).unwrap();
+        assert_eq!(save_json["apiKeyConfigured"], serde_json::Value::Bool(true));
+        assert!(save_json.get("apiKeyMasked").is_none());
+        assert!(!save_json.to_string().contains("1234"));
+    }
 }

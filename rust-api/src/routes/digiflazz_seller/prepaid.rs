@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime, Document};
+use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use rand::{distributions::Alphanumeric, Rng};
 use serde_json::Value;
 
@@ -35,7 +35,6 @@ pub async fn prepaid(
     let db = client.database(&state.mongo_db);
     let config = seller_config(&db).await;
     let request_ip = client_ip(&headers);
-    let raw = payload_raw(&payload);
     let ref_id = payload
         .ref_id
         .as_ref()
@@ -75,7 +74,6 @@ pub async fn prepaid(
         return reject(
             &db,
             &config,
-            &raw,
             &request_ip,
             &ref_id,
             &pulsa_code,
@@ -94,7 +92,6 @@ pub async fn prepaid(
         return reject(
             &db,
             &config,
-            &raw,
             &request_ip,
             &ref_id,
             &pulsa_code,
@@ -113,7 +110,6 @@ pub async fn prepaid(
         return reject(
             &db,
             &config,
-            &raw,
             &request_ip,
             &ref_id,
             &pulsa_code,
@@ -134,7 +130,6 @@ pub async fn prepaid(
         return reject(
             &db,
             &config,
-            &raw,
             &request_ip,
             &ref_id,
             &pulsa_code,
@@ -153,7 +148,6 @@ pub async fn prepaid(
         return reject(
             &db,
             &config,
-            &raw,
             &request_ip,
             &ref_id,
             &pulsa_code,
@@ -172,7 +166,7 @@ pub async fn prepaid(
     }
 
     if let Some(response) =
-        reply_with_existing_seller_order(&db, &state, &config, &request_ip, &raw, &ref_id).await
+        reply_with_existing_seller_order(&db, &state, &config, &request_ip, &ref_id).await
     {
         return response;
     }
@@ -181,7 +175,6 @@ pub async fn prepaid(
         return reject(
             &db,
             &config,
-            &raw,
             &request_ip,
             &ref_id,
             &pulsa_code,
@@ -200,7 +193,6 @@ pub async fn prepaid(
         return reject(
             &db,
             &config,
-            &raw,
             &request_ip,
             &ref_id,
             &pulsa_code,
@@ -225,7 +217,6 @@ pub async fn prepaid(
         return reject(
             &db,
             &config,
-            &raw,
             &request_ip,
             &ref_id,
             &pulsa_code,
@@ -243,7 +234,6 @@ pub async fn prepaid(
         return reject(
             &db,
             &config,
-            &raw,
             &request_ip,
             &ref_id,
             &pulsa_code,
@@ -267,7 +257,6 @@ pub async fn prepaid(
         return reject(
             &db,
             &config,
-            &raw,
             &request_ip,
             &ref_id,
             &pulsa_code,
@@ -288,7 +277,6 @@ pub async fn prepaid(
         return reject(
             &db,
             &config,
-            &raw,
             &request_ip,
             &ref_id,
             &pulsa_code,
@@ -306,7 +294,6 @@ pub async fn prepaid(
         return reject(
             &db,
             &config,
-            &raw,
             &request_ip,
             &ref_id,
             &pulsa_code,
@@ -349,7 +336,6 @@ pub async fn prepaid(
         "vendorSku": &vendor_sku,
         "vendorTrxId": &tr_id,
         "requestIp": &request_ip,
-        "rawRequest": mongodb::bson::to_bson(&raw).unwrap_or(Bson::Null),
         "callbackRequired": config.callback_enabled,
         "callbackAttemptCount": 0_i64,
         "callbackLastMessage": "",
@@ -368,7 +354,7 @@ pub async fn prepaid(
             .unwrap_or_else(ObjectId::new),
         Err(_) => {
             if let Some(response) =
-                reply_with_existing_seller_order(&db, &state, &config, &request_ip, &raw, &ref_id)
+                reply_with_existing_seller_order(&db, &state, &config, &request_ip, &ref_id)
                     .await
             {
                 return response;
@@ -435,7 +421,6 @@ pub async fn prepaid(
             &document_string(&updated, "message"),
             true,
             &request_ip,
-            Some(raw),
         )
         .await;
         return Json(build_response_from_order(&updated, &config)).into_response();
@@ -461,7 +446,6 @@ pub async fn prepaid(
             "Produk belum punya vendor supplier yang bisa diproses",
             true,
             &request_ip,
-            Some(raw),
         )
         .await;
         return Json(build_response_from_order(&updated, &config)).into_response();
@@ -507,7 +491,6 @@ pub async fn prepaid(
         &document_string(&updated, "message"),
         true,
         &request_ip,
-        Some(raw),
     )
     .await;
     Json(build_response_from_order(&updated, &config)).into_response()
@@ -539,7 +522,6 @@ async fn reply_with_existing_seller_order(
     state: &AppState,
     config: &SellerConfig,
     request_ip: &str,
-    raw: &Value,
     ref_id: &str,
 ) -> Option<Response> {
     let existing = db
@@ -590,7 +572,6 @@ async fn reply_with_existing_seller_order(
         "Status order dikembalikan dari data existing",
         true,
         request_ip,
-        Some(raw.clone()),
     )
     .await;
     Some(Json(build_response_from_order(&latest, config)).into_response())
@@ -640,7 +621,6 @@ async fn update_seller_order_status(
 async fn reject(
     db: &mongodb::Database,
     config: &SellerConfig,
-    raw: &Value,
     request_ip: &str,
     ref_id: &str,
     pulsa_code: &str,
@@ -659,7 +639,6 @@ async fn reject(
         &log_message,
         verified,
         request_ip,
-        Some(raw.clone()),
     )
     .await;
     Json(build_error_response(
@@ -778,23 +757,16 @@ async fn log_seller_request(
     message: &str,
     verified: bool,
     request_ip: &str,
-    raw: Option<Value>,
 ) {
-    let now = DateTime::now();
-    let mut document = doc! {
-        "provider": "digiflazz_seller",
-        "event": "request",
-        "refId": ref_id,
-        "status": status,
-        "message": message,
-        "verified": verified,
-        "requestIp": request_ip,
-        "createdAt": now,
-        "updatedAt": now,
-    };
-    if let Some(raw) = raw {
-        document.insert("raw", mongodb::bson::to_bson(&raw).unwrap_or(Bson::Null));
-    }
+    let document = crate::services::seller_secrecy::safe_seller_event_document(
+        "digiflazz_seller",
+        "request",
+        ref_id,
+        status,
+        message,
+        verified,
+        request_ip,
+    );
     let _ = db
         .collection::<Document>("webhookeventlogs")
         .insert_one(document)
@@ -839,17 +811,6 @@ fn client_ip(headers: &HeaderMap) -> String {
         .to_string()
 }
 
-fn payload_raw(payload: &SellerPrepaidPayload) -> Value {
-    serde_json::json!({
-        "ref_id": payload.ref_id.clone().unwrap_or(Value::Null),
-        "pulsa_code": payload.pulsa_code.clone().unwrap_or(Value::Null),
-        "hp": payload.hp.clone().unwrap_or(Value::Null),
-        "price": payload.price.clone().unwrap_or(Value::Null),
-        "sign": payload.sign.clone().unwrap_or(Value::Null),
-        "username": payload.username.clone().unwrap_or(Value::Null),
-        "commands": payload.commands.clone().unwrap_or(Value::Null),
-    })
-}
 
 async fn generate_seller_ref_id(_db: &mongodb::Database) -> String {
     let suffix: String = rand::thread_rng()
