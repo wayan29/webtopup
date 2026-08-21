@@ -35,6 +35,29 @@ test('identifier readiness binary is registered and disposable-only', async () =
   assert.match(service, /SUCCESS_CACHE_TTL/u);
 });
 
+test('Rust startup gates listener readiness on seller order indexes without creating them', async () => {
+  const source = await fs.readFile(path.join(root, 'rust-api/src/main.rs'), 'utf8');
+  assert.match(source, /services::seller_integrity::ensure_seller_order_indexes_ready\(&db\)\s*\.await\s*\.context\("seller order indexes failed before listener readiness"\)\?;/u);
+  const ensureAt = source.indexOf('services::seller_integrity::ensure_seller_order_indexes_ready(&db)');
+  const listenAt = source.indexOf('let listener = tokio::net::TcpListener::bind(addr)');
+  assert.ok(listenAt > ensureAt, 'listener must bind only after seller order index readiness succeeds');
+  assert.doesNotMatch(source, /seller_order_readiness/u);
+  assert.doesNotMatch(source, /create_index/u, 'startup must never create seller indexes');
+});
+
+test('seller order readiness binary is registered and disposable-only', async () => {
+  const cargo = await fs.readFile(path.join(root, 'rust-api/Cargo.toml'), 'utf8');
+  assert.match(cargo, /name\s*=\s*"seller_order_readiness"/u);
+  const binary = await fs.readFile(path.join(root, 'rust-api/src/bin/seller_order_readiness.rs'), 'utf8');
+  assert.match(binary, /webtopup_task14_dev/u);
+  assert.match(binary, /seller_apply_allowed/u);
+  assert.match(binary, /--apply/u);
+  const service = await fs.readFile(path.join(root, 'rust-api/src/services/seller_integrity.rs'), 'utf8');
+  assert.match(service, /digiflazzsellerorders/u);
+  assert.match(service, /irssellerorders/u);
+  assert.match(service, /ensure_seller_order_indexes_ready/u);
+});
+
 test('Rust startup gates listener readiness on site config foundation indexes', async () => {
   const source = await fs.readFile(path.join(root, 'rust-api/src/main.rs'), 'utf8');
   assert.match(source, /routes::settings::ensure_site_config_foundation_indexes\(&db\)/u);

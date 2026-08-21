@@ -21,6 +21,10 @@ path = "src/bin/site_config_identifier_readiness.rs"
 name = "slider_managed_asset_readiness"
 path = "src/bin/slider_managed_asset_readiness.rs"
 
+[[bin]]
+name = "seller_order_readiness"
+path = "src/bin/seller_order_readiness.rs"
+
 [dependencies]
 ammonia = "=4.1.2"
 base64 = "=0.22.1"

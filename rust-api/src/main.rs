@@ -75,6 +75,12 @@ async fn main() -> anyhow::Result<()> {
                     "site config foundation indexes failed before listener readiness: {error:?}"
                 )
             })?;
+        // Seller order refId uniqueness is a readiness requirement: exact unique
+        // indexes must already exist (created by the guarded readiness tool);
+        // startup verifies and never creates or drops them.
+        services::seller_integrity::ensure_seller_order_indexes_ready(&db)
+            .await
+            .context("seller order indexes failed before listener readiness")?;
         // Slider readiness is inspection-only in production.  Missing indexes/data are logged as
         // a false capability state; no production index creation, registration, or repair occurs.
         let slider_report = services::slider_readiness::inspect_slider_foundation(
