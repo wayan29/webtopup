@@ -237,8 +237,7 @@ export const ADMIN_NAV_BLUEPRINT: AdminNavBlueprintItem[] = [
         submenu: [
             { name: 'Ringkasan Add Ons', path: '/admin/addons', permission: 'manageVendors', subtitle: 'Ringkasan integrasi aktif' },
             { name: 'Digiflazz', path: '/admin/addons/digiflazz', permission: 'manageVendors', subtitle: 'Provider Digiflazz' },
-            { name: 'Digiflazz Seller', path: '/admin/addons/digiflazz-seller', permission: 'manageVendors', subtitle: 'Seller API Digiflazz' },
-            { name: 'IRS Seller', path: '/admin/addons/irs-seller', permission: 'manageVendors', subtitle: 'Seller channel IRS' },
+            { name: 'Digiflazz Seller Center', path: '/admin/addons/digiflazz-seller-center', permission: 'manageVendors', subtitle: 'Seller API Digiflazz & IRS' },
             { name: 'Tokovoucher', path: '/admin/addons/tokovoucher', permission: 'manageVendors', subtitle: 'Provider Tokovoucher' }
         ]
     },

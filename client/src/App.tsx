@@ -36,8 +36,7 @@ import {
   AdminRewards,
   AdminTeams,
   AdminDigiflazzSettings,
-  AdminDigiflazzSellerSettings,
-  AdminIrsSellerSettings,
+  AdminDigiflazzSellerCenter,
   AdminTokovoucherSettings,
   AdminMargins,
   AdminValidation,
@@ -593,16 +592,13 @@ function App() {
               <AdminDigiflazzSettings />
             </AdminGuarded>
           } />
-          <Route path="addons/digiflazz-seller" element={
-            <AdminGuarded path="/admin/addons/digiflazz-seller">
-              <AdminDigiflazzSellerSettings />
+          <Route path="addons/digiflazz-seller-center" element={
+            <AdminGuarded path="/admin/addons/digiflazz-seller-center">
+              <AdminDigiflazzSellerCenter />
             </AdminGuarded>
           } />
-          <Route path="addons/irs-seller" element={
-            <AdminGuarded path="/admin/addons/irs-seller">
-              <AdminIrsSellerSettings />
-            </AdminGuarded>
-          } />
+          <Route path="addons/digiflazz-seller" element={<Navigate replace to="/admin/addons/digiflazz-seller-center?section=overview" />} />
+          <Route path="addons/irs-seller" element={<Navigate replace to="/admin/addons/digiflazz-seller-center?section=irs" />} />
           <Route path="addons/tokovoucher" element={
             <AdminGuarded path="/admin/addons/tokovoucher">
               <AdminTokovoucherSettings />

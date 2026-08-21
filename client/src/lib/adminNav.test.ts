@@ -143,3 +143,38 @@ test('legacy Slider and campaign preferences migrate without duplicate menu name
         ['Slider Beranda', 'Kampanye'],
     );
 });
+
+test('seller center is the single canonical add-on identity with legacy redirects', () => {
+    const addons = ADMIN_NAV_BLUEPRINT.find((item) => item.id === 'addons');
+    assert.ok(addons?.submenu, 'Add Ons must keep a submenu');
+    const names = addons.submenu.map((item) => item.name);
+    assert.deepEqual(
+        names.filter((name) => name === 'Digiflazz Seller Center'),
+        ['Digiflazz Seller Center'],
+    );
+    assert.equal(names.includes('IRS Seller'), false);
+    assert.equal(names.includes('Digiflazz Seller'), false);
+
+    const paths = addons.submenu.map((item) => item.path);
+    assert.equal(paths.includes('/admin/addons/digiflazz-seller'), false);
+    assert.equal(paths.includes('/admin/addons/irs-seller'), false);
+
+    const center = addons.submenu.find((item) => item.name === 'Digiflazz Seller Center');
+    assert.equal(center?.path, '/admin/addons/digiflazz-seller-center');
+    assert.equal(center?.permission, 'manageVendors');
+
+    for (const path of [
+        '/admin/addons/digiflazz-seller-center',
+        '/admin/addons/digiflazz-seller',
+        '/admin/addons/irs-seller',
+    ]) {
+        const rule = getAdminRoutePermission(path);
+        assert.equal(rule?.permission, 'manageVendors', `${path} permission`);
+    }
+
+    // Persisted preferences are top-level only; unknown submenu names are dropped unchanged.
+    const order = normalizeAdminMenuOrder(['Digiflazz Seller', 'Add Ons']);
+    assert.equal(order.includes('Digiflazz Seller'), false);
+    assert.ok(order.includes('Add Ons'));
+    assert.deepEqual(Object.keys(ADMIN_MENU_NAME_ALIASES).includes('IRS Seller'), false);
+});
