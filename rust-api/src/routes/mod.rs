@@ -262,6 +262,10 @@ pub fn app(state: Arc<AppState>) -> Router {
             "/v2/digiflazz-seller/settings",
             get(digiflazz_seller::settings).post(digiflazz_seller::save_settings),
         )
+        .route(
+            "/v2/digiflazz-seller/center-summary",
+            get(digiflazz_seller::center_summary),
+        )
         .route("/v2/digiflazz-seller/logs", get(digiflazz_seller::logs))
         .route(
             "/v2/digiflazz-seller/prepaid",

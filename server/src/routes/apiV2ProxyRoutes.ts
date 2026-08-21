@@ -1528,6 +1528,7 @@ const proxyUnlock = async (request: AuthRequest, reply: FastifyReply) => {
     app.put('/deposits/:id/reject', { preHandler: [authenticate, hasPermission('approveDeposits'), requireStepUp('finance.deposit_approval')] }, proxyRequest);
     app.all('/deposits/*', { preHandler: [authenticate, hasPermission('viewDeposits')] }, proxyRequest);
     app.post('/digiflazz-seller/prepaid', proxyRequest);
+    app.get('/digiflazz-seller/center-summary', { preHandler: [authenticate, hasPermission('manageVendors')] }, proxyRequest);
     app.get('/digiflazz-seller/orders/admin', { preHandler: [authenticate, hasPermission('viewTransactions')] }, proxyRequest);
     app.post('/digiflazz-seller/orders/process-callback-retries/scheduler', { preHandler: [webhookRateLimit] }, proxyRequest);
     app.post('/digiflazz-seller/settings', { preHandler: [authenticate, hasPermission('manageVendors'), requireStepUp('integrations.credentials')] }, proxyRequest);

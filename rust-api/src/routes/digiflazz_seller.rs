@@ -19,6 +19,7 @@ use crate::{
 const SELLER_ORDER_EXPORT_LIMIT: i64 = 5000;
 
 mod callbacks;
+mod center;
 mod logs;
 mod mappings;
 mod prepaid;
@@ -28,6 +29,7 @@ mod types;
 mod utils;
 
 use callbacks::*;
+pub use center::center_summary;
 pub use logs::logs;
 pub use mappings::{delete_mapping, mappings, save_mapping, sync_all_mappings, sync_mapping_by_id};
 pub use prepaid::prepaid;

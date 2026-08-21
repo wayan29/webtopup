@@ -265,6 +265,69 @@ pub(super) struct SavedMappingItem {
     pub(super) last_sync_at: Option<String>,
 }
 
+#[derive(Clone, Serialize)]
+pub(super) struct SellerCenterIssue {
+    pub(super) code: &'static str,
+    pub(super) source: &'static str,
+}
+
+impl SellerCenterIssue {
+    pub(super) const fn new(code: &'static str, source: &'static str) -> Self {
+        Self { code, source }
+    }
+}
+
+#[derive(Serialize)]
+pub(super) struct SellerCenterSummaryResponse {
+    pub(super) ok: bool,
+    pub(super) partial: bool,
+    pub(super) issues: Vec<SellerCenterIssue>,
+    #[serde(rename = "generatedAt")]
+    pub(super) generated_at: String,
+    pub(super) digiflazz: SellerCenterDigiflazz,
+    pub(super) irs: SellerCenterIrs,
+    pub(super) mappings: SellerCenterMappings,
+}
+
+#[derive(Serialize)]
+pub(super) struct SellerCenterDigiflazz {
+    pub(super) configured: bool,
+    pub(super) ready: bool,
+    pub(super) status: String,
+    pub(super) orders: SellerCenterDigiflazzOrders,
+}
+
+#[derive(Default, Serialize)]
+pub(super) struct SellerCenterDigiflazzOrders {
+    pub(super) total: i64,
+    pub(super) pending: i64,
+    pub(super) failed: i64,
+    #[serde(rename = "callbackPending")]
+    pub(super) callback_pending: i64,
+}
+
+#[derive(Serialize)]
+pub(super) struct SellerCenterIrs {
+    pub(super) enabled: bool,
+    pub(super) configured: bool,
+    pub(super) ready: bool,
+    pub(super) status: String,
+    pub(super) orders: SellerCenterOrderCounts,
+}
+
+#[derive(Default, Serialize)]
+pub(super) struct SellerCenterOrderCounts {
+    pub(super) total: i64,
+    pub(super) pending: i64,
+    pub(super) failed: i64,
+}
+
+#[derive(Default, Serialize)]
+pub(super) struct SellerCenterMappings {
+    pub(super) total: i64,
+    pub(super) active: i64,
+}
+
 #[derive(Serialize)]
 pub(super) struct SellerLogItem {
     pub(super) id: String,

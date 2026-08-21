@@ -279,3 +279,30 @@ test('legacy vendor routes are not registered in the gateway app', () => {
     const appSource = readFileSync(join(__dirname, '..', '..', 'src', 'app.ts'), 'utf8');
     assert.doesNotMatch(appSource, /vendorRoutes/);
 });
+
+test('seller center summary keeps exact permissions and public prepaid order', () => {
+    const source = readFileSync(join(__dirname, '..', '..', 'src', 'routes', 'apiV2ProxyRoutes.ts'), 'utf8');
+    assert.match(source, /app\.get\('\/digiflazz-seller\/center-summary', \{ preHandler: \[authenticate, hasPermission\('manageVendors'\)\] \}/u);
+    assert.match(source, /app\.post\('\/digiflazz-seller\/settings', \{ preHandler: \[authenticate, hasPermission\('manageVendors'\), requireStepUp\('integrations\.credentials'\)\] \}/u);
+    assert.match(source, /app\.post\('\/irs-seller\/settings', \{ preHandler: \[authenticate, hasPermission\('manageVendors'\), requireStepUp\('integrations\.credentials'\)\] \}/u);
+
+    const summaryAt = source.indexOf("app.get('/digiflazz-seller/center-summary'");
+    const digiflazzCatchAllAt = source.indexOf("app.all('/digiflazz-seller/*'");
+    assert.ok(summaryAt > -1 && summaryAt < digiflazzCatchAllAt, 'summary must register before the protected catch-all');
+
+    for (const prepaidLine of ["app.post('/digiflazz-seller/prepaid'", "app.post('/irs-seller/prepaid'"]) {
+        const lineAt = source.indexOf(prepaidLine);
+        const lineEnd = source.indexOf('\n', lineAt);
+        const line = source.slice(lineAt, lineEnd);
+        assert.ok(!line.includes('authenticate'), `${prepaidLine} must stay public`);
+    }
+    const irsPrepaidAt = source.indexOf("app.post('/irs-seller/prepaid'");
+    const irsCatchAllAt = source.indexOf("app.all('/irs-seller/*'");
+    assert.ok(irsPrepaidAt < irsCatchAllAt, 'public IRS prepaid must register before the catch-all');
+});
+
+test('legacy node seller controllers stay unregistered', () => {
+    const appSource = readFileSync(join(__dirname, '..', '..', 'src', 'app.ts'), 'utf8');
+    assert.doesNotMatch(appSource, /digiflazzSellerRoutes/);
+    assert.doesNotMatch(appSource, /irsSellerRoutes/);
+});

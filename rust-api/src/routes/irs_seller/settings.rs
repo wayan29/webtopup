@@ -75,7 +75,7 @@ pub(super) fn irs_settings_response(config: &Document, active_mappings: i64) -> 
     }
 }
 
-pub(super) async fn stored_config(
+pub(crate) async fn stored_config(
     db: &mongodb::Database,
 ) -> mongodb::error::Result<Option<Document>> {
     let document = db

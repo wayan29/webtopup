@@ -6,6 +6,7 @@ mod types;
 pub use admin::{admin_orders, delete_mapping, logs, mappings, save_mapping};
 pub use prepaid::prepaid;
 pub use settings::{save_settings, settings};
+pub(crate) use settings::stored_config;
 
 use axum::{
     http::HeaderMap,
