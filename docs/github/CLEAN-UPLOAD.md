@@ -1,6 +1,8 @@
 # Upload ulang GitHub (repo bersih)
 
-Folder ini adalah snapshot aplikasi **tanpa**:
+Dokumen ini adalah catatan snapshot/upload ulang, bukan prosedur harian. Upload biasa tetap lewat [UPLOAD_GUIDE.md](UPLOAD_GUIDE.md).
+
+Folder snapshot yang dirujuk di sini adalah aplikasi **tanpa**:
 
 - history git lama
 - `docs/superpowers/`, `.superpowers/`, `docs/ai/`, `skills/`, `CLAUDE.md`

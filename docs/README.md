@@ -18,6 +18,7 @@
 - [UPLOAD_GUIDE.md](github/UPLOAD_GUIDE.md): langkah upload/publish repository
 - [READY_TO_UPLOAD.md](github/READY_TO_UPLOAD.md): checklist sebelum push
 - [GIT_SETUP_COMPLETE.md](github/GIT_SETUP_COMPLETE.md): verifikasi cepat setelah setup git
+- [CLEAN-UPLOAD.md](github/CLEAN-UPLOAD.md): catatan snapshot/upload ulang GitHub (bukan prosedur harian)
 - [CONTRIBUTING.md](../CONTRIBUTING.md): aturan branch, commit, PR, dan update repo
 
 
@@ -30,7 +31,9 @@
 
 ## Operations
 
-- [product-id-integrity.md](operations/product-id-integrity.md): integritas product id dan runbook operasional terkait
+- [product-id-integrity.md](ops/product-id-integrity.md): integritas product id dan runbook operasional terkait
+- [backup-restore-monitoring.md](ops/backup-restore-monitoring.md): backup Mongo, uji restore disposable, dan status report
+- [digiflazz-seller-center-hygiene.md](ops/digiflazz-seller-center-hygiene.md): hygiene raw payload Seller Center dan indeks `refId`
 
 
 ## Assets

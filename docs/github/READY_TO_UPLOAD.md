@@ -27,4 +27,4 @@
 - [ ] PR description siap
 - [ ] checklist PR sudah diisi
 
-Upload guide detail ada di [UPLOAD_GUIDE.md](/home/web/docs/github/UPLOAD_GUIDE.md).
+Upload guide detail ada di [UPLOAD_GUIDE.md](UPLOAD_GUIDE.md). Catatan snapshot/upload ulang ada di [CLEAN-UPLOAD.md](CLEAN-UPLOAD.md).
