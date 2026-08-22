@@ -2,9 +2,20 @@ import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Search, Settings, CreditCard, BarChart3, MessageSquare, Server, Zap, RefreshCw } from 'lucide-react';
 import { apiV2 } from '../../api';
+import {
+    malformedSellerCenterSummary,
+    parseSellerCenterSummary,
+    type SellerCenterStatus,
+} from '../../lib/digiflazzSellerCenter';
 
 type AddOnCategory = 'Semua' | 'Mutasi' | 'Payment' | 'Vendor' | 'Wa';
 type AddOnStatus = 'ready' | 'needs_setup' | 'attention' | 'coming_soon';
+
+type AddOnStatusRow = {
+    label: string;
+    status: string;
+    tone: 'ok' | 'warn' | 'muted' | 'bad';
+};
 
 type AddOn = {
     id: string;
@@ -16,19 +27,11 @@ type AddOn = {
     note: string;
     settingPath?: string;
     available: boolean;
+    statusRows?: AddOnStatusRow[];
 };
 
 type VendorSettingsResponse = {
     configured?: boolean;
-};
-
-type DigiflazzSellerSettingsResponse = {
-    configured?: boolean;
-    ready?: boolean;
-    publicBaseUrl?: string;
-    mappingSummary?: {
-        active?: number;
-    };
 };
 
 type WebhookConfigResponse = {
@@ -60,9 +63,34 @@ const baseAddOns: Omit<AddOn, 'status' | 'note'>[] = [
     { id: 'easywa', name: 'EASYWA', description: 'Integrasi WhatsApp belum tersedia di admin ini.', category: 'Wa', icon: 'message', available: false },
     { id: 'mesin-otomatis', name: 'MESIN OTOMATIS', description: 'Belum ada pengaturan khusus di panel ini.', category: 'Vendor', icon: 'zap', available: false },
     { id: 'digiflazz', name: 'DIGIFLAZZ', description: 'Vendor H2H Pulsa, Data, PLN, dll', category: 'Vendor', icon: 'server', available: true, settingPath: '/admin/addons/digiflazz' },
-    { id: 'digiflazz-seller', name: 'DIGIFLAZZ SELLER', description: 'Expose produk lokal Anda ke Digiflazz Seller API', category: 'Vendor', icon: 'server', available: true, settingPath: '/admin/addons/digiflazz-seller' },
+    { id: 'digiflazz-seller-center', name: 'DIGIFLAZZ SELLER CENTER', description: 'Jual produk lokal lewat Digiflazz Seller API dan integrasi IRS', category: 'Vendor', icon: 'server', available: true, settingPath: '/admin/addons/digiflazz-seller-center' },
     { id: 'tokovoucher', name: 'TOKOVOUCHER', description: 'Vendor H2H Voucher Game, Pulsa, Data', category: 'Vendor', icon: 'server', available: true, settingPath: '/admin/addons/tokovoucher' },
 ];
+
+const statusRowLabel: Record<SellerCenterStatus, string> = {
+    ready: 'Siap',
+    disabled: 'Nonaktif',
+    needs_setup: 'Perlu Setup',
+    attention: 'Perlu Tindakan',
+    unavailable: 'Tidak tersedia',
+};
+
+const statusRowTone: Record<SellerCenterStatus, AddOnStatusRow['tone']> = {
+    ready: 'ok',
+    disabled: 'muted',
+    needs_setup: 'warn',
+    attention: 'warn',
+    unavailable: 'bad',
+};
+
+const statusRowToneClass: Record<AddOnStatusRow['tone'], string> = {
+    ok: 'ui-success-chip',
+    warn: 'ui-warning-chip',
+    muted: 'ui-panel ui-text-muted',
+    bad: 'ui-danger-chip',
+};
+
+const unavailableRow = (label: string): AddOnStatusRow => ({ label, status: 'Tidak tersedia', tone: 'bad' });
 
 const categories: AddOnCategory[] = ['Semua', 'Mutasi', 'Payment', 'Vendor', 'Wa'];
 
@@ -101,19 +129,17 @@ export default function AddOns() {
 
             const [digiflazzSettings, digiflazzSellerSettings, tokovoucherSettings, digiflazzWebhook, tokovoucherWebhook] = await Promise.allSettled([
                 apiV2.get<VendorSettingsResponse>('/vendors/digiflazz/settings'),
-                apiV2.get<DigiflazzSellerSettingsResponse>('/digiflazz-seller/settings'),
+                apiV2.get('/digiflazz-seller/center-summary'),
                 apiV2.get<VendorSettingsResponse>('/vendors/tokovoucher/settings'),
                 apiV2.get<WebhookConfigResponse>('/webhook/digiflazz/config'),
                 apiV2.get<WebhookConfigResponse>('/webhook/tokovoucher/config')
             ]);
 
             const digiflazzConfigured = digiflazzSettings.status === 'fulfilled' && Boolean(digiflazzSettings.value.data?.configured);
-            const digiflazzSellerConfigured = digiflazzSellerSettings.status === 'fulfilled' && Boolean(digiflazzSellerSettings.value.data?.configured);
-            const digiflazzSellerReady = digiflazzSellerSettings.status === 'fulfilled' && Boolean(digiflazzSellerSettings.value.data?.ready);
-            const digiflazzSellerPublicBaseUrl = digiflazzSellerSettings.status === 'fulfilled' && Boolean(digiflazzSellerSettings.value.data?.publicBaseUrl);
-            const digiflazzSellerActiveMappings = digiflazzSellerSettings.status === 'fulfilled'
-                ? Number(digiflazzSellerSettings.value.data?.mappingSummary?.active || 0)
-                : 0;
+            const centerSummary = digiflazzSellerSettings.status === 'fulfilled'
+                ? parseSellerCenterSummary(digiflazzSellerSettings.value.data)
+                : malformedSellerCenterSummary();
+            const centerReadable = digiflazzSellerSettings.status === 'fulfilled' && centerSummary.ok;
             const digiflazzProtection = digiflazzWebhook.status === 'fulfilled'
                 ? digiflazzWebhook.value.data?.protectionMode || 'unprotected'
                 : 'unprotected';
@@ -149,37 +175,59 @@ export default function AddOns() {
                     };
                 }
 
-                if (addon.id === 'digiflazz-seller') {
-                    if (!digiflazzSellerConfigured) {
+                if (addon.id === 'digiflazz-seller-center') {
+                    if (!centerReadable) {
+                        return {
+                            ...addon,
+                            status: 'attention',
+                            note: 'Status integrasi tidak dapat dibaca. Coba segarkan halaman.',
+                            statusRows: [unavailableRow('Digiflazz API'), unavailableRow('Integrasi IRS')]
+                        };
+                    }
+
+                    const digiflazzRow: AddOnStatusRow = {
+                        label: 'Digiflazz API',
+                        status: statusRowLabel[centerSummary.digiflazz.status],
+                        tone: statusRowTone[centerSummary.digiflazz.status]
+                    };
+                    const irsRow: AddOnStatusRow = {
+                        label: 'Integrasi IRS',
+                        status: statusRowLabel[centerSummary.irs.status],
+                        tone: statusRowTone[centerSummary.irs.status]
+                    };
+
+                    if (centerSummary.partial || centerSummary.digiflazz.status === 'unavailable' || centerSummary.irs.status === 'unavailable') {
+                        return {
+                            ...addon,
+                            status: 'attention',
+                            note: 'Sebagian status integrasi tidak tersedia.',
+                            statusRows: [digiflazzRow, irsRow]
+                        };
+                    }
+
+                    if (centerSummary.digiflazz.status === 'attention') {
+                        return {
+                            ...addon,
+                            status: 'attention',
+                            note: 'Belum ada mapping produk aktif untuk dijual ke Digiflazz.',
+                            statusRows: [digiflazzRow, irsRow]
+                        };
+                    }
+
+                    if (centerSummary.digiflazz.status === 'needs_setup') {
                         return {
                             ...addon,
                             status: 'needs_setup',
-                            note: 'Kredensial Digiflazz Seller belum lengkap.'
-                        };
-                    }
-
-                    if (!digiflazzSellerPublicBaseUrl) {
-                        return {
-                            ...addon,
-                            status: 'attention',
-                            note: 'Public Base URL belum diisi, endpoint seller belum siap didaftarkan.'
-                        };
-                    }
-
-                    if (digiflazzSellerActiveMappings === 0) {
-                        return {
-                            ...addon,
-                            status: 'attention',
-                            note: 'Belum ada mapping produk aktif untuk dijual ke Digiflazz.'
+                            note: 'Kredensial Digiflazz Seller belum lengkap.',
+                            statusRows: [digiflazzRow, irsRow]
                         };
                     }
 
                     return {
                         ...addon,
-                        status: digiflazzSellerReady ? 'ready' : 'attention',
-                        note: digiflazzSellerReady
-                            ? `Seller API siap dengan ${digiflazzSellerActiveMappings} mapping aktif.`
-                            : 'Konfigurasi seller hampir siap, cek endpoint dan mapping aktif.'
+                        status: 'ready',
+                        note: `Seller API siap dengan ${centerSummary.mappings.active} mapping aktif.`,
+                        statusRows: [digiflazzRow, irsRow]
                     };
                 }
 
@@ -348,6 +396,16 @@ export default function AddOns() {
                                 </div>
                                 <div className="mt-1 text-sm ui-text-muted">{addon.description}</div>
                                 <div className="mt-2 text-sm ui-text">{addon.note}</div>
+                                {addon.statusRows && (
+                                    <div className="mt-2 flex flex-col gap-1.5">
+                                        {addon.statusRows.map((row) => (
+                                            <div key={row.label} className="flex items-center justify-between gap-2 text-xs">
+                                                <span className="ui-text-muted">{row.label}</span>
+                                                <span className={`inline-flex rounded-full border px-2 py-0.5 font-semibold ${statusRowToneClass[row.tone]}`}>{row.status}</span>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
                             </div>
                             <div className="flex flex-col items-end gap-2 shrink-0">
                                 {addon.settingPath ? (

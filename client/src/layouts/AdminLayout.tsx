@@ -160,11 +160,7 @@ const routeMetaOverrides: Array<{
     },
     {
         match: (pathname) => pathname.startsWith('/admin/addons/digiflazz-seller'),
-        meta: { eyebrow: 'Add Ons', title: 'Digiflazz Seller', subtitle: 'Konfigurasi seller API Digiflazz' }
-    },
-    {
-        match: (pathname) => pathname.startsWith('/admin/addons/irs-seller'),
-        meta: { eyebrow: 'Add Ons', title: 'IRS Seller', subtitle: 'Konfigurasi seller channel IRS' }
+        meta: { eyebrow: 'Add Ons', title: 'Digiflazz Seller Center', subtitle: 'Konfigurasi seller API Digiflazz dan integrasi IRS' }
     },
     {
         match: (pathname) => pathname.startsWith('/admin/addons/digiflazz'),

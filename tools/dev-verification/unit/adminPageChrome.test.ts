@@ -193,8 +193,8 @@ test('refresh controls remain reachable after local hero refresh removal', () =>
 test('settings and account pages remove intro copy without losing security or CRUD', () => {
     assertChromeRemoved('DigiflazzSettings.tsx', [/Digiflazz Settings<\/h1>/], [/credentials/, /pricelist/, /webhook/i]);
     assertChromeRemoved('TokovoucherSettings.tsx', [/Tokovoucher Settings<\/h1>/], [/credentials/, /pricelist/, /webhook/i]);
-    assertChromeRemoved('DigiflazzSellerSettings.tsx', [/Digiflazz Seller Settings<\/h1>/], [/IrsSellerSettings/, /fetchSettings/]);
-    assertChromeRemoved('IrsSellerSettings.tsx', [/Integrasi IRS Seller Masuk<\/h1>/], [/status/, /mapping/, /endpoint/i]);
+    assertChromeRemoved('DigiflazzSellerChannel.tsx', [/Digiflazz Seller Settings<\/h1>/], [/refreshRevision/, /fetchSettings/, /onMutationComplete/]);
+    assertChromeRemoved('IrsSellerIntegration.tsx', [/Integrasi IRS Seller Masuk<\/h1>/], [/status/, /mapping/, /endpoint/i]);
     assertChromeRemoved('PaymentMethods.tsx', [/Pusat Metode Pembayaran/i], [/Tambah Metode/, /Filter/, /stepUp\.dialog/]);
     assertChromeRemoved('PaymentCategories.tsx', [/Matriks Kategori Pembayaran/i], [/Tambah Kategori/, /Filter/]);
     assertChromeRemoved('Teams.tsx', [/Manajemen Tim<\/h1>/], [/Tambah Tim/, /Log Login/]);
@@ -383,4 +383,51 @@ test('slider step-up dialog remains interactive above an inert app background', 
     assert.match(dialog, /data-step-up-dialog/);
     assert.match(dialog, /MutationObserver/);
     assert.match(dialog, /aria-modal/);
+});
+
+test('seller center shell hierarchy, refresh, and accessibility contracts hold', () => {
+    const shell = readAdminPage('DigiflazzSellerCenter.tsx');
+    for (const contract of [
+        /admin:refresh-current-page/,
+        /parseSellerCenterSection/,
+        /parseSellerCenterSummary/,
+        /latestSummaryRequestId/,
+        /aria-busy/,
+        /aria-label="Navigasi Digiflazz Seller Center"/,
+        /role="status"/,
+        /role="alert"/,
+        /stepUp\.dialog/,
+    ]) {
+        assert.match(shell, contract, `seller center shell missing ${contract}`);
+    }
+
+    // The two legacy admin pages are removed and cannot be revived as a second surface.
+    for (const legacy of ['DigiflazzSellerSettings.tsx', 'IrsSellerSettings.tsx']) {
+        assert.equal(fs.existsSync(path.join(root, 'client/src/pages/admin', legacy)), false, `${legacy} must be removed`);
+    }
+
+    // Children consume the global refresh revision; neither owns a pure Refresh button.
+    for (const child of ['DigiflazzSellerChannel.tsx', 'IrsSellerIntegration.tsx']) {
+        const source = readAdminPage(child);
+        assert.match(source, /refreshRevision/, `${child} must consume the shell refresh revision`);
+        assert.doesNotMatch(source, />\s*Refresh\s*</, `${child} must not own a pure Refresh button`);
+    }
+
+    const addOns = readAdminPage('AddOns.tsx');
+    const cardMatches = addOns.match(/digiflazz-seller-center/g) || [];
+    assert.ok(cardMatches.length >= 1, 'Add Ons must link the canonical seller center card');
+    assert.equal((addOns.match(/\/admin\/addons\/irs-seller/g) || []).length, 0, 'Add Ons must not link the legacy IRS page');
+    assert.equal((addOns.match(/\/admin\/addons\/digiflazz-seller['"`]/g) || []).length, 0, 'Add Ons must not link the legacy seller page');
+    assert.match(addOns, /Digiflazz API/);
+    assert.match(addOns, /Integrasi IRS/);
+});
+
+test('seller center irs integration keeps credential fields write-only', () => {
+    const irs = readAdminPage('IrsSellerIntegration.tsx');
+    assert.match(irs, /passwordConfigured/);
+    assert.match(irs, /pinConfigured/);
+    assert.match(irs, /secretConfigured/);
+    assert.doesNotMatch(irs, /passwordMasked|pinMasked|secretMasked/);
+    assert.match(irs, /integrations\.credentials/);
+    assert.match(irs, /type="password"/);
 });
