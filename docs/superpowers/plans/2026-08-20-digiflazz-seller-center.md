@@ -96,7 +96,7 @@ Issue objects serialize as `{ "code": string, "source": string }`. Allowed sourc
 - Produces: Digiflazz settings responses with `apiKeyConfigured: boolean` and no `apiKeyMasked`/credential fragment.
 - Consumes: existing Digiflazz public payload/response behavior; no public field changes.
 
-- [ ] **Step 1: Add RED tests proving raw fields/signatures are currently retained or serialized**
+- [x] **Step 1: Add RED tests proving raw fields/signatures are currently retained or serialized**
 
 In `seller_secrecy.rs`, define tests first:
 
@@ -126,7 +126,7 @@ fn nested_seller_secret_aliases_are_detected_case_insensitively() {
 
 Add source/serialization tests in `digiflazz_seller.rs` proving `SellerAdminOrderItem` JSON has no `rawRequest`, production text before `#[cfg(test)]` has no order insertion of `"rawRequest"`, and both settings response types serialize `apiKeyConfigured` without `apiKeyMasked` or any API-key fragment.
 
-- [ ] **Step 2: Run focused Rust tests to verify RED**
+- [x] **Step 2: Run focused Rust tests to verify RED**
 
 ```bash
 cd rust-api
@@ -135,7 +135,7 @@ cargo test services::seller_secrecy::tests routes::digiflazz_seller::tests -- --
 
 If Cargo rejects two filters, run each filter separately. Expected: FAIL because the service/functions do not exist and the admin DTO still exposes `rawRequest`.
 
-- [ ] **Step 3: Implement the safe event builder and recursive key detector**
+- [x] **Step 3: Implement the safe event builder and recursive key detector**
 
 Use a closed sensitive-key set:
 
@@ -148,7 +148,7 @@ const SENSITIVE_SELLER_KEYS: &[&str] = &[
 
 `contains_sensitive_seller_key` recursively visits JSON objects/arrays and normalizes keys with `trim().to_ascii_lowercase()`. `safe_seller_event_document` inserts only the exact fields asserted in Step 1 and bounds `message`/`requestIp` using existing safe lengths.
 
-- [ ] **Step 4: Stop Digiflazz raw persistence and serialization**
+- [x] **Step 4: Stop Digiflazz raw persistence and serialization**
 
 Apply the minimum production changes:
 
@@ -160,7 +160,7 @@ Apply the minimum production changes:
 - keep public Digiflazz response builders byte/field compatible;
 - do not delete historical fields in this task.
 
-- [ ] **Step 5: Verify GREEN and public response compatibility**
+- [x] **Step 5: Verify GREEN and public response compatibility**
 
 ```bash
 cd rust-api
@@ -174,7 +174,7 @@ git diff --check
 
 Expected: focused tests and compile pass; source and DTO output contain no new raw seller persistence.
 
-- [ ] **Step 6: Commit the secrecy checkpoint**
+- [x] **Step 6: Commit the secrecy checkpoint**
 
 ```bash
 git add rust-api/src/services/seller_secrecy.rs rust-api/src/services/mod.rs \
@@ -211,7 +211,7 @@ git commit -m "fix: stop retaining raw seller credentials"
 - Produces executable: `rust-api/target/debug/seller_order_readiness`, dry-run by default and `--apply` only for exact disposable DB.
 - Consumes: Task 1 secrecy policy; exact collections `digiflazzsellerorders`, `irssellerorders`, and provider-filtered `webhookeventlogs`.
 
-- [ ] **Step 1: Add RED CLI guard and policy tests**
+- [x] **Step 1: Add RED CLI guard and policy tests**
 
 Test the exact guard:
 
@@ -239,7 +239,7 @@ Test that the policy targets only:
 ]
 ```
 
-- [ ] **Step 2: Run JS tests to verify RED**
+- [x] **Step 2: Run JS tests to verify RED**
 
 ```bash
 node --test scripts/security/seller-secret-policy.test.js scripts/security/scrub-seller-secrets.test.js
@@ -247,7 +247,7 @@ node --test scripts/security/seller-secret-policy.test.js scripts/security/scrub
 
 Expected: FAIL because the files/exports do not exist.
 
-- [ ] **Step 3: Implement dry-run/apply with secrecy-safe reporting**
+- [x] **Step 3: Implement dry-run/apply with secrecy-safe reporting**
 
 `inspectSellerHygiene` must return counts only:
 
@@ -281,7 +281,7 @@ Add package script:
 "seller-center:hygiene": "node scripts/security/scrub-seller-secrets.js"
 ```
 
-- [ ] **Step 4: Add RED Rust index readiness tests**
+- [x] **Step 4: Add RED Rust index readiness tests**
 
 ```rust
 #[test]
@@ -303,7 +303,7 @@ fn apply_is_allowed_only_for_exact_disposable_database() {
 }
 ```
 
-- [ ] **Step 5: Run Rust tests to verify RED, then implement verifier/binary**
+- [x] **Step 5: Run Rust tests to verify RED, then implement verifier/binary**
 
 ```bash
 cd rust-api
@@ -322,13 +322,13 @@ services::seller_integrity::ensure_seller_order_indexes_ready(&db)
 
 Do not call any index creation function from `main.rs`.
 
-- [ ] **Step 6: Wire disposable readiness before host startup**
+- [x] **Step 6: Wire disposable readiness before host startup**
 
 Add `makeSellerOrderReadinessApplyPlan()` beside existing readiness plans in `tools/dev-verification/processes.ts`. It must execute only the debug binary at `rust-api/target/debug/seller_order_readiness` with `--apply`, require `MONGO_DB === 'webtopup_task14_dev'`, and redact Mongo URI from errors/logs. Call it after disposable Mongo bootstrap and before the Rust host process.
 
 Add unit assertions proving protected DBs and unexpected executable paths are rejected.
 
-- [ ] **Step 7: Write the operational runbook**
+- [x] **Step 7: Write the operational runbook**
 
 Document exact commands without real credentials:
 
@@ -342,7 +342,7 @@ npm run seller-center:hygiene -- --mongo-uri "$MONGO_URI" --database "$MONGO_DB"
 
 The runbook must say: stop on duplicates/drift, do not deploy code that requires readiness before indexes pass, never paste report values containing credentials, and re-run dry-run after apply.
 
-- [ ] **Step 8: Verify GREEN and commit**
+- [x] **Step 8: Verify GREEN and commit**
 
 ```bash
 node --test scripts/security/seller-secret-policy.test.js scripts/security/scrub-seller-secrets.test.js
@@ -382,7 +382,7 @@ git commit -m "feat: add guarded seller data hygiene"
 - Produces: `constant_time_required_match(payload, config, aliases, config_key) -> bool`.
 - Consumes: Task 1 safe event builder; current public route exports from `irs_seller` remain unchanged.
 
-- [ ] **Step 1: Add RED settings secrecy and validation tests**
+- [x] **Step 1: Add RED settings secrecy and validation tests**
 
 ```rust
 #[test]
@@ -408,7 +408,7 @@ fn formatter_accepts_only_bounded_sn_markers() {
 
 Add a DTO test that feeds a Mongo document containing `rawRequest`, `password`, and `unknownField` through the mapper and asserts none serialize.
 
-- [ ] **Step 2: Run focused tests to verify RED**
+- [x] **Step 2: Run focused tests to verify RED**
 
 ```bash
 cd rust-api
@@ -417,7 +417,7 @@ cargo test routes::irs_seller:: -- --nocapture
 
 Expected: FAIL because the module/types do not yet exist.
 
-- [ ] **Step 3: Split the module without changing public routes**
+- [x] **Step 3: Split the module without changing public routes**
 
 `mod.rs` re-exports exactly:
 
@@ -429,7 +429,7 @@ pub use settings::{settings, save_settings};
 
 Move existing helpers into the file that owns them. Keep `/v2/irs-seller/*` registration unchanged. Compile before reliability changes to ensure the split itself is behavior-neutral.
 
-- [ ] **Step 4: Implement typed settings with write-only secrets**
+- [x] **Step 4: Implement typed settings with write-only secrets**
 
 Rules:
 
@@ -441,7 +441,7 @@ Rules:
 - credential comparison uses `subtle::ConstantTimeEq` after exact byte-length check;
 - `unavailable()` must not mention `MONGO_URI`.
 
-- [ ] **Step 5: Implement fail-closed typed admin reads**
+- [x] **Step 5: Implement fail-closed typed admin reads**
 
 - mapping/order/log cursor/query failure returns a generic storage error, not `[]`;
 - mapping response remains read-only and uses the shared mapping collection;
@@ -449,7 +449,7 @@ Rules:
 - `IrsLogItem` includes only `id`, `timestamp`, `event`, `refId`, `status`, `message`, `verified`, `requestIp`;
 - no mapper calls a generic `document_json` function.
 
-- [ ] **Step 6: Verify GREEN and commit**
+- [x] **Step 6: Verify GREEN and commit**
 
 ```bash
 cd rust-api
@@ -477,7 +477,7 @@ git commit -m "fix: harden irs seller admin contracts"
 - Produces: `irs_response_from_order(order: &Document) -> Response` preserving exact `data.ref_id`, `produk`, `tujuan`, `statuscode`, `sn`, `msg` fields.
 - Consumes: Task 2 exact unique index startup gate, Task 3 typed config, existing `top_up_vendor`, `run_paid_validation`, and `RecheckProduct`.
 
-- [ ] **Step 1: Add RED pure/source tests for exact response fields and durable ordering**
+- [x] **Step 1: Add RED pure/source tests for exact response fields and durable ordering**
 
 ```rust
 #[test]
@@ -500,7 +500,7 @@ fn supplier_call_is_after_durable_execution_claim() {
 
 Add a test for status mapping: `success -> 1`, `failed -> 2`, `pending/executing -> 3`.
 
-- [ ] **Step 2: Run focused tests to verify RED**
+- [x] **Step 2: Run focused tests to verify RED**
 
 ```bash
 cd rust-api
@@ -509,7 +509,7 @@ cargo test routes::irs_seller::prepaid::tests -- --nocapture
 
 Expected: FAIL because the claim/state helpers do not exist and current IRS flow does not call fulfillment.
 
-- [ ] **Step 3: Implement storage failures and idempotent creation**
+- [x] **Step 3: Implement storage failures and idempotent creation**
 
 The request flow must match each Mongo operation separately:
 
@@ -523,7 +523,7 @@ The request flow must match each Mongo operation separately:
 
 Remove `parse_irs_status` as an authority over the new order outcome. Incoming request status text must never manufacture success.
 
-- [ ] **Step 4: Implement the one-way execution claim**
+- [x] **Step 4: Implement the one-way execution claim**
 
 Use the exact filter/update:
 
@@ -537,7 +537,7 @@ Ok(claimed.is_some())
 
 Only the request that receives `true` may call validation/provider. If `false`, reload and return the persisted pending/completed outcome. Never reset `executing` to `ready` automatically.
 
-- [ ] **Step 5: Execute validation or supplier and persist the real result**
+- [x] **Step 5: Execute validation or supplier and persist the real result**
 
 - for validation products, call `run_paid_validation` and map existing statuses;
 - otherwise build `RecheckProduct` from the mapped product vendor and call `top_up_vendor(&state, &internal_ref_id, &target, "", &product)` exactly once;
@@ -546,7 +546,7 @@ Only the request that receives `true` may call validation/provider. If `false`, 
 - if final Mongo update fails after execution, return a pending/generic IRS envelope and leave the durable `executing` marker; do not retry automatically;
 - write only safe event metadata through Task 1's builder.
 
-- [ ] **Step 6: Verify GREEN including full Rust suite**
+- [x] **Step 6: Verify GREEN including full Rust suite**
 
 ```bash
 cd rust-api
@@ -560,7 +560,7 @@ git diff --check
 
 Expected: IRS tests, existing Digiflazz tests, and full Rust suite PASS with no real provider calls.
 
-- [ ] **Step 7: Commit the fulfillment checkpoint**
+- [x] **Step 7: Commit the fulfillment checkpoint**
 
 ```bash
 git add rust-api/src/routes/irs_seller/prepaid.rs rust-api/src/routes/irs_seller/types.rs
@@ -586,7 +586,7 @@ git commit -m "feat: fulfill irs seller orders once"
 - Produces statuses `ready | disabled | needs_setup | attention | unavailable`.
 - Consumes: Task 3 IRS config reader and existing Digiflazz settings/order/mapping collections.
 
-- [ ] **Step 1: Add RED Rust summary classification tests**
+- [x] **Step 1: Add RED Rust summary classification tests**
 
 ```rust
 #[test]
@@ -607,7 +607,7 @@ fn summary_issue_codes_are_stable_and_non_secret() {
 }
 ```
 
-- [ ] **Step 2: Add RED gateway ordering/boundary tests**
+- [x] **Step 2: Add RED gateway ordering/boundary tests**
 
 Assert exact routes:
 
@@ -627,7 +627,7 @@ assert.doesNotMatch(appSource, /digiflazzSellerRoutes/);
 assert.doesNotMatch(appSource, /irsSellerRoutes/);
 ```
 
-- [ ] **Step 3: Run RED tests**
+- [x] **Step 3: Run RED tests**
 
 ```bash
 cd rust-api
@@ -638,7 +638,7 @@ node --import tsx --test server/src/routes/apiV2ProxyRoutes.test.ts
 
 Expected: FAIL because the summary route is absent.
 
-- [ ] **Step 4: Implement typed fail-closed summary assembly**
+- [x] **Step 4: Implement typed fail-closed summary assembly**
 
 - missing Mongo client → structured `503`, `ok:false`, issue `SELLER_CONFIG_UNAVAILABLE`;
 - query Digiflazz config, IRS config, mappings, Digiflazz order summary, and IRS order summary separately;
@@ -648,11 +648,11 @@ Expected: FAIL because the summary route is absent.
 - corrected Digiflazz `callbackPending` counts only required, undelivered callbacks;
 - serialize `generatedAt` as RFC3339.
 
-- [ ] **Step 5: Register exact Node/Rust routes**
+- [x] **Step 5: Register exact Node/Rust routes**
 
 Place the explicit Node `GET /digiflazz-seller/center-summary` before `app.all('/digiflazz-seller/*')`. Preserve the public and settings routes exactly. Rust still calls `require_proxy_context`; no client-created permission/action headers are accepted.
 
-- [ ] **Step 6: Verify GREEN and commit**
+- [x] **Step 6: Verify GREEN and commit**
 
 ```bash
 cd rust-api
@@ -690,7 +690,7 @@ git commit -m "feat: expose private seller center summary"
 - Produces canonical nav identity `Digiflazz Seller Center` at `/admin/addons/digiflazz-seller-center`.
 - Keeps persisted sidebar order/pin preferences top-level only; no submenu-name alias migration is introduced.
 
-- [ ] **Step 1: Add RED pure parser and redirect tests**
+- [x] **Step 1: Add RED pure parser and redirect tests**
 
 ```ts
 test('seller center sections and legacy routes fail closed to canonical destinations', () => {
@@ -710,7 +710,7 @@ test('malformed summary never becomes ready', () => {
 });
 ```
 
-- [ ] **Step 2: Add RED nav identity/migration tests**
+- [x] **Step 2: Add RED nav identity/migration tests**
 
 Assert:
 
@@ -720,7 +720,7 @@ Assert:
 - top-level menu order and pin normalization remain unchanged and do not attempt unsupported submenu migration;
 - route permission for canonical and both redirect paths remains `manageVendors`.
 
-- [ ] **Step 3: Run client tests to verify RED**
+- [x] **Step 3: Run client tests to verify RED**
 
 ```bash
 node --import tsx --test client/src/lib/digiflazzSellerCenter.test.ts client/src/lib/adminNav.test.ts
@@ -728,7 +728,7 @@ node --import tsx --test client/src/lib/digiflazzSellerCenter.test.ts client/src
 
 Expected: FAIL because the module/canonical identity do not exist.
 
-- [ ] **Step 4: Implement pure contracts and canonical nav metadata**
+- [x] **Step 4: Implement pure contracts and canonical nav metadata**
 
 The parser allowlists only stable statuses/issues, finite nonnegative counts, valid RFC3339 timestamp, and booleans. Any missing required branch produces the malformed issue and unavailable states; it never invents `ok:true`.
 
@@ -736,7 +736,7 @@ Update `ADMIN_NAV_BLUEPRINT`, route permissions, and presentation metadata. Keep
 
 Add the new pure test to `test:dev-verify:unit`.
 
-- [ ] **Step 5: Add canonical route and redirect-only legacy routes**
+- [x] **Step 5: Add canonical route and redirect-only legacy routes**
 
 Export `AdminDigiflazzSellerCenter`. In `App.tsx`:
 
@@ -750,7 +750,7 @@ Export `AdminDigiflazzSellerCenter`. In `App.tsx`:
 
 Do not render old page components on redirect routes.
 
-- [ ] **Step 6: Verify GREEN and commit**
+- [x] **Step 6: Verify GREEN and commit**
 
 ```bash
 node --import tsx --test client/src/lib/digiflazzSellerCenter.test.ts client/src/lib/adminNav.test.ts tools/dev-verification/unit/adminPageChrome.test.ts
@@ -782,7 +782,7 @@ git commit -m "feat: define canonical digiflazz seller center navigation"
 - Consumes Task 5 `/digiflazz-seller/center-summary` and existing channel endpoints.
 - Consumes Task 6 pure parser/section helpers.
 
-- [ ] **Step 1: Add RED source-contract tests for shell hierarchy and refresh**
+- [x] **Step 1: Add RED source-contract tests for shell hierarchy and refresh**
 
 Assert the new shell contains:
 
@@ -802,7 +802,7 @@ for (const contract of [
 
 Assert old files are removed, neither child has a pure `Refresh` button, and the Add Ons source has exactly one `digiflazz-seller-center` card with both `Digiflazz API` and `Integrasi IRS` labels.
 
-- [ ] **Step 2: Run source tests to verify RED**
+- [x] **Step 2: Run source tests to verify RED**
 
 ```bash
 node --import tsx --test tools/dev-verification/unit/adminPageChrome.test.ts
@@ -810,7 +810,7 @@ node --import tsx --test tools/dev-verification/unit/adminPageChrome.test.ts
 
 Expected: FAIL because the shell/new files do not exist.
 
-- [ ] **Step 3: Implement the canonical shell and overview**
+- [x] **Step 3: Implement the canonical shell and overview**
 
 - use `useSearchParams` and `parseSellerCenterSection`;
 - update query with `replace:true` and preserve only allowlisted `section`;
@@ -821,7 +821,7 @@ Expected: FAIL because the shell/new files do not exist.
 - overview renders separate compact Digiflazz/IRS status rows and shared mapping count;
 - show stable issue codes only, never raw server errors.
 
-- [ ] **Step 4: Move Digiflazz behavior into section-scoped child UI**
+- [x] **Step 4: Move Digiflazz behavior into section-scoped child UI**
 
 Preserve all existing mutations and step-up orchestration, but remove `activeChannel` and local pure refresh controls. Fetch only the active section:
 
@@ -832,7 +832,7 @@ Preserve all existing mutations and step-up orchestration, but remove `activeCha
 
 Mapping sync and callback retry buttons remain explicit mutations and call `onMutationComplete()` after success so summary refreshes.
 
-- [ ] **Step 5: Implement typed IRS integration UI**
+- [x] **Step 5: Implement typed IRS integration UI**
 
 - no `any` response/order/log types;
 - secret inputs start blank/write-only and show only boolean configured readiness, never masked fragments or hydrated secret values;
@@ -844,7 +844,7 @@ Mapping sync and callback retry buttons remain explicit mutations and call `onMu
 - use global refresh revision, no local Refresh button;
 - retain `integrations.credentials` step-up dialog and bounded formatter fields.
 
-- [ ] **Step 6: Replace Add Ons cards/status loading**
+- [x] **Step 6: Replace Add Ons cards/status loading**
 
 Remove standalone IRS and old seller cards. Fetch the one center summary and map status rows fail-closed:
 
@@ -855,7 +855,7 @@ Remove standalone IRS and old seller cards. Fetch the one center summary and map
 
 No source failure is represented as zero/ready.
 
-- [ ] **Step 7: Verify focused UI/build tests and commit**
+- [x] **Step 7: Verify focused UI/build tests and commit**
 
 ```bash
 node --import tsx --test client/src/lib/digiflazzSellerCenter.test.ts client/src/lib/adminNav.test.ts tools/dev-verification/unit/adminPageChrome.test.ts
@@ -889,7 +889,7 @@ git commit -m "feat: unify private digiflazz seller center admin"
 - Produces required checks `seller-center-integration`, `seller-center-desktop`, `seller-center-mobile`.
 - Consumes all Tasks 1–7 and exact disposable DB `webtopup_task14_dev`.
 
-- [ ] **Step 1: Add RED seed and matrix source tests**
+- [x] **Step 1: Add RED seed and matrix source tests**
 
 Assert both fixtures exist with unique email/device identity and matrix contains exactly:
 
@@ -903,7 +903,7 @@ Assert both fixtures exist with unique email/device identity and matrix contains
 
 All are `required:true`, isolated, and use the canonical test files.
 
-- [ ] **Step 2: Run seed/matrix tests to verify RED**
+- [x] **Step 2: Run seed/matrix tests to verify RED**
 
 ```bash
 node --import tsx --test tools/dev-verification/unit/seed.test.ts tools/dev-verification/unit/verificationMatrix.test.ts
@@ -911,7 +911,7 @@ node --import tsx --test tools/dev-verification/unit/seed.test.ts tools/dev-veri
 
 Expected: FAIL because fixtures/checks are absent.
 
-- [ ] **Step 3: Implement test-local fixtures and integration cleanup guards**
+- [x] **Step 3: Implement test-local fixtures and integration cleanup guards**
 
 Global seed creates users only. `sellerCenter.test.ts` inserts marked, test-local:
 
@@ -922,7 +922,7 @@ Global seed creates users only. `sellerCenter.test.ts` inserts marked, test-loca
 
 Every write includes `task14Fixture:true` and `fixtureRunId`. Cleanup first verifies the `__localVerification` marker and exact DB name, then removes only marked rows. Never place vendor/provider URL fixtures in global seed.
 
-- [ ] **Step 4: Implement integration permission and step-up assertions**
+- [x] **Step 4: Implement integration permission and step-up assertions**
 
 Through Node gateway prove:
 
@@ -933,7 +933,7 @@ Through Node gateway prove:
 - valid step-up permits a settings update while omitted secrets remain unchanged and all responses expose booleans only;
 - public prepaid routes do not require admin auth.
 
-- [ ] **Step 5: Prove secrecy and historical hygiene**
+- [x] **Step 5: Prove secrecy and historical hygiene**
 
 - send invalid Digiflazz and IRS requests containing synthetic signatures/password/PIN/secret;
 - query Mongo directly and assert no newly created seller order/log contains those values, `raw`, or `rawRequest`;
@@ -943,7 +943,7 @@ Through Node gateway prove:
 - re-run dry-run and assert `affected:0`, `blocking:false`;
 - scan captured stdout/stderr/report artifacts and assert fixture secret strings are absent.
 
-- [ ] **Step 6: Prove concurrent IRS fulfillment executes once**
+- [x] **Step 6: Prove concurrent IRS fulfillment executes once**
 
 With `PROVIDER_MODE=mock`, submit two concurrent requests with the same valid `refId`. Assert:
 
@@ -956,7 +956,7 @@ With `PROVIDER_MODE=mock`, submit two concurrent requests with the same valid `r
 
 Also test a Mongo failure seam/invalid collection readiness yields generic channel-compatible failure and zero provider execution.
 
-- [ ] **Step 7: Implement desktop/mobile route-intercepted browser coverage**
+- [x] **Step 7: Implement desktop/mobile route-intercepted browser coverage**
 
 Browser test requirements:
 
@@ -974,7 +974,7 @@ Browser test requirements:
 
 Use Playwright route interception for UI race/degraded states. Do not call provider endpoints.
 
-- [ ] **Step 8: Register matrix checks and run focused disposable verification**
+- [x] **Step 8: Register matrix checks and run focused disposable verification**
 
 ```bash
 npm run api-v2:build
@@ -989,7 +989,7 @@ npx playwright test --config tools/dev-verification/playwright.config.ts seller-
 
 Expected: all three focused checks PASS; no provider call; test database exact.
 
-- [ ] **Step 9: Commit end-to-end coverage**
+- [x] **Step 9: Commit end-to-end coverage**
 
 ```bash
 git add tools/dev-verification/seed.ts tools/dev-verification/unit/seed.test.ts \
@@ -998,7 +998,7 @@ git add tools/dev-verification/seed.ts tools/dev-verification/unit/seed.test.ts 
 git commit -m "test: verify digiflazz seller center end to end"
 ```
 
-- [ ] **Step 10: Run complete focused verification on the final tree**
+- [x] **Step 10: Run complete focused verification on the final tree**
 
 ```bash
 cd rust-api
@@ -1020,7 +1020,7 @@ git diff --check
 
 Expected: every command PASS. Record `cargo fmt --check` as unavailable if `rustfmt` remains absent.
 
-- [ ] **Step 11: Run the complete aggregate disposable matrix**
+- [x] **Step 11: Run the complete aggregate disposable matrix**
 
 Rebuild the Rust binary, ensure disposable infrastructure is up, then run:
 
@@ -1032,7 +1032,7 @@ npm run dev-verify -- test
 
 Expected: `LOCAL DEV VERIFIED`; aggregate report contains all required checks including the three Seller Center checks. Record run ID, check count, and result.
 
-- [ ] **Step 12: Tear down and audit secrecy**
+- [x] **Step 12: Tear down and audit secrecy**
 
 ```bash
 npm run dev-verify -- down
@@ -1042,11 +1042,11 @@ node --import tsx tools/dev-verification/cli.ts audit-reports
 
 Expected: zero processes/services, rollout disabled, report secrecy PASS, and no fixture credentials/raw bodies in retained reports.
 
-- [ ] **Step 13: Obtain independent review and resolve findings**
+- [x] **Step 13: Obtain independent review and resolve findings**
 
 Request a fresh read-only review of `origin/main..HEAD` against the spec. Fix every Critical/Important finding with a focused RED/GREEN test and separate checkpoint commit. Re-run affected focused checks plus full Rust/client/server builds after fixes.
 
-- [ ] **Step 14: Mark plan complete and commit progress**
+- [x] **Step 14: Mark plan complete and commit progress**
 
 After all evidence and review are green, change only this plan's completed step checkboxes from `[ ]` to `[x]`, then:
 
