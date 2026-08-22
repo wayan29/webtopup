@@ -36,3 +36,19 @@ test('open api credentials wrap, confirm inline, and copy secret only when visib
     assert.doesNotMatch(source, /Regenerate API Credentials/);
     assert.doesNotMatch(source, /Revoke \/ Hapus Key/);
 });
+
+test('open api docs stay summarized until expanded and never embed live secrets', () => {
+    const source = settings();
+    assert.match(source, /buildOpenApiBaseUrl/);
+    assert.match(source, /OPEN_API_LIST_SIGNATURE/);
+    assert.match(source, /OPEN_API_ORDER_SIGNATURE/);
+    assert.match(source, /OPEN_API_ENDPOINTS/);
+    assert.match(source, /openApiCurlExamples/);
+    assert.match(source, /Buka contoh CURL & endpoint/);
+    assert.match(source, /Tutup contoh CURL & endpoint/);
+    assert.match(source, /data-testid="settings-openapi-docs-summary"/);
+    assert.match(source, /data-testid="settings-openapi-docs-examples"/);
+    assert.doesNotMatch(source, /#0c0c16/);
+    assert.doesNotMatch(source, /md5\(\$\{memberId/);
+    assert.doesNotMatch(source, /showDocs && !apiLoading/);
+});
