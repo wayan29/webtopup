@@ -19,8 +19,13 @@ import {
 import { apiV2 } from '../api';
 import { useAuthStore } from '../store/useAuthStore';
 import {
+    buildOpenApiBaseUrl,
     canCopyOpenApiSecret,
     maskOpenApiKey,
+    OPEN_API_ENDPOINTS,
+    OPEN_API_LIST_SIGNATURE,
+    OPEN_API_ORDER_SIGNATURE,
+    openApiCurlExamples,
     openApiSecretStatus,
     parseSettingsTab,
     type SettingsTabId,
@@ -206,17 +211,12 @@ export default function Settings() {
         : secretStatus === 'stored-hidden'
             ? 'Tersimpan (hanya ditampilkan saat generate)'
             : '-';
-    const listSignatureFormula = 'md5(member_id:api_key:secret)';
-    const orderSignatureFormula = 'md5(member_id:api_key:secret:ref_id)';
     const rawApiV2Base = import.meta.env.VITE_API_V2_URL || '/api/v2';
     const activeTheme = getUIThemeMeta(settings.uiTheme);
-    const openApiBaseUrl = useMemo(() => {
-        if (rawApiV2Base.startsWith('http://') || rawApiV2Base.startsWith('https://')) {
-            return `${rawApiV2Base.replace(/\/$/, '')}/api`;
-        }
-
-        return `${window.location.origin}${rawApiV2Base}/api`;
-    }, [rawApiV2Base]);
+    const openApiBaseUrl = useMemo(
+        () => buildOpenApiBaseUrl(rawApiV2Base, window.location.origin),
+        [rawApiV2Base],
+    );
 
     return (
         <div className="space-y-6 animate-slide-up">
@@ -495,14 +495,6 @@ export default function Settings() {
                                     <p className="text-xs ui-text-muted">Gunakan kredensial ini untuk otomasi transaksi lewat API.</p>
                                 </div>
                             </div>
-                            <button
-                                type="button"
-                                onClick={() => setShowDocs((current) => !current)}
-                                className="ui-muted-action inline-flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold transition-colors"
-                            >
-                                <Code className="w-4 h-4 ui-accent-text" />
-                                {showDocs ? 'Tutup Dokumentasi' : 'Buka Dokumentasi'}
-                            </button>
                         </div>
 
                         {apiLoading ? (
@@ -625,97 +617,40 @@ export default function Settings() {
                         )}
                     </div>
 
-                    {/* Collapsible API Docs Panel */}
-                    {showDocs && !apiLoading && (
-                        <div className="ui-panel rounded-2xl p-6 border ui-border space-y-6 animate-slide-up">
-                            <div className="flex items-center justify-between border-b ui-border pb-3">
-                                <h3 className="text-base font-bold ui-text flex items-center gap-2">
-                                    <Code className="w-5 h-5 ui-accent-text" />
-                                    Petunjuk Integrasi & API Dokumentasi
-                                </h3>
-                                <span className="text-[10px] font-bold px-2 py-0.5 rounded-full ui-accent-chip uppercase tracking-wider">
-                                    OpenAPI v2
-                                </span>
+                    <div className="ui-panel rounded-2xl border ui-border p-4 sm:p-6 space-y-4" data-testid="settings-openapi-docs-summary">
+                        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                            <div className="min-w-0">
+                                <h3 className="text-base font-bold ui-text">Dokumentasi Open API</h3>
+                                <p className="text-xs ui-text-muted">Base URL dan formula signature. Contoh CURL tetap tertutup sampai dibuka.</p>
                             </div>
-
-                            <div className="grid gap-6 lg:grid-cols-2">
-                                {/* Left side: Endpoint details */}
-                                <div className="space-y-4">
-                                    <div>
-                                        <p className="text-xs font-bold ui-text-muted uppercase tracking-wider">Base URL API</p>
-                                        <div className="mt-1 flex items-center gap-2 bg-black/10 rounded-lg px-3 py-2 border ui-border">
-                                            <code className="text-xs ui-accent-text font-mono select-all flex-1 truncate">{openApiBaseUrl}</code>
-                                            <button
-                                                type="button"
-                                                onClick={() => copyValue(openApiBaseUrl, 'baseUrl')}
-                                                className="text-gray-400 hover:text-white p-1"
-                                                title="Copy Base URL"
-                                            >
-                                                {copied === 'baseUrl' ? <Check className="w-4 h-4 text-green-400" /> : <Copy className="w-4 h-4" />}
-                                            </button>
-                                        </div>
-                                    </div>
-
-                                    <div className="space-y-2">
-                                        <p className="text-xs font-bold ui-text-muted uppercase tracking-wider">Metode Autentikasi (Signature)</p>
-                                        <p className="text-xs ui-text-muted leading-relaxed">
-                                            Request API harus menyertakan <code>member_id</code>, <code>api_key</code>, dan <code>signature</code> MD5. Formula pembuatan signature adalah sebagai berikut:
-                                        </p>
-                                        <div className="space-y-2 font-mono text-[11px] bg-black/25 rounded-xl p-3.5 border ui-border text-gray-300">
-                                            <div>
-                                                <p className="text-[10px] ui-text-muted font-sans font-bold">List Catalog & Profile:</p>
-                                                <code className="ui-accent-text">{listSignatureFormula}</code>
-                                            </div>
-                                            <div className="pt-2 border-t border-white/5 mt-2">
-                                                <p className="text-[10px] ui-text-muted font-sans font-bold">Order / Cek Status Transaksi:</p>
-                                                <code className="ui-accent-text">{orderSignatureFormula}</code>
-                                            </div>
-                                        </div>
-                                    </div>
-                                </div>
-
-                                {/* Right side: CURL examples */}
-                                <div className="space-y-2">
-                                    <p className="text-xs font-bold ui-text-muted uppercase tracking-wider">Contoh Pemanggilan CURL</p>
-                                    <pre className="bg-[#0c0c16] text-[11px] font-mono text-gray-300 rounded-xl p-4 border ui-border overflow-x-auto shadow-inner leading-relaxed">
-{`# 1. Mengambil Katalog Produk
-# signature = md5(${memberId || 'MBRxxxx'}:${apiKey || 'tv_xxxx'}:secret)
-curl -X GET "${openApiBaseUrl}/products?\\
-member_id=${memberId || 'MBRxxxx'}&\\
-api_key=${apiKey || 'tv_xxxx'}&\\
-signature=SIGNATURE"
-
-# 2. Membuat Transaksi Baru (Order)
-# signature = md5(${memberId || 'MBRxxxx'}:${apiKey || 'tv_xxxx'}:secret:ref_id)
-curl -X POST "${openApiBaseUrl}/order" \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "member_id": "${memberId || 'MBRxxxx'}",
-    "api_key": "${apiKey || 'tv_xxxx'}",
-    "signature": "SIGNATURE",
-    "ref_id": "INV-1001",
-    "produk": "ML86",
-    "tujuan": "123456789",
-    "server_id": "1234"
-  }'`}
-                                    </pre>
-                                </div>
+                            <button type="button" className="ui-muted-action inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold" onClick={() => setShowDocs((current) => !current)}>
+                                {showDocs ? 'Tutup contoh CURL & endpoint' : 'Buka contoh CURL & endpoint'}
+                            </button>
+                        </div>
+                        <div>
+                            <p className="text-xs font-bold uppercase tracking-wider ui-text-muted">Base URL API</p>
+                            <div className="mt-1 flex min-w-0 items-start gap-2 rounded-lg border ui-border bg-black/10 px-3 py-2">
+                                <code className="min-w-0 flex-1 break-all font-mono text-xs ui-accent-text">{openApiBaseUrl}</code>
+                                <button type="button" onClick={() => void copyValue(openApiBaseUrl, 'baseUrl')} className="shrink-0 p-1 ui-text-muted hover:ui-text" title="Salin Base URL">
+                                    {copied === 'baseUrl' ? <Check className="h-4 w-4 text-green-400" /> : <Copy className="h-4 w-4" />}
+                                </button>
                             </div>
+                        </div>
+                        <div className="space-y-2 rounded-xl border ui-border bg-black/10 p-3 font-mono text-[11px]">
+                            <p>Katalog &amp; profil: <code className="ui-accent-text">{OPEN_API_LIST_SIGNATURE}</code></p>
+                            <p>Order / cek status: <code className="ui-accent-text">{OPEN_API_ORDER_SIGNATURE}</code></p>
+                        </div>
+                    </div>
 
-                            {/* Detailed Endpoints Grid */}
-                            <div className="border-t ui-border pt-4 space-y-3">
-                                <p className="text-xs font-bold ui-text-muted uppercase tracking-wider">Daftar Endpoint API Aktif</p>
-                                <div className="grid gap-4 sm:grid-cols-2">
-                                    <Endpoint method="GET" path="/profile" description="Cek profil, level harga, dan saldo aktif Anda saat ini." />
-                                    <Endpoint method="GET" path="/categories" description="Daftar semua kategori produk aktif di platform." />
-                                    <Endpoint method="GET" path="/operators?category=category_id" description="Daftar brand/operator aktif, bisa difilter berdasarkan ID Kategori." />
-                                    <Endpoint method="GET" path="/product-types?category=category_id&operator=operator_id" description="Daftar tipe produk aktif berdasarkan Kategori dan Brand." />
-                                    <Endpoint method="GET" path="/products?category=category_id&operator=operator_id&type=type_id" description="Daftar katalog produk lengkap beserta harga khusus sesuai level member Anda." />
-                                    <Endpoint method="POST" path="/order" description="Membuat transaksi pembelian baru (Gaya standard parameter Tokovoucher)." extra="Body: { member_id, api_key, signature, ref_id, produk, tujuan, server_id? }" />
-                                    <Endpoint method="POST" path="/transaction" description="Membuat transaksi pembelian baru (Alias endpoint lama / legacy)." extra="Body: { member_id, api_key, signature, ref_id, product_code, target, server_id? }" />
-                                    <Endpoint method="GET" path="/transaction/check?ref_id=xxx&member_id=xxx&api_key=xxx&signature=xxx" description="Cek detail dan status pengiriman transaksi secara real-time." />
-                                    <Endpoint method="GET" path="/transactions" description="Riwayat ringkasan transaksi API akun Anda." />
-                                </div>
+                    {showDocs && (
+                        <div className="ui-panel rounded-2xl border ui-border p-4 sm:p-6 space-y-4" data-testid="settings-openapi-docs-examples">
+                            <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded-xl border ui-border ui-panel-muted p-4 font-mono text-[11px] leading-relaxed ui-text">
+                                {openApiCurlExamples(openApiBaseUrl)}
+                            </pre>
+                            <div className="grid gap-4 sm:grid-cols-2">
+                                {OPEN_API_ENDPOINTS.map((endpoint) => (
+                                    <Endpoint key={`${endpoint.method}-${endpoint.path}`} {...endpoint} />
+                                ))}
                             </div>
                         </div>
                     )}
@@ -853,7 +788,7 @@ function Endpoint({
                 }`}>
                     {method}
                 </span>
-                <code className="ui-text font-mono font-bold select-all truncate max-w-full">{path}</code>
+                <code className="ui-text font-mono font-bold select-all break-all">{path}</code>
             </div>
             <p className="ui-text-muted leading-relaxed">{description}</p>
             {extra && (
