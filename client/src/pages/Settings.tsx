@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {
     Bell,
     Check,
@@ -17,6 +18,7 @@ import {
 } from 'lucide-react';
 import { apiV2 } from '../api';
 import { useAuthStore } from '../store/useAuthStore';
+import { parseSettingsTab, type SettingsTabId } from '../lib/openApiSettings';
 import { DARK_UI_THEME, LIGHT_UI_THEME, UI_THEME_OPTIONS, getUIThemeMeta, type UIThemeId } from '../lib/uiTheme';
 
 type PreferencesResponse = {
@@ -28,14 +30,16 @@ type PreferencesResponse = {
     };
 };
 
-type TabId = 'preferences' | 'api' | 'security';
-
 export default function Settings() {
     const { user, syncProfile } = useAuthStore();
+    const [searchParams, setSearchParams] = useSearchParams();
+    const activeTab: SettingsTabId = parseSettingsTab(searchParams.get('tab'));
+    const setActiveTab = (next: SettingsTabId) => {
+        setSearchParams(next === 'preferences' ? {} : { tab: next }, { replace: true });
+    };
     const [loading, setLoading] = useState(false);
     const [settingsLoading, setSettingsLoading] = useState(true);
     const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
-    const [activeTab, setActiveTab] = useState<TabId>('preferences');
     const [settings, setSettings] = useState({
         emailNotifications: true,
         smsNotifications: false,
@@ -216,41 +220,49 @@ export default function Settings() {
             )}
 
             {/* Sliding Pill Tab Navigation */}
-            <div className="flex border ui-border p-1 bg-black/10 rounded-xl max-w-xl">
+            <div className="flex w-full min-w-0 gap-1 rounded-xl border ui-border bg-black/10 p-1" role="tablist" aria-label="Pengaturan akun">
                 <button
                     type="button"
+                    role="tab"
+                    aria-selected={activeTab === 'preferences'}
                     onClick={() => setActiveTab('preferences')}
-                    className={`flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-semibold transition-all ${
+                    className={`min-w-0 flex-1 flex items-center justify-center gap-1 sm:gap-2 px-2 sm:px-4 py-2.5 rounded-lg text-xs sm:text-sm font-semibold transition-all ${
                         activeTab === 'preferences'
                             ? 'ui-accent-chip shadow-sm'
                             : 'ui-text-muted hover:ui-text hover:bg-white/5'
                     }`}
                 >
-                    <Sun className="w-4 h-4" />
-                    <span className="hidden sm:inline">Tampilan & </span>Preferensi
+                    <Sun className="h-4 w-4 shrink-0" />
+                    <span className="hidden sm:inline">Tampilan & Preferensi</span>
+                    <span className="sm:hidden">Preferensi</span>
                 </button>
                 <button
                     type="button"
+                    role="tab"
+                    aria-selected={activeTab === 'api'}
                     onClick={() => setActiveTab('api')}
-                    className={`flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-semibold transition-all ${
+                    className={`min-w-0 flex-1 flex items-center justify-center gap-1 sm:gap-2 px-2 sm:px-4 py-2.5 rounded-lg text-xs sm:text-sm font-semibold transition-all ${
                         activeTab === 'api'
                             ? 'ui-accent-chip shadow-sm'
                             : 'ui-text-muted hover:ui-text hover:bg-white/5'
                     }`}
                 >
-                    <Code className="w-4 h-4" />
-                    Open API
+                    <Code className="h-4 w-4 shrink-0" />
+                    <span className="hidden sm:inline">Open API</span>
+                    <span className="sm:hidden">API</span>
                 </button>
                 <button
                     type="button"
+                    role="tab"
+                    aria-selected={activeTab === 'security'}
                     onClick={() => setActiveTab('security')}
-                    className={`flex-1 flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-semibold transition-all ${
+                    className={`min-w-0 flex-1 flex items-center justify-center gap-1 sm:gap-2 px-2 sm:px-4 py-2.5 rounded-lg text-xs sm:text-sm font-semibold transition-all ${
                         activeTab === 'security'
                             ? 'ui-accent-chip shadow-sm'
                             : 'ui-text-muted hover:ui-text hover:bg-white/5'
                     }`}
                 >
-                    <Shield className="w-4 h-4" />
+                    <Shield className="h-4 w-4 shrink-0" />
                     Keamanan
                 </button>
             </div>
@@ -258,7 +270,7 @@ export default function Settings() {
             {/* TAB CONTENT AREAS */}
 
             {activeTab === 'preferences' && (
-                <div className="space-y-6 animate-slide-up">
+                <div role="tabpanel" className="space-y-6 animate-slide-up">
                     {/* UI Theme Selection Panel */}
                     <div className="ui-panel rounded-2xl p-6 border ui-border space-y-6">
                         <div className="flex items-center gap-3">
@@ -441,7 +453,7 @@ export default function Settings() {
             )}
 
             {activeTab === 'api' && (
-                <div className="space-y-6 animate-slide-up">
+                <div role="tabpanel" className="space-y-6 animate-slide-up">
                     {/* API Key Panel */}
                     <div className="ui-panel rounded-2xl p-6 border ui-border space-y-6">
                         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
@@ -660,7 +672,7 @@ curl -X POST "${openApiBaseUrl}/order" \\
             )}
 
             {activeTab === 'security' && (
-                <div className="space-y-6 animate-slide-up">
+                <div role="tabpanel" className="space-y-6 animate-slide-up">
                     {/* Security Tab Content */}
                     <div className="ui-panel rounded-2xl p-6 border ui-border space-y-6">
                         <div className="flex items-center gap-3">
