@@ -18,7 +18,13 @@ import {
 } from 'lucide-react';
 import { apiV2 } from '../api';
 import { useAuthStore } from '../store/useAuthStore';
-import { parseSettingsTab, type SettingsTabId } from '../lib/openApiSettings';
+import {
+    canCopyOpenApiSecret,
+    maskOpenApiKey,
+    openApiSecretStatus,
+    parseSettingsTab,
+    type SettingsTabId,
+} from '../lib/openApiSettings';
 import { DARK_UI_THEME, LIGHT_UI_THEME, UI_THEME_OPTIONS, getUIThemeMeta, type UIThemeId } from '../lib/uiTheme';
 
 type PreferencesResponse = {
@@ -58,6 +64,7 @@ export default function Settings() {
     const [copied, setCopied] = useState<string | null>(null);
     const [showApiKey, setShowApiKey] = useState(false);
     const [showDocs, setShowDocs] = useState(false);
+    const [pendingApiAction, setPendingApiAction] = useState<null | 'regenerate' | 'revoke'>(null);
 
     useEffect(() => {
         const loadSettingsPage = async () => {
@@ -95,8 +102,6 @@ export default function Settings() {
     }, []);
 
     const generateApiKey = async () => {
-        if (apiKey && !window.confirm('API key lama akan diganti. Secret baru hanya ditampilkan sekali. Lanjutkan?')) return;
-
         try {
             setApiGenerating(true);
             setMessage(null);
@@ -119,8 +124,6 @@ export default function Settings() {
     };
 
     const revokeApiKey = async () => {
-        if (!window.confirm('API key dan secret akan dihapus dan tidak bisa digunakan lagi. Lanjutkan?')) return;
-
         try {
             setMessage(null);
             await apiV2.delete('/api/key/revoke');
@@ -135,11 +138,32 @@ export default function Settings() {
         }
     };
 
-    const copyValue = (value: string | null | undefined, key: string) => {
+    const copyValue = async (value: string | null | undefined, key: string) => {
         if (!value) return;
-        navigator.clipboard.writeText(value);
-        setCopied(key);
-        setTimeout(() => setCopied(null), 2000);
+        try {
+            await navigator.clipboard.writeText(value);
+            setCopied(key);
+            setTimeout(() => setCopied(null), 2000);
+        } catch {
+            setMessage({ type: 'error', text: 'Gagal menyalin ke clipboard.' });
+        }
+    };
+
+    const requestGenerateApiKey = () => {
+        if (apiKey) {
+            setPendingApiAction('regenerate');
+            return;
+        }
+        void generateApiKey();
+    };
+
+    const requestRevokeApiKey = () => setPendingApiAction('revoke');
+
+    const confirmPendingApiAction = async () => {
+        const action = pendingApiAction;
+        setPendingApiAction(null);
+        if (action === 'regenerate') await generateApiKey();
+        if (action === 'revoke') await revokeApiKey();
     };
 
     const handleSave = async () => {
@@ -176,7 +200,12 @@ export default function Settings() {
         }
     };
 
-    const maskedApiKey = apiKey ? `${apiKey.slice(0, 8)}${'*'.repeat(Math.max(0, apiKey.length - 16))}${apiKey.slice(-8)}` : '';
+    const secretStatus = openApiSecretStatus({ plaintext: apiSecret, hasStoredSecret });
+    const secretDisplay = secretStatus === 'visible'
+        ? apiSecret
+        : secretStatus === 'stored-hidden'
+            ? 'Tersimpan (hanya ditampilkan saat generate)'
+            : '-';
     const listSignatureFormula = 'md5(member_id:api_key:secret)';
     const orderSignatureFormula = 'md5(member_id:api_key:secret:ref_id)';
     const rawApiV2Base = import.meta.env.VITE_API_V2_URL || '/api/v2';
@@ -462,8 +491,8 @@ export default function Settings() {
                                     <Key className="w-5 h-5" />
                                 </div>
                                 <div>
-                                    <h2 className="text-lg font-bold ui-text">Developer Open API Credentials</h2>
-                                    <p className="text-xs ui-text-muted">Gunakan kredensial berikut untuk melakukan otomasi transaksi melalui API.</p>
+                                    <h2 className="text-lg font-bold ui-text">Kredensial Open API</h2>
+                                    <p className="text-xs ui-text-muted">Gunakan kredensial ini untuk otomasi transaksi lewat API.</p>
                                 </div>
                             </div>
                             <button
@@ -485,18 +514,18 @@ export default function Settings() {
                             <div className="space-y-6">
                                 {apiKey ? (
                                     <>
-                                        <div className="grid gap-4 lg:grid-cols-3">
+                                        <div className="grid gap-4 grid-cols-1 lg:grid-cols-3">
                                             <CredentialCard
                                                 label="Member ID"
                                                 value={memberId || '-'}
                                                 copied={copied === 'memberId'}
-                                                onCopy={() => copyValue(memberId, 'memberId')}
+                                                onCopy={() => void copyValue(memberId, 'memberId')}
                                             />
                                             <CredentialCard
                                                 label="API Key"
-                                                value={showApiKey ? apiKey : maskedApiKey}
+                                                value={showApiKey ? apiKey : maskOpenApiKey(apiKey)}
                                                 copied={copied === 'apiKey'}
-                                                onCopy={() => copyValue(apiKey, 'apiKey')}
+                                                onCopy={() => void copyValue(apiKey, 'apiKey')}
                                                 action={(
                                                     <button
                                                         type="button"
@@ -510,9 +539,13 @@ export default function Settings() {
                                             />
                                             <CredentialCard
                                                 label="Secret Key"
-                                                value={apiSecret || (hasStoredSecret ? 'Tersimpan (hanya ditampilkan saat generate)' : '-')}
+                                                value={secretDisplay}
                                                 copied={copied === 'secret'}
-                                                onCopy={() => copyValue(apiSecret, 'secret')}
+                                                copyDisabled={!canCopyOpenApiSecret(secretStatus)}
+                                                onCopy={() => {
+                                                    if (!canCopyOpenApiSecret(secretStatus)) return;
+                                                    void copyValue(apiSecret, 'secret');
+                                                }}
                                             />
                                         </div>
                                         {apiSecret ? (
@@ -521,23 +554,41 @@ export default function Settings() {
                                             </div>
                                         ) : null}
 
-                                        <div className="flex flex-wrap gap-3">
+                                        {pendingApiAction && (
+                                            <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm" data-testid="settings-openapi-confirm">
+                                                <p className="font-semibold">
+                                                    {pendingApiAction === 'regenerate'
+                                                        ? 'API key lama akan diganti. Secret baru hanya ditampilkan sekali. Lanjutkan?'
+                                                        : 'API key dan secret akan dihapus dan tidak bisa digunakan lagi. Lanjutkan?'}
+                                                </p>
+                                                <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+                                                    <button type="button" className="ui-accent-solid rounded-xl px-4 py-2 text-sm font-bold" onClick={() => void confirmPendingApiAction()}>
+                                                        Ya, lanjutkan
+                                                    </button>
+                                                    <button type="button" className="ui-muted-action rounded-xl px-4 py-2 text-sm font-bold" onClick={() => setPendingApiAction(null)}>
+                                                        Batal
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        <div className="flex flex-col sm:flex-row flex-wrap gap-3">
                                             <button
                                                 type="button"
-                                                onClick={generateApiKey}
+                                                onClick={requestGenerateApiKey}
                                                 disabled={apiGenerating}
-                                                className="flex-1 min-w-[200px] flex items-center justify-center gap-2 px-5 py-2.5 ui-muted-action text-sm font-bold rounded-xl transition-all disabled:opacity-50"
+                                                className="w-full sm:flex-1 flex items-center justify-center gap-2 px-5 py-2.5 ui-muted-action text-sm font-bold rounded-xl transition-all disabled:opacity-50"
                                             >
                                                 {apiGenerating ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4 ui-accent-text" />}
-                                                Regenerate API Credentials
+                                                Buat ulang kredensial
                                             </button>
                                             <button
                                                 type="button"
-                                                onClick={revokeApiKey}
-                                                className="flex items-center justify-center gap-2 px-5 py-2.5 ui-danger-action text-sm font-bold rounded-xl transition-all"
+                                                onClick={requestRevokeApiKey}
+                                                className="w-full sm:w-auto flex items-center justify-center gap-2 px-5 py-2.5 ui-danger-action text-sm font-bold rounded-xl transition-all"
                                             >
                                                 <Trash2 className="w-4 h-4" />
-                                                Revoke / Hapus Key
+                                                Cabut key
                                             </button>
                                         </div>
                                     </>
@@ -554,12 +605,12 @@ export default function Settings() {
                                         </div>
                                         <button
                                             type="button"
-                                            onClick={generateApiKey}
+                                            onClick={requestGenerateApiKey}
                                             disabled={apiGenerating}
                                             className="inline-flex items-center gap-2 px-6 py-3 ui-accent-solid rounded-xl text-sm font-bold shadow-md transition-all hover:scale-[1.02] disabled:opacity-50"
                                         >
                                             {apiGenerating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Key className="w-4 h-4" />}
-                                            Generate API Key & Secret
+                                            Buat API Key & Secret
                                         </button>
                                     </div>
                                 )}
@@ -715,13 +766,15 @@ function CredentialCard({
     value,
     copied,
     onCopy,
-    action
+    action,
+    copyDisabled = false,
 }: {
     label: string;
     value: string | null;
     copied: boolean;
     onCopy: () => void;
     action?: ReactNode;
+    copyDisabled?: boolean;
 }) {
     return (
         <div className="ui-panel-muted rounded-xl p-4 border ui-border space-y-2 shadow-sm">
@@ -729,14 +782,15 @@ function CredentialCard({
                 <span className="text-xs font-bold ui-text-muted uppercase tracking-wider">{label}</span>
                 {action}
             </div>
-            <div className="flex items-center gap-2 bg-black/10 rounded-lg p-1.5 border ui-border">
-                <code className="flex-1 text-xs ui-accent-text font-mono overflow-x-auto whitespace-nowrap scrollbar-hide px-2 leading-relaxed">
+            <div className="flex items-start gap-2 bg-black/10 rounded-lg p-1.5 border ui-border">
+                <code className="min-w-0 flex-1 break-all whitespace-pre-wrap text-xs ui-accent-text font-mono px-2 leading-relaxed">
                     {value || '-'}
                 </code>
                 <button
                     type="button"
                     onClick={onCopy}
-                    className="p-2 text-gray-400 hover:text-white hover:bg-white/5 rounded-lg transition-colors shrink-0"
+                    disabled={copyDisabled}
+                    className="p-2 text-gray-400 hover:text-white hover:bg-white/5 rounded-lg transition-colors shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
                     title="Salin Kredensial"
                 >
                     {copied ? <Check className="w-4 h-4 text-green-400 animate-bounce" /> : <Copy className="w-4 h-4" />}
