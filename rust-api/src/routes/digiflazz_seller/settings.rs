@@ -10,7 +10,7 @@ use crate::{
 };
 
 use super::{
-    allowed_ips, bool_from_value, bson_to_json, callback_pending_expression, count_documents,
+    allowed_ips, bool_from_value, bson_to_json, callback_pending_expression,
     document_string, internal_error, join_url, non_negative_i64, normalize_url,
     optional_bool, optional_date_or_string, save_settings_error, text_from_value, unavailable,
     validate_allowed_ips, validate_http_url, EmptyStringFallback, MappingSummary, OrderSummary,
