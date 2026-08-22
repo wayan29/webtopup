@@ -316,8 +316,11 @@ pub async fn orders(
         .limit(50)
         .await
     {
-        Ok(cursor) => cursor.try_collect::<Vec<_>>().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
+        Ok(cursor) => match cursor.try_collect::<Vec<_>>().await {
+            Ok(docs) => docs,
+            Err(_) => return internal_error(),
+        },
+        Err(_) => return internal_error(),
     };
     let product_map = seller_order_products(&db, &docs).await;
 
@@ -356,8 +359,11 @@ pub async fn admin_orders(
         .limit(limit)
         .await
     {
-        Ok(cursor) => cursor.try_collect::<Vec<_>>().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
+        Ok(cursor) => match cursor.try_collect::<Vec<_>>().await {
+            Ok(docs) => docs,
+            Err(_) => return internal_error(),
+        },
+        Err(_) => return internal_error(),
     };
     let product_map = seller_order_products(&db, &docs).await;
     let summary = admin_orders_summary(&collection, filter).await;
@@ -406,8 +412,11 @@ pub async fn admin_orders_export(
         .limit(SELLER_ORDER_EXPORT_LIMIT)
         .await
     {
-        Ok(cursor) => cursor.try_collect::<Vec<_>>().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
+        Ok(cursor) => match cursor.try_collect::<Vec<_>>().await {
+            Ok(docs) => docs,
+            Err(_) => return internal_error(),
+        },
+        Err(_) => return internal_error(),
     };
     let product_map = seller_order_products(&db, &docs).await;
     let items = docs
@@ -485,7 +494,7 @@ async fn build_admin_orders_filter(
         .filter(|value| !value.is_empty())
     {
         let regex = doc! { "$regex": escape_regex(keyword), "$options": "i" };
-        let product_ids = product_ids_for_seller_order_search(db, regex.clone()).await;
+        let product_ids = product_ids_for_seller_order_search(db, regex.clone()).await?;
         let mut search_or = vec![
             doc! { "refId": regex.clone() },
             doc! { "trId": regex.clone() },
@@ -511,8 +520,11 @@ async fn build_admin_orders_filter(
     Ok(filter)
 }
 
-async fn product_ids_for_seller_order_search(db: &mongodb::Database, regex: Document) -> Vec<Bson> {
-    match db
+async fn product_ids_for_seller_order_search(
+    db: &mongodb::Database,
+    regex: Document,
+) -> Result<Vec<Bson>, Response> {
+    let cursor = db
         .collection::<Document>("products")
         .find(doc! { "$or": [
             { "name": regex.clone() },
@@ -524,16 +536,15 @@ async fn product_ids_for_seller_order_search(db: &mongodb::Database, regex: Docu
         ] })
         .projection(doc! { "_id": 1 })
         .await
-    {
-        Ok(cursor) => cursor
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|doc| doc.get_object_id("_id").ok().map(Bson::ObjectId))
-            .collect(),
-        Err(_) => Vec::new(),
-    }
+        .map_err(|_| internal_error())?;
+    let docs = cursor
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|_| internal_error())?;
+    Ok(docs
+        .into_iter()
+        .filter_map(|doc| doc.get_object_id("_id").ok().map(Bson::ObjectId))
+        .collect())
 }
 
 fn parse_date_boundary(
@@ -885,7 +896,7 @@ fn status_message(status: axum::http::StatusCode, message: &'static str) -> Resp
     (status, Json(ErrorResponse { message })).into_response()
 }
 
-fn internal_error() -> Response {
+pub(super) fn internal_error() -> Response {
     status_message(
         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
         "Internal Server Error",
@@ -1055,6 +1066,42 @@ mod tests {
         assert!(
             !production.contains("return unavailable();"),
             "public Digiflazz prepaid must stay on the channel envelope when storage is missing"
+        );
+    }
+
+    fn production_source(path: &str) -> String {
+        let source = std::fs::read_to_string(path).unwrap();
+        source
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn admin_reads_fail_closed_on_query_errors() {
+        let root = production_source("src/routes/digiflazz_seller.rs");
+        let logs = production_source("src/routes/digiflazz_seller/logs.rs");
+        let mappings = production_source("src/routes/digiflazz_seller/mappings.rs");
+        let settings = production_source("src/routes/digiflazz_seller/settings.rs");
+        for (label, source) in [
+            ("orders", root.as_str()),
+            ("logs", logs.as_str()),
+            ("mappings", mappings.as_str()),
+        ] {
+            assert!(
+                !source.contains("Err(_) => Vec::new()"),
+                "{label} must not fail open to an empty list"
+            );
+        }
+        assert!(
+            !settings.contains("Err(_) => OrderSummary::default()"),
+            "seller_order_summary must not fail open to zeros"
+        );
+        assert!(
+            settings.contains("Err(_) => return internal_error()")
+                || settings.contains("Err(_) => return unavailable()"),
+            "settings helpers must fail closed on Mongo errors"
         );
     }
 }

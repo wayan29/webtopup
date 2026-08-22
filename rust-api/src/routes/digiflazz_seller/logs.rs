@@ -25,8 +25,11 @@ pub async fn logs(headers: axum::http::HeaderMap, State(state): State<Arc<AppSta
         .limit(100)
         .await
     {
-        Ok(cursor) => cursor.try_collect::<Vec<_>>().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
+        Ok(cursor) => match cursor.try_collect::<Vec<_>>().await {
+            Ok(docs) => docs,
+            Err(_) => return super::internal_error(),
+        },
+        Err(_) => return super::internal_error(),
     };
 
     Json(

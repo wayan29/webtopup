@@ -79,8 +79,11 @@ pub async fn mappings(
         .sort(doc! { "updatedAt": -1, "name": 1 })
         .await
     {
-        Ok(cursor) => cursor.try_collect::<Vec<_>>().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
+        Ok(cursor) => match cursor.try_collect::<Vec<_>>().await {
+            Ok(docs) => docs,
+            Err(_) => return internal_error(),
+        },
+        Err(_) => return internal_error(),
     };
 
     let product_ids = products

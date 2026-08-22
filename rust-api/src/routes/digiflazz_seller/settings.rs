@@ -36,12 +36,34 @@ pub async fn settings(
         return unavailable();
     };
     let db = client.database(&state.mongo_db);
-    let config = seller_config(&db).await;
-    let total_mappings = count_documents(&db, "digiflazzsellerproductmaps", doc! {}).await;
-    let active_mappings =
-        count_documents(&db, "digiflazzsellerproductmaps", doc! { "isActive": true }).await;
-    let order_summary = seller_order_summary(&db).await;
-    let retry_queue_health = retry_queue_health(&db).await;
+    let config = match stored_seller_config(&db).await {
+        Ok(stored) => seller_config_from_stored(stored),
+        Err(_) => return internal_error(),
+    };
+    let total_mappings = match db
+        .collection::<Document>("digiflazzsellerproductmaps")
+        .count_documents(doc! {})
+        .await
+    {
+        Ok(count) => count as i64,
+        Err(_) => return internal_error(),
+    };
+    let active_mappings = match db
+        .collection::<Document>("digiflazzsellerproductmaps")
+        .count_documents(doc! { "isActive": true })
+        .await
+    {
+        Ok(count) => count as i64,
+        Err(_) => return internal_error(),
+    };
+    let order_summary = match seller_order_summary(&db).await {
+        Ok(summary) => summary,
+        Err(_) => return internal_error(),
+    };
+    let retry_queue_health = match retry_queue_health(&db).await {
+        Ok(health) => health,
+        Err(_) => return internal_error(),
+    };
     let configured = !config.username.is_empty() && !config.api_key.is_empty();
 
     Json(SellerSettingsResponse {
@@ -84,7 +106,10 @@ pub async fn save_settings(
     };
 
     let db = client.database(&state.mongo_db);
-    let current = stored_seller_config(&db).await;
+    let current = match stored_seller_config(&db).await {
+        Ok(current) => current,
+        Err(_) => return internal_error(),
+    };
     let api_key = payload
         .api_key
         .as_ref()
@@ -181,7 +206,11 @@ pub async fn save_settings(
 }
 
 pub(super) async fn seller_config(db: &mongodb::Database) -> SellerConfig {
-    let stored = stored_seller_config(db).await;
+    let stored = stored_seller_config(db).await.unwrap_or_default();
+    seller_config_from_stored(stored)
+}
+
+fn seller_config_from_stored(stored: Document) -> SellerConfig {
     let public_base_url = normalize_url(document_string(&stored, "publicBaseUrl"));
     let prepaid_endpoint_path = PREPAID_PATH.to_string();
     let prepaid_endpoint_url = join_url(&public_base_url, &prepaid_endpoint_path);
@@ -202,26 +231,27 @@ pub(super) async fn seller_config(db: &mongodb::Database) -> SellerConfig {
     }
 }
 
-async fn stored_seller_config(db: &mongodb::Database) -> Document {
-    db.collection::<Document>("settings")
+async fn stored_seller_config(
+    db: &mongodb::Database,
+) -> mongodb::error::Result<Document> {
+    Ok(db
+        .collection::<Document>("settings")
         .find_one(doc! { "key": CONFIG_KEY })
-        .await
-        .ok()
-        .flatten()
+        .await?
         .and_then(|doc| doc.get_document("value").ok().cloned())
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
-async fn retry_queue_health(db: &mongodb::Database) -> RetryQueueHealth {
+async fn retry_queue_health(
+    db: &mongodb::Database,
+) -> mongodb::error::Result<RetryQueueHealth> {
     let value = db
         .collection::<Document>("settings")
         .find_one(doc! { "key": RETRY_HEALTH_KEY })
-        .await
-        .ok()
-        .flatten()
+        .await?
         .and_then(|doc| doc.get_document("value").ok().cloned())
         .unwrap_or_default();
-    RetryQueueHealth {
+    Ok(RetryQueueHealth {
         status: document_string(&value, "status").if_empty("never"),
         source: document_string(&value, "source").if_empty("unknown"),
         last_run_at: optional_date_or_string(&value, "lastRunAt"),
@@ -230,12 +260,14 @@ async fn retry_queue_health(db: &mongodb::Database) -> RetryQueueHealth {
         failed_count: read_i64(&value, "failedCount"),
         remaining_due: read_i64(&value, "remainingDue"),
         last_error: document_string(&value, "lastError"),
-    }
+    })
 }
 
-async fn seller_order_summary(db: &mongodb::Database) -> OrderSummary {
+async fn seller_order_summary(
+    db: &mongodb::Database,
+) -> mongodb::error::Result<OrderSummary> {
     let now = DateTime::now();
-    match db
+    let cursor = db
         .collection::<Document>("digiflazzsellerorders")
         .aggregate(vec![doc! { "$group": {
             "_id": Bson::Null,
@@ -255,21 +287,16 @@ async fn seller_order_summary(db: &mongodb::Database) -> OrderSummary {
                 { "$gte": [ { "$ifNull": ["$callbackAttemptCount", 0] }, HIGH_CALLBACK_ATTEMPT_THRESHOLD ] }
             ] }, 1, 0 ] } }
         } }])
-        .await
-    {
-        Ok(cursor) => cursor
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap_or_default()
-            .first()
-            .map(|doc| OrderSummary {
-                total: read_i64(doc, "total"),
-                pending: read_i64(doc, "pending"),
-                callback_pending: read_i64(doc, "callbackPending"),
-                callback_due_retry: read_i64(doc, "callbackDueRetry"),
-                callback_high_attempt: read_i64(doc, "callbackHighAttempt"),
-            })
-            .unwrap_or_default(),
-        Err(_) => OrderSummary::default(),
-    }
+        .await?;
+    let docs = cursor.try_collect::<Vec<_>>().await?;
+    Ok(docs
+        .first()
+        .map(|doc| OrderSummary {
+            total: read_i64(doc, "total"),
+            pending: read_i64(doc, "pending"),
+            callback_pending: read_i64(doc, "callbackPending"),
+            callback_due_retry: read_i64(doc, "callbackDueRetry"),
+            callback_high_attempt: read_i64(doc, "callbackHighAttempt"),
+        })
+        .unwrap_or_default())
 }
