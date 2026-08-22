@@ -21,7 +21,7 @@ use crate::{
 
 use super::{
     document_string, is_valid_pulsa_code, non_negative_i64, optional_i64, seller_config,
-    send_seller_callback, text_from_value, unavailable, SellerConfig, SellerPrepaidPayload,
+    send_seller_callback, text_from_value, SellerConfig, SellerPrepaidPayload,
 };
 
 pub async fn prepaid(
@@ -30,7 +30,19 @@ pub async fn prepaid(
     Json(payload): Json<SellerPrepaidPayload>,
 ) -> Response {
     let Some(client) = &state.mongo_client else {
-        return unavailable();
+        return Json(build_response(
+            "-",
+            "",
+            "-",
+            "-",
+            0,
+            "failed",
+            "39",
+            "Layanan Digiflazz Seller tidak tersedia",
+            "",
+            0,
+        ))
+        .into_response();
     };
     let db = client.database(&state.mongo_db);
     let config = seller_config(&db).await;

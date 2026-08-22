@@ -92,13 +92,10 @@ pub(super) fn internal_error() -> Response {
 }
 
 pub(super) fn unavailable() -> Response {
-    (
+    status_message(
         axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        Json(ErrorResponse {
-            message: "MONGO_URI is not configured",
-        }),
+        "Service Unavailable",
     )
-        .into_response()
 }
 
 pub(super) trait EmptyStringFallback {

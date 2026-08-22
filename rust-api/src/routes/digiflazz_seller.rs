@@ -893,13 +893,10 @@ fn internal_error() -> Response {
 }
 
 fn unavailable() -> Response {
-    (
+    status_message(
         axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        Json(ErrorResponse {
-            message: "MONGO_URI is not configured",
-        }),
+        "Service Unavailable",
     )
-        .into_response()
 }
 
 #[cfg(test)]
@@ -1033,5 +1030,31 @@ mod tests {
         assert_eq!(save_json["apiKeyConfigured"], serde_json::Value::Bool(true));
         assert!(save_json.get("apiKeyMasked").is_none());
         assert!(!save_json.to_string().contains("1234"));
+    }
+
+    #[test]
+    fn admin_unavailable_never_mentions_mongo_uri() {
+        let source = include_str!("digiflazz_seller.rs");
+        let tests = source.find("\n#[cfg(test)]").unwrap_or(source.len());
+        let production = &source[..tests];
+        assert!(
+            !production.contains("MONGO_URI is not configured"),
+            "Digiflazz admin unavailable() must not leak Mongo configuration"
+        );
+    }
+
+    #[test]
+    fn public_prepaid_does_not_use_admin_unavailable_helper() {
+        let source = include_str!("digiflazz_seller/prepaid.rs");
+        let tests = source.find("\n#[cfg(test)]").unwrap_or(source.len());
+        let production = &source[..tests];
+        assert!(
+            !production.contains("MONGO_URI is not configured"),
+            "public Digiflazz prepaid must not leak Mongo configuration"
+        );
+        assert!(
+            !production.contains("return unavailable();"),
+            "public Digiflazz prepaid must stay on the channel envelope when storage is missing"
+        );
     }
 }

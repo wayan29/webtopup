@@ -445,4 +445,17 @@ mod tests {
         let source = include_str!("prepaid.rs");
         assert!(!source.contains("MONGO_URI is not configured"));
     }
+
+    #[test]
+    fn admin_unavailable_never_mentions_mongo_uri() {
+        let source = include_str!("mod.rs");
+        assert!(
+            !source.contains("MONGO_URI is not configured"),
+            "IRS admin unavailable() must not leak Mongo configuration"
+        );
+        assert!(
+            source.contains("Service Unavailable") || source.contains("tidak tersedia"),
+            "IRS admin unavailable() must use a generic storage message"
+        );
+    }
 }
