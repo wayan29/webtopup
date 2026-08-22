@@ -115,15 +115,28 @@ pub fn seller_requirement_state(
     }
 }
 
+fn is_namespace_not_found_message(message: &str) -> bool {
+    message.contains("NamespaceNotFound") || message.contains("ns does not exist")
+}
+
+fn is_namespace_not_found(error: &mongodb::error::Error) -> bool {
+    is_namespace_not_found_message(&error.to_string())
+}
+
 pub async fn inspect_seller_index_state(
     db: &Database,
     requirement: &SellerOrderIndexRequirement,
 ) -> Result<SellerIndexState, SellerIntegrityError> {
-    let indexes = db
+    let cursor = match db
         .collection::<Document>(requirement.collection)
         .list_indexes()
         .await
-        .map_err(SellerIntegrityError::Mongo)?
+    {
+        Ok(cursor) => cursor,
+        Err(error) if is_namespace_not_found(&error) => return Ok(SellerIndexState::Missing),
+        Err(error) => return Err(SellerIntegrityError::Mongo(error)),
+    };
+    let indexes = cursor
         .try_collect::<Vec<_>>()
         .await
         .map_err(SellerIntegrityError::Mongo)?;
@@ -219,5 +232,15 @@ mod tests {
             seller_requirement_state(&[], &requirement),
             SellerIndexState::Missing
         );
+    }
+
+    #[test]
+    fn missing_collection_is_index_missing_not_storage_failure() {
+        assert!(is_namespace_not_found_message(
+            "Kind: Command failed: Error code 26 (NamespaceNotFound): ns does not exist: webtopup_task14_dev.irssellerorders"
+        ));
+        assert!(!is_namespace_not_found_message(
+            "Kind: Command failed: Error code 13 (Unauthorized): not authorized"
+        ));
     }
 }
