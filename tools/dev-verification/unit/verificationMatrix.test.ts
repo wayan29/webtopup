@@ -62,3 +62,20 @@ test('browser matrix uses trusted configs and serial workers without TLS bypass'
   assert.match(serialized, /playwright\.config\.ts/); assert.match(serialized, /chromium-desktop/); assert.match(serialized, /chromium-mobile/);
   assert.doesNotMatch(serialized, /ignoreHTTPSErrors/); assert.doesNotMatch(serialized, /--workers=[2-9]/);
 });
+
+test('seller center integration and responsive checks are required matrix entries', () => {
+  const matrix = verificationMatrix();
+  const names = matrix.map(({ name }) => name);
+  for (const name of ['seller-center-integration', 'seller-center-desktop', 'seller-center-mobile']) {
+    const check = matrix.find((item) => item.name === name);
+    assert.ok(check, `${name} must be in the matrix`);
+    assert.equal(check.required, true);
+    assert.equal(check.profile, 'session-cs');
+    assert.equal(check.isolated, true);
+    assert.ok(names.filter((item) => item === name).length === 1, `${name} must appear exactly once`);
+  }
+  const integration = matrix.find((item) => item.name === 'seller-center-integration');
+  assert.ok(integration?.args.join(' ').includes('sellerCenter.test.ts'));
+  const browsers = matrix.filter((item) => item.name.startsWith('seller-center-') && item.name !== 'seller-center-integration');
+  for (const check of browsers) assert.ok(check.args.join(' ').includes('seller-center.spec.ts'));
+});

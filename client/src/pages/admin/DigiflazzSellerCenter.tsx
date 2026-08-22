@@ -202,7 +202,7 @@ const SellerCenterOverview = ({
     loading: boolean;
     onNavigateSection: (section: SellerCenterSection) => void;
 }) => (
-    <div className="space-y-4" aria-busy={loading}>
+    <div className="space-y-4" aria-busy={loading} data-testid="seller-center-overview">
         <div className="grid gap-4 xl:grid-cols-2">
             <div className="rounded-xl border ui-border ui-panel-muted p-5">
                 <div className="flex items-center justify-between gap-3">

@@ -182,3 +182,20 @@ test('slider fixture seeding is marker-bound and cannot mutate balance/provider 
 function cryptoRandomUuid(): string {
   return '123e4567-e89b-12d3-a456-426614174000';
 }
+
+test('seller center fixtures exist with manager and denied permission scopes', () => {
+  const definitions = fixtureDefinitions('run-123', new Date('2026-07-18T00:00:00Z'));
+  const manager = definitions.find((item) => item.alias === 'seller-center-manager');
+  assert.ok(manager, 'seller-center-manager fixture is required');
+  assert.equal(manager.permissions?.manageVendors, true);
+  assert.equal(manager.permissions?.viewTransactions, true);
+  assert.equal(manager.twoFactorEnabled, true, 'manager must be able to complete step-up');
+
+  const denied = definitions.find((item) => item.alias === 'seller-center-denied');
+  assert.ok(denied, 'seller-center-denied fixture is required');
+  assert.notEqual(denied.permissions?.manageVendors, true);
+  assert.notEqual(denied.permissions?.viewTransactions, true);
+
+  const emails = definitions.map((item) => item.email);
+  assert.equal(new Set(emails).size, emails.length, 'fixture emails must stay unique');
+});
