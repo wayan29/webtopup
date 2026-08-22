@@ -283,6 +283,8 @@ test('legacy vendor routes are not registered in the gateway app', () => {
 test('seller center summary keeps exact permissions and public prepaid order', () => {
     const source = readFileSync(join(__dirname, '..', '..', 'src', 'routes', 'apiV2ProxyRoutes.ts'), 'utf8');
     assert.match(source, /app\.get\('\/digiflazz-seller\/center-summary', \{ preHandler: \[authenticate, hasPermission\('manageVendors'\)\] \}/u);
+    assert.match(source, /app\.get\('\/digiflazz-seller\/orders\/admin', \{ preHandler: \[authenticate, hasPermission\('viewTransactions'\)\] \}/u);
+    assert.match(source, /app\.get\('\/irs-seller\/orders\/admin', \{ preHandler: \[authenticate, hasPermission\('viewTransactions'\)\] \}/u);
     assert.match(source, /app\.post\('\/digiflazz-seller\/settings', \{ preHandler: \[authenticate, hasPermission\('manageVendors'\), requireStepUp\('integrations\.credentials'\)\] \}/u);
     assert.match(source, /app\.post\('\/irs-seller\/settings', \{ preHandler: \[authenticate, hasPermission\('manageVendors'\), requireStepUp\('integrations\.credentials'\)\] \}/u);
 

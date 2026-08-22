@@ -431,3 +431,12 @@ test('seller center irs integration keeps credential fields write-only', () => {
     assert.match(irs, /integrations\.credentials/);
     assert.match(irs, /type="password"/);
 });
+
+test('seller center digiflazz orders stay behind viewTransactions', () => {
+    const channel = readAdminPage('DigiflazzSellerChannel.tsx');
+    assert.match(channel, /\/digiflazz-seller\/orders\/admin/);
+    assert.doesNotMatch(channel, /apiV2\.get\('\/digiflazz-seller\/orders'\)/);
+    assert.match(channel, /viewTransactions/);
+    assert.match(channel, /denied/);
+    assert.match(channel, /Penyimpanan order Digiflazz tidak tersedia|tidak tersedia/);
+});

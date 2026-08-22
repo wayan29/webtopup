@@ -129,6 +129,7 @@ type OrderItem = {
 };
 
 type MappingEditorState = { pulsaCode: string; sellerMarginFlat: string; isActive: boolean; syncNow: boolean };
+type ResourceState = 'loading' | 'ready' | 'empty' | 'denied' | 'unavailable';
 
 const currencyFormatter = new Intl.NumberFormat('id-ID');
 const DEFAULT_DIGIFLAZZ_CALLBACK_URL = 'https://api.digiflazz.com/v1/seller/callback';
@@ -221,7 +222,7 @@ export default function DigiflazzSellerChannel({
     const [logs, setLogs] = useState<LogItem[]>([]);
     const [orders, setOrders] = useState<OrderItem[]>([]);
     const [logsLoading, setLogsLoading] = useState(false);
-    const [ordersLoading, setOrdersLoading] = useState(false);
+    const [ordersState, setOrdersState] = useState<ResourceState>('loading');
     const [retryingCallbackId, setRetryingCallbackId] = useState<string | null>(null);
     const [retryingBulkCallbacks, setRetryingBulkCallbacks] = useState(false);
     const [processingDueRetries, setProcessingDueRetries] = useState(false);
@@ -308,14 +309,18 @@ export default function DigiflazzSellerChannel({
 
     const fetchOrders = useCallback(async () => {
         try {
-            setOrdersLoading(true);
-            const response = await apiV2.get('/digiflazz-seller/orders');
-            setOrders(response.data || []);
+            setOrdersState('loading');
+            const response = await apiV2.get('/digiflazz-seller/orders/admin');
+            const items = Array.isArray(response.data?.items) ? response.data.items as OrderItem[] : [];
+            setOrders(items);
+            setOrdersState(items.length === 0 ? 'empty' : 'ready');
         } catch (error) {
-            console.error('Failed to fetch Digiflazz Seller orders:', error);
-            setMessage({ type: 'error', text: 'Gagal memuat order Digiflazz Seller' });
-        } finally {
-            setOrdersLoading(false);
+            setOrders([]);
+            if (axios.isAxiosError(error) && (error.response?.status === 401 || error.response?.status === 403)) {
+                setOrdersState('denied');
+                return;
+            }
+            setOrdersState('unavailable');
         }
     }, []);
 
@@ -624,7 +629,7 @@ export default function DigiflazzSellerChannel({
                     logs={logs}
                     logsLoading={logsLoading}
                     orders={orders}
-                    ordersLoading={ordersLoading}
+                    ordersState={ordersState}
                     settings={settings}
                     schedulerConfig={schedulerConfig}
                     schedulerCurlCommand={schedulerCurlCommand}
@@ -1260,7 +1265,7 @@ const OrdersSection = ({
     logs,
     logsLoading,
     orders,
-    ordersLoading,
+    ordersState,
     settings,
     schedulerConfig,
     schedulerCurlCommand,
@@ -1276,7 +1281,7 @@ const OrdersSection = ({
     logs: LogItem[];
     logsLoading: boolean;
     orders: OrderItem[];
-    ordersLoading: boolean;
+    ordersState: ResourceState;
     settings: SettingsState;
     schedulerConfig: SchedulerConfig;
     schedulerCurlCommand: string;
@@ -1440,9 +1445,13 @@ const OrdersSection = ({
                         </div>
                     </div>
 
-                    {ordersLoading ? (
+                    {ordersState === 'loading' ? (
                         <div className="rounded-xl border ui-border ui-panel px-4 py-8 text-center text-sm ui-text-muted">Memuat order...</div>
-                    ) : orders.length === 0 ? (
+                    ) : ordersState === 'denied' ? (
+                        <div className="rounded-xl border ui-border ui-panel px-4 py-8 text-center text-sm ui-text-muted" role="status">Anda memerlukan izin viewTransactions untuk melihat order Digiflazz Seller.</div>
+                    ) : ordersState === 'unavailable' ? (
+                        <div className="rounded-xl border ui-border ui-panel px-4 py-8 text-center text-sm ui-danger-text" role="alert">Penyimpanan order Digiflazz tidak tersedia.</div>
+                    ) : ordersState === 'empty' ? (
                         <div className="rounded-xl border ui-border ui-panel px-4 py-8 text-center text-sm ui-text-muted">Belum ada order Digiflazz Seller.</div>
                     ) : orders.map((order) => (
                         <div key={order.id} className="rounded-xl border ui-border ui-panel p-4">
