@@ -140,6 +140,7 @@ export default function IrsSellerIntegration({
 }: IntegrationProps) {
     const [settings, setSettings] = useState<IrsSettingsState>(defaultSettingsState);
     const [settingsLoading, setSettingsLoading] = useState(true);
+    const [settingsLoaded, setSettingsLoaded] = useState(false);
     const [saving, setSaving] = useState(false);
     const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
     const [formatterError, setFormatterError] = useState('');
@@ -170,13 +171,17 @@ export default function IrsSellerIntegration({
                 callbackUrl: data.callbackUrl || '',
                 prepaidEndpointPath: data.prepaidEndpointPath || '/v2/irs-seller/prepaid',
                 mappingActive: Number(data.mappingSummary?.active || 0),
+                formatterStart: String(data.formatter?.sn?.start || ''),
+                formatterEnd: String(data.formatter?.sn?.end || ''),
                 // Secrets stay write-only: reloads never hydrate editing fields.
                 password: '',
                 pin: '',
                 secret: '',
             }));
+            setSettingsLoaded(true);
         } catch (error) {
             console.error('Failed to fetch IRS settings:', error);
+            setSettingsLoaded(false);
             setMessage({ type: 'error', text: 'Gagal memuat konfigurasi IRS.' });
         } finally {
             setSettingsLoading(false);
@@ -221,6 +226,10 @@ export default function IrsSellerIntegration({
 
     const handleSave = async (event: React.FormEvent) => {
         event.preventDefault();
+        if (!settingsLoaded) {
+            setMessage({ type: 'error', text: 'Konfigurasi IRS belum dimuat. Simpan ditolak.' });
+            return;
+        }
         if (settings.formatterStart.length > FORMATTER_MARKER_MAX || settings.formatterEnd.length > FORMATTER_MARKER_MAX) {
             setFormatterError(`Marker formatter maksimal ${FORMATTER_MARKER_MAX} karakter.`);
             return;
@@ -236,8 +245,8 @@ export default function IrsSellerIntegration({
                 callbackEnabled: settings.callbackEnabled,
                 callbackUrl: settings.callbackUrl.trim(),
                 sellerMarginFlat: Number(settings.sellerMarginFlat || 0),
-                formatter: { sn: { start: settings.formatterStart, end: settings.formatterEnd } },
             };
+            if (settingsLoaded) payload.formatter = { sn: { start: settings.formatterStart, end: settings.formatterEnd } };
             // Blank secrets preserve the stored values server-side.
             if (settings.password.trim()) payload.password = settings.password.trim();
             if (settings.pin.trim()) payload.pin = settings.pin.trim();
@@ -386,7 +395,7 @@ export default function IrsSellerIntegration({
                 <div className="flex justify-end">
                     <button
                         type="submit"
-                        disabled={saving}
+                        disabled={saving || settingsLoading || !settingsLoaded}
                         className="inline-flex items-center gap-2 rounded-xl ui-accent-solid px-4 py-2.5 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-60"
                     >
                         {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}

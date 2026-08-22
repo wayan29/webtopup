@@ -430,6 +430,9 @@ test('seller center irs integration keeps credential fields write-only', () => {
     assert.doesNotMatch(irs, /passwordMasked|pinMasked|secretMasked/);
     assert.match(irs, /integrations\.credentials/);
     assert.match(irs, /type="password"/);
+    assert.match(irs, /formatterStart:\s*String\(data\.formatter\?\.sn\?\.start/);
+    assert.match(irs, /disabled=\{saving \|\| settingsLoading \|\| !settingsLoaded\}/);
+    assert.match(irs, /if \(settingsLoaded\) payload\.formatter/);
 });
 
 test('seller center digiflazz orders stay behind viewTransactions', () => {

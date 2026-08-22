@@ -22,7 +22,8 @@ use super::{
     DEFAULT_ENDPOINT, DEFAULT_PREPAID_PATH,
 };
 use super::types::{
-    validated_irs_formatter, IrsMappingSummary, IrsSettingsResponse, SaveIrsSettingsPayload,
+    validated_irs_formatter, IrsFormatterMarkers, IrsFormatterSnMarkers, IrsMappingSummary,
+    IrsSettingsResponse, SaveIrsSettingsPayload,
 };
 
 pub async fn settings(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
@@ -71,6 +72,20 @@ pub(super) fn irs_settings_response(config: &Document, active_mappings: i64) -> 
         prepaid_endpoint_path: DEFAULT_PREPAID_PATH.to_string(),
         mapping_summary: IrsMappingSummary {
             active: active_mappings,
+        },
+        formatter: irs_formatter_markers(config),
+    }
+}
+
+fn irs_formatter_markers(config: &Document) -> IrsFormatterMarkers {
+    let sn = config
+        .get_document("formatter")
+        .ok()
+        .and_then(|formatter| formatter.get_document("sn").ok());
+    IrsFormatterMarkers {
+        sn: IrsFormatterSnMarkers {
+            start: sn.map(|sn| read_string(sn, "start")).unwrap_or_default(),
+            end: sn.map(|sn| read_string(sn, "end")).unwrap_or_default(),
         },
     }
 }

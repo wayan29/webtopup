@@ -142,6 +142,18 @@ pub(super) struct IrsSettingsResponse {
     pub(super) prepaid_endpoint_path: String,
     #[serde(rename = "mappingSummary")]
     pub(super) mapping_summary: IrsMappingSummary,
+    pub(super) formatter: IrsFormatterMarkers,
+}
+
+#[derive(Serialize)]
+pub(super) struct IrsFormatterMarkers {
+    pub(super) sn: IrsFormatterSnMarkers,
+}
+
+#[derive(Serialize)]
+pub(super) struct IrsFormatterSnMarkers {
+    pub(super) start: String,
+    pub(super) end: String,
 }
 
 #[derive(Serialize)]
@@ -331,6 +343,38 @@ mod tests {
         for secret in ["password-fixture", "1234", "secret-fixture"] {
             assert!(!text.contains(secret), "secret fragment leaked: {secret}");
         }
+    }
+
+    #[test]
+    fn settings_response_exposes_nonsecret_formatter_markers() {
+        let mut config = doc! {
+            "enabled": true,
+            "merchantId": "merchant",
+            "password": "password-fixture",
+            "pin": "1234",
+            "secret": "secret-fixture",
+            "endpointUrl": "https://fixture.invalid",
+            "allowedIps": ["127.0.0.1"],
+            "sellerMarginFlat": 250_i64,
+            "callbackEnabled": false,
+            "callbackUrl": "",
+            "formatter": { "sn": { "start": "SN:", "end": "Saldo" } },
+        };
+        let json = serde_json::to_value(crate::routes::irs_seller::settings::irs_settings_response(
+            &config, 3,
+        ))
+        .unwrap();
+        assert_eq!(json["formatter"]["sn"]["start"], "SN:");
+        assert_eq!(json["formatter"]["sn"]["end"], "Saldo");
+        assert!(!json.to_string().contains("password-fixture"));
+
+        config.remove("formatter");
+        let json = serde_json::to_value(crate::routes::irs_seller::settings::irs_settings_response(
+            &config, 3,
+        ))
+        .unwrap();
+        assert_eq!(json["formatter"]["sn"]["start"], "");
+        assert_eq!(json["formatter"]["sn"]["end"], "");
     }
 
     #[test]
