@@ -597,8 +597,8 @@ function App() {
               <AdminDigiflazzSellerCenter />
             </AdminGuarded>
           } />
-          <Route path="addons/digiflazz-seller" element={<Navigate replace to="/admin/addons/digiflazz-seller-center?section=overview" />} />
-          <Route path="addons/irs-seller" element={<Navigate replace to="/admin/addons/digiflazz-seller-center?section=irs" />} />
+          <Route path="addons/digiflazz-seller" element={<Navigate replace to={{ pathname: '/admin/addons/digiflazz-seller-center', search: 'section=overview' }} />} />
+          <Route path="addons/irs-seller" element={<Navigate replace to={{ pathname: '/admin/addons/digiflazz-seller-center', search: 'section=irs' }} />} />
           <Route path="addons/tokovoucher" element={
             <AdminGuarded path="/admin/addons/tokovoucher">
               <AdminTokovoucherSettings />
