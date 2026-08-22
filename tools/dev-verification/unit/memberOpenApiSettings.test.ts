@@ -52,3 +52,16 @@ test('open api docs stay summarized until expanded and never embed live secrets'
     assert.doesNotMatch(source, /md5\(\$\{memberId/);
     assert.doesNotMatch(source, /showDocs && !apiLoading/);
 });
+
+test('settings keep the existing key generate and revoke endpoints', () => {
+    const source = settings();
+    assert.match(source, /apiV2\.get\('\/api\/key'\)/);
+    assert.match(source, /apiV2\.post\('\/api\/key\/generate'\)/);
+    assert.match(source, /apiV2\.delete\('\/api\/key\/revoke'\)/);
+    assert.match(source, /hasSecret/);
+});
+
+test('dev-verify unit script includes open api settings helpers', () => {
+    const pkg = readFileSync(resolve(root, 'package.json'), 'utf8');
+    assert.match(pkg, /client\/src\/lib\/openApiSettings\.test\.ts/);
+});
