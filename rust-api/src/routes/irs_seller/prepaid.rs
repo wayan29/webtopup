@@ -283,7 +283,19 @@ async fn execute_irs_order(
 
     // This request now owns the single execution for this refId.
     let internal_ref_id = read_string(&order, "internalRefId");
-    let product = load_irs_order_product(db, &order).await;
+    let product = match load_irs_order_product(db, &order).await {
+        Ok(product) => product,
+        Err(_) => {
+            return irs_response(
+                &ref_id,
+                &produk,
+                &tujuan,
+                "3",
+                "",
+                IRS_STORAGE_FAILURE_MESSAGE,
+            )
+        }
+    };
     let (status, message, sn, vendor_trx_id) = if order.get_bool("validationOrder").unwrap_or(false)
     {
         match product {
@@ -394,13 +406,13 @@ async fn execute_irs_order(
 async fn load_irs_order_product(
     db: &mongodb::Database,
     order: &Document,
-) -> Option<Document> {
-    let product_id = order.get_object_id("product").ok()?;
+) -> mongodb::error::Result<Option<Document>> {
+    let Some(product_id) = order.get_object_id("product").ok() else {
+        return Ok(None);
+    };
     db.collection::<Document>("products")
         .find_one(doc! { "_id": product_id })
         .await
-        .ok()
-        .flatten()
 }
 
 async fn reload_irs_order(db: &mongodb::Database, order_id: ObjectId) -> Option<Document> {
@@ -610,6 +622,43 @@ mod tests {
         assert!(
             !production.contains("\"executing\", \"ready\""),
             "executing must never roll back to ready"
+        );
+    }
+
+    #[test]
+    fn product_reload_storage_error_does_not_complete_as_failed() {
+        let source = include_str!("prepaid.rs");
+        let production = source.split("\n#[cfg(test)]").next().unwrap();
+        let load_fn = production
+            .split("async fn load_irs_order_product(")
+            .nth(1)
+            .unwrap()
+            .split("async fn reload_irs_order(")
+            .next()
+            .unwrap();
+        assert!(
+            load_fn.contains("mongodb::error::Result"),
+            "product reload must surface Mongo errors instead of swallowing them"
+        );
+        assert!(
+            !load_fn.contains(".ok()\n            .flatten()") && !load_fn.contains(".ok().flatten()"),
+            "product reload must not map storage errors to missing product"
+        );
+
+        let execute_fn = production
+            .split("async fn execute_irs_order(")
+            .nth(1)
+            .unwrap()
+            .split("async fn load_irs_order_product(")
+            .next()
+            .unwrap();
+        let load_at = execute_fn.find("load_irs_order_product(").unwrap();
+        let after_load = &execute_fn[load_at..];
+        let storage_at = after_load.find("IRS_STORAGE_FAILURE_MESSAGE").unwrap();
+        let finalize_at = after_load.find("finalize_irs_execution(").unwrap();
+        assert!(
+            storage_at < finalize_at,
+            "storage failure after claim must precede finalize so the order is not completed as failed"
         );
     }
 }
