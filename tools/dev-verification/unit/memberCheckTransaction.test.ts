@@ -11,7 +11,7 @@ test('guest public check still requires whatsapp while dashboard check uses the 
     const rust = read('rust-api/src/routes/guest_transactions/public.rs');
     const home = read('client/src/pages/Home.tsx');
 
-    assert.match(page, /isEmbeddedInDashboard/);
+    assert.match(page, /isEmbeddedInDashboard \? undefined : phone/);
     assert.match(page, /\/dashboard\/check-transaction\?invoice=/);
     assert.match(page, /guest-transactions\/check\/\$\{/);
     assert.doesNotMatch(

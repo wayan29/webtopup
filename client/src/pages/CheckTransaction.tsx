@@ -61,7 +61,7 @@ export default function CheckTransaction() {
         setLoading(true);
         setError('');
         try {
-            const params = phone ? { whatsapp: phone } : undefined;
+            const params = isEmbeddedInDashboard ? undefined : phone ? { whatsapp: phone } : undefined;
             const res = await apiV2.get(`/guest-transactions/check/${inv}`, { params });
             setTransaction(res.data);
         } catch (err: any) {
