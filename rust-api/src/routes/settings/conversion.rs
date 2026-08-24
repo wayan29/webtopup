@@ -33,6 +33,7 @@ pub fn normalize_setting_value(key: &str, value: &Bson) -> Value {
         "maintenanceMode"
         | "registrationEnabled"
         | "guestCheckoutEnabled"
+        | "botProtectionEnabled"
         | "popupBannerEnabled" => Value::Bool(matches!(value, Bson::Boolean(true))),
         "minDeposit" | "maxDeposit" | "depositFee" => json!(clamp_i64(value, 0, 100_000_000)),
         "refIdSequenceDigits" => json!(clamp_i64(value, 1, 10)),
