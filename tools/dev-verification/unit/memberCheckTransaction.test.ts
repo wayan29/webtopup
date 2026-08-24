@@ -14,6 +14,13 @@ test('guest public check still requires whatsapp while dashboard check uses the 
     assert.match(page, /isEmbeddedInDashboard \? undefined : phone/);
     assert.match(page, /\/dashboard\/check-transaction\?invoice=/);
     assert.match(page, /guest-transactions\/check\/\$\{/);
+    assert.match(
+        page,
+        /fetchTransaction\(invoice, isEmbeddedInDashboard \? undefined : whatsapp\)/,
+        'dashboard refresh must not pass leftover WhatsApp into fetch',
+    );
+    assert.match(page, /isEmbeddedInDashboard[\s\S]{0,220}Masukkan invoice untuk melihat status transaksi/);
+    assert.match(page, /Masukkan invoice dan WhatsApp untuk melihat status transaksi/);
     assert.doesNotMatch(
         page,
         /isEmbeddedInDashboard[\s\S]{0,80}Nomor WhatsApp/,

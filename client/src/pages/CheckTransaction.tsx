@@ -256,7 +256,7 @@ export default function CheckTransaction() {
                             <div className="flex items-center justify-between mb-4">
                                 <h2 className="font-semibold">Detail Transaksi</h2>
                                 <button 
-                                    onClick={() => fetchTransaction(invoice, whatsapp)}
+                                    onClick={() => fetchTransaction(invoice, isEmbeddedInDashboard ? undefined : whatsapp)}
                                     className="ui-muted-action rounded-lg p-2"
                                     title="Refresh"
                                 >
@@ -380,7 +380,11 @@ export default function CheckTransaction() {
                 {!loading && !transaction && !error && !invoiceFromUrl && !whatsappFromUrl && (
                     <div className="text-center py-12">
                         <Search className="ui-text-muted mx-auto mb-4 h-16 w-16 opacity-60" />
-                        <p className="ui-text-muted">Masukkan invoice dan WhatsApp untuk melihat status transaksi</p>
+                        <p className="ui-text-muted">
+                            {isEmbeddedInDashboard
+                                ? 'Masukkan invoice untuk melihat status transaksi'
+                                : 'Masukkan invoice dan WhatsApp untuk melihat status transaksi'}
+                        </p>
                     </div>
                 )}
             </div>
