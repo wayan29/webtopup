@@ -38,6 +38,8 @@ interface SettingsForm {
     maintenanceMessage: string;
     registrationEnabled: boolean;
     guestCheckoutEnabled: boolean;
+    botProtectionEnabled: boolean;
+    turnstileSiteKey: string;
     minDeposit: number;
     maxDeposit: number;
     depositFee: number;
@@ -89,6 +91,8 @@ const defaultForm: SettingsForm = {
     maintenanceMessage: 'Sistem sedang dalam pemeliharaan. Silakan coba beberapa saat lagi.',
     registrationEnabled: true,
     guestCheckoutEnabled: true,
+    botProtectionEnabled: false,
+    turnstileSiteKey: '',
     minDeposit: 10000,
     maxDeposit: 10000000,
     depositFee: 0,
@@ -130,6 +134,7 @@ export default function SiteConfig() {
     const [saving, setSaving] = useState(false);
     const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
     const [pendingConfirmMessage, setPendingConfirmMessage] = useState<string | null>(null);
+    const [botProtectionKillSwitch, setBotProtectionKillSwitch] = useState(false);
 
     useEffect(() => {
         fetchSettings();
@@ -155,6 +160,7 @@ export default function SiteConfig() {
             setLastSavedForm(nextForm);
             setRevision(parsed.revision);
             setVersioned(parsed.versioned);
+            setBotProtectionKillSwitch(res.data?.botProtectionKillSwitch === true);
         } catch (error: any) {
             if (requestId !== latestRequestId.current) return;
             console.error('Failed to load settings', error);
@@ -238,6 +244,9 @@ export default function SiteConfig() {
         if (!lastSavedForm.maintenanceMode && form.maintenanceMode) warnings.push('Mode maintenance akan diaktifkan dan dapat membatasi akses layanan.');
         if (lastSavedForm.registrationEnabled && !form.registrationEnabled) warnings.push('Registrasi member baru akan dinonaktifkan.');
         if (lastSavedForm.guestCheckoutEnabled && !form.guestCheckoutEnabled) warnings.push('Guest checkout akan dinonaktifkan.');
+        if (!lastSavedForm.botProtectionEnabled && form.botProtectionEnabled && !form.turnstileSiteKey.trim()) {
+            warnings.push('Anti-bot Cloudflare akan diaktifkan. Login dan order akan ditolak sampai site key dan TURNSTILE_SECRET_KEY siap.');
+        }
         if (
             form.minDeposit !== lastSavedForm.minDeposit
             || form.maxDeposit !== lastSavedForm.maxDeposit
@@ -292,6 +301,7 @@ export default function SiteConfig() {
             const nextRevision = typeof body?.revision === 'number' ? body.revision : revision;
             const nextForm = { ...defaultForm, ...(body?.data || form) } as SettingsForm;
             delete (nextForm as { revision?: unknown }).revision;
+            delete (nextForm as { botProtectionKillSwitch?: unknown }).botProtectionKillSwitch;
             setForm(nextForm);
             setLastSavedForm(nextForm);
             setRevision(nextRevision);
@@ -567,6 +577,40 @@ export default function SiteConfig() {
                         <label htmlFor="guestCheckoutEnabled" className="text-sm ui-text">
                             Izinkan Transaksi Tanpa Login (Guest)
                         </label>
+                    </div>
+                    <div className="space-y-3 border-t ui-border pt-3">
+                        <div className="flex items-center gap-3">
+                            <input
+                                type="checkbox"
+                                id="botProtectionEnabled"
+                                checked={form.botProtectionEnabled}
+                                onChange={(e) => setForm({ ...form, botProtectionEnabled: e.target.checked })}
+                                className={checkboxClass}
+                            />
+                            <label htmlFor="botProtectionEnabled" className="text-sm ui-text">
+                                Anti-bot Cloudflare (Turnstile)
+                            </label>
+                        </div>
+                        {botProtectionKillSwitch && (
+                            <div className="rounded-lg border ui-warning-chip p-3 text-sm">
+                                Kill switch aktif (`TURNSTILE_DISABLED=1`). Toggle tersimpan, tetapi verifikasi bot tidak dijalankan sampai env dimatikan.
+                            </div>
+                        )}
+                        <div>
+                            <label htmlFor="turnstileSiteKey" className={labelClass}>Turnstile site key</label>
+                            <input
+                                id="turnstileSiteKey"
+                                type="text"
+                                autoComplete="off"
+                                className={inputClass}
+                                value={form.turnstileSiteKey}
+                                onChange={(e) => setForm({ ...form, turnstileSiteKey: e.target.value })}
+                                placeholder="0x4AAAAAAA..."
+                            />
+                            <p className="text-xs ui-text-muted mt-1">
+                                Site key publik dari Cloudflare. Secret (`TURNSTILE_SECRET_KEY`) hanya di environment server. Gunakan `TURNSTILE_DISABLED=1` sebagai kill switch darurat.
+                            </p>
+                        </div>
                     </div>
                 </div>
             </div>

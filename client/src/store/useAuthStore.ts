@@ -85,7 +85,7 @@ interface AuthState {
     authSessionEpoch: number;
     /** Memory-only: parsed serverTime - Date.now() at last authoritative envelope. Never persisted. */
     serverTimeOffsetMs: number | null;
-    login: (audience: LoginAudience, email: string, password: string, rememberMe?: boolean) => Promise<LoginResult>;
+    login: (audience: LoginAudience, email: string, password: string, rememberMe?: boolean, turnstileToken?: string) => Promise<LoginResult>;
     verifyTwoFactorLogin: (audience: LoginAudience, challengeToken: string, code: string, rememberMe?: boolean) => Promise<LoginResult>;
     completeDeviceSelection: (audience: LoginAudience, challengeToken: string, sessionId: string) => Promise<void>;
     register: (name: string, email: string, password: string) => Promise<void>;
@@ -408,13 +408,14 @@ export const useAuthStore = create<AuthState>((set, get) => {
         authSessionEpoch: 0,
         serverTimeOffsetMs: null,
 
-        login: async (audience, email, password, rememberMe = false) => {
-            const payload = {
+        login: async (audience, email, password, rememberMe = false, turnstileToken) => {
+            const payload: Record<string, unknown> = {
                 email: normalizeEmail(email),
                 password,
                 // Rust forces staff sessions to a non-persistent ceiling; never ask for more.
                 rememberMe: allowsRememberMe(audience) ? rememberMe : false,
             };
+            if (turnstileToken) payload.turnstileToken = turnstileToken;
             const res = await apiV2.post(loginEndpointForAudience(audience), payload).catch((error) => {
                 if (error.response?.data?.code === 'AUTH_DEVICE_LIMIT_REACHED') return error.response;
                 throw error;
