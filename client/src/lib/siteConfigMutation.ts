@@ -20,6 +20,7 @@ export function parseAdminSettingsResponse(input: unknown): {
   const revisionRaw = record.revision;
   const form: SettingsFormLike = { ...record };
   delete form.revision;
+  delete form.botProtectionKillSwitch;
   if (revisionRaw === undefined) {
     return { form, revision: 0, versioned: false };
   }
@@ -52,7 +53,12 @@ export function createChangedPayload(
 ): Record<string, unknown> {
   const changes: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(form)) {
-    if (key === 'revision' || key === 'refIdSample' || key === 'invoiceSample') continue;
+    if (
+      key === 'revision'
+      || key === 'botProtectionKillSwitch'
+      || key === 'refIdSample'
+      || key === 'invoiceSample'
+    ) continue;
     if (value !== lastSaved[key]) changes[key] = value;
   }
   return changes;

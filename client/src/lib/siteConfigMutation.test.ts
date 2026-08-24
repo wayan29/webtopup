@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   classifySettingsConflict,
+  createChangedPayload,
   createSiteConfigIntent,
   createSiteConfigSaveRequest,
   invoiceRandomMin,
@@ -24,6 +25,22 @@ test('revision metadata never becomes an editable setting', () => {
   assert.equal(parsed.revision, 14);
   assert.equal(parsed.versioned, true);
   assert.equal('revision' in parsed.form, false);
+});
+
+test('kill switch metadata never becomes an editable setting', () => {
+  const parsed = parseAdminSettingsResponse({
+    ...fixtureSettings,
+    revision: 14,
+    botProtectionKillSwitch: true,
+    botProtectionEnabled: true,
+  });
+  assert.equal('botProtectionKillSwitch' in parsed.form, false);
+  assert.equal(parsed.form.botProtectionEnabled, true);
+  const changes = createChangedPayload(
+    { ...parsed.form, botProtectionKillSwitch: true },
+    parsed.form,
+  );
+  assert.equal('botProtectionKillSwitch' in changes, false);
 });
 
 test('legacy admin settings without revision still load as an unversioned snapshot', () => {

@@ -12,7 +12,7 @@ mod validation;
 pub use idempotency::ensure_site_config_foundation_indexes;
 pub use mutation::execute_site_config_mutation;
 
-use std::sync::Arc;
+use std::{env, sync::Arc};
 
 use axum::{
     extract::{Path, State},
@@ -24,13 +24,15 @@ use serde_json::{json, Map, Value};
 
 use crate::{
     security::require_permission,
+    services::bot_protection::kill_switch_enabled,
     state::AppState,
 };
 
 use defaults::default_site_settings;
 use responses::{internal_error, status_message, unavailable};
 use snapshot::{
-    load_consistent_snapshot, matches_site_settings_etag, site_settings_etag, with_revision_field,
+    apply_public_bot_protection, load_consistent_snapshot, matches_site_settings_etag,
+    site_settings_etag, with_admin_bot_protection_metadata, with_revision_field,
     SITE_CONFIG_REVISION_KEY, SnapshotError,
 };
 
@@ -53,9 +55,11 @@ pub async fn admin_all(
             return snapshot_error_response(error);
         }
     };
-    Json(Value::Object(with_revision_field(
+    let kill_switch = kill_switch_enabled(env::var("TURNSTILE_DISABLED").ok().as_deref());
+    Json(Value::Object(with_admin_bot_protection_metadata(
         snapshot.settings,
         snapshot.revision,
+        kill_switch,
     )))
     .into_response()
 }
@@ -67,7 +71,7 @@ pub async fn public_settings(
     let Some(client) = &state.mongo_client else {
         return unavailable();
     };
-    let snapshot = match load_consistent_snapshot(
+    let mut snapshot = match load_consistent_snapshot(
         client,
         &state.mongo_db,
         defaults::public_site_setting_keys(),
@@ -80,6 +84,10 @@ pub async fn public_settings(
             return snapshot_error_response(error);
         }
     };
+    apply_public_bot_protection(
+        &mut snapshot.settings,
+        kill_switch_enabled(env::var("TURNSTILE_DISABLED").ok().as_deref()),
+    );
     let etag = site_settings_etag(snapshot.revision);
     if matches_site_settings_etag(headers.get(header::IF_NONE_MATCH), snapshot.revision) {
         return (

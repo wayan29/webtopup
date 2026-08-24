@@ -3,6 +3,8 @@
 use axum::http::HeaderValue;
 use serde_json::{Map, Value};
 
+use crate::services::bot_protection::effective_bot_protection;
+
 use super::{defaults::default_site_settings, store::load_settings};
 
 pub const SITE_CONFIG_REVISION_KEY: &str = "__site_config_revision__";
@@ -115,10 +117,35 @@ pub fn with_revision_field(mut settings: Map<String, Value>, revision: i64) -> M
     settings
 }
 
+pub fn apply_public_bot_protection(settings: &mut Map<String, Value>, kill_switch: bool) {
+    let stored_enabled = settings
+        .get("botProtectionEnabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    settings.insert(
+        "botProtectionEnabled".to_string(),
+        Value::Bool(effective_bot_protection(stored_enabled, kill_switch)),
+    );
+}
+
+pub fn with_admin_bot_protection_metadata(
+    settings: Map<String, Value>,
+    revision: i64,
+    kill_switch: bool,
+) -> Map<String, Value> {
+    let mut settings = with_revision_field(settings, revision);
+    settings.insert(
+        "botProtectionKillSwitch".to_string(),
+        Value::Bool(kill_switch),
+    );
+    settings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::routes::settings::defaults::{default_site_settings, public_site_setting_keys};
+    use serde_json::json;
 
     #[test]
     fn revision_key_is_reserved_and_never_a_normal_setting() {
@@ -162,5 +189,25 @@ mod tests {
             with_revision.get("brand"),
             Some(&Value::String("Danayasa".into()))
         );
+    }
+
+    #[test]
+    fn public_bot_protection_uses_effective_flag() {
+        let mut settings = Map::new();
+        settings.insert("botProtectionEnabled".into(), json!(true));
+        settings.insert("turnstileSiteKey".into(), json!("site"));
+        apply_public_bot_protection(&mut settings, true);
+        assert_eq!(settings.get("botProtectionEnabled"), Some(&json!(false)));
+        assert!(settings.get("botProtectionKillSwitch").is_none());
+    }
+
+    #[test]
+    fn admin_metadata_exposes_kill_switch_beside_revision() {
+        let mut settings = Map::new();
+        settings.insert("botProtectionEnabled".into(), json!(true));
+        let out = with_admin_bot_protection_metadata(settings, 4, true);
+        assert_eq!(out.get("revision"), Some(&Value::from(4)));
+        assert_eq!(out.get("botProtectionKillSwitch"), Some(&json!(true)));
+        assert_eq!(out.get("botProtectionEnabled"), Some(&json!(true)));
     }
 }
