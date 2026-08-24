@@ -153,6 +153,66 @@ pub fn verify_error_response(error: TurnstileVerifyError) -> axum::response::Res
     }
 }
 
+pub async fn enforce_turnstile<V: TurnstileVerifier>(
+    stored_enabled: bool,
+    site_key: &str,
+    secret: &str,
+    kill_switch: bool,
+    token: Option<&str>,
+    remote_ip: Option<&str>,
+    verifier: &V,
+) -> Result<(), axum::response::Response> {
+    match evaluate_turnstile(stored_enabled, site_key, secret, kill_switch, token) {
+        Ok(TurnstileAction::Skip) => Ok(()),
+        Ok(TurnstileAction::Verify(token)) => verifier
+            .verify(secret.trim(), &token, remote_ip)
+            .await
+            .map_err(verify_error_response),
+        Err(reject) => Err(reject_response(reject)),
+    }
+}
+
+fn bson_to_bool(value: &mongodb::bson::Bson) -> bool {
+    match value {
+        mongodb::bson::Bson::Boolean(value) => *value,
+        mongodb::bson::Bson::String(value) => value == "true" || value == "1",
+        mongodb::bson::Bson::Int32(value) => *value != 0,
+        mongodb::bson::Bson::Int64(value) => *value != 0,
+        mongodb::bson::Bson::Double(value) => *value != 0.0,
+        _ => false,
+    }
+}
+
+pub async fn load_bot_protection_settings(db: &mongodb::Database) -> (bool, String) {
+    let settings = db.collection::<mongodb::bson::Document>("settings");
+    let stored_enabled = settings
+        .find_one(mongodb::bson::doc! { "key": "botProtectionEnabled" })
+        .await
+        .ok()
+        .flatten()
+        .and_then(|document| document.get("value").cloned())
+        .map(|value| bson_to_bool(&value))
+        .unwrap_or(false);
+    let site_key = settings
+        .find_one(mongodb::bson::doc! { "key": "turnstileSiteKey" })
+        .await
+        .ok()
+        .flatten()
+        .and_then(|document| document.get("value").cloned())
+        .and_then(|value| match value {
+            mongodb::bson::Bson::String(value) => Some(value),
+            other => Some(other.to_string()),
+        })
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
+    (stored_enabled, site_key)
+}
+
+pub fn cloudflare_turnstile_verifier() -> &'static CloudflareTurnstileVerifier {
+    static VERIFIER: std::sync::OnceLock<CloudflareTurnstileVerifier> = std::sync::OnceLock::new();
+    VERIFIER.get_or_init(CloudflareTurnstileVerifier::new)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,6 +337,111 @@ mod tests {
         assert!(!raw.contains("cloudflare"));
         let value: serde_json::Value = serde_json::from_slice(&body).expect("json");
         (status, value)
+    }
+
+    #[tokio::test]
+    async fn enforce_turnstile_skip_does_not_call_verifier() {
+        let verifier = FakeVerifier {
+            result: Err(TurnstileVerifyError::Failed),
+            called: Mutex::new(0),
+        };
+        let secret = "s".repeat(32);
+        enforce_turnstile(false, "site", &secret, false, None, None, &verifier)
+            .await
+            .expect("disabled skip");
+        enforce_turnstile(true, "site", &secret, true, Some("tok"), Some("1.1.1.1"), &verifier)
+            .await
+            .expect("kill switch skip");
+        assert_eq!(*verifier.called.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn enforce_turnstile_required_maps_status() {
+        let verifier = FakeVerifier {
+            result: Ok(()),
+            called: Mutex::new(0),
+        };
+        let err = enforce_turnstile(
+            true,
+            "site",
+            &"s".repeat(32),
+            false,
+            None,
+            None,
+            &verifier,
+        )
+        .await
+        .expect_err("required");
+        let (status, body) = status_and_message(err).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(body["message"], BOT_PROTECTION_FAILED_MESSAGE);
+        assert_eq!(*verifier.called.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn enforce_turnstile_unavailable_maps_status() {
+        let verifier = FakeVerifier {
+            result: Ok(()),
+            called: Mutex::new(0),
+        };
+        let err = enforce_turnstile(
+            true,
+            "",
+            &"s".repeat(32),
+            false,
+            Some("tok"),
+            None,
+            &verifier,
+        )
+        .await
+        .expect_err("unavailable");
+        let (status, body) = status_and_message(err).await;
+        assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["message"], BOT_PROTECTION_UNAVAILABLE_MESSAGE);
+        assert_eq!(*verifier.called.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn enforce_turnstile_verify_failure_maps_to_403() {
+        let verifier = FakeVerifier {
+            result: Err(TurnstileVerifyError::Failed),
+            called: Mutex::new(0),
+        };
+        let err = enforce_turnstile(
+            true,
+            "site",
+            &"s".repeat(32),
+            false,
+            Some("tok"),
+            Some("1.1.1.1"),
+            &verifier,
+        )
+        .await
+        .expect_err("failed");
+        let (status, body) = status_and_message(err).await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(body["message"], BOT_PROTECTION_FAILED_MESSAGE);
+        assert_eq!(*verifier.called.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn enforce_turnstile_verify_ok_increments_call_count() {
+        let verifier = FakeVerifier {
+            result: Ok(()),
+            called: Mutex::new(0),
+        };
+        enforce_turnstile(
+            true,
+            "site",
+            &"s".repeat(32),
+            false,
+            Some("tok"),
+            Some("1.1.1.1"),
+            &verifier,
+        )
+        .await
+        .expect("ok");
+        assert_eq!(*verifier.called.lock().unwrap(), 1);
     }
 
     #[tokio::test]
