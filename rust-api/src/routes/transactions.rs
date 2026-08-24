@@ -18,6 +18,10 @@ use crate::{
     routes::auth::require_trusted_step_up_group,
     security::{require_member_user, require_permission, ErrorResponse},
     services::{
+        bot_protection::{
+            cloudflare_turnstile_verifier, enforce_turnstile, kill_switch_enabled,
+            load_bot_protection_settings,
+        },
         identifier_integrity::{
             allocate_reference_in_session, load_reference_format, require_identifier_indexes,
             MAX_REFERENCE_ALLOCATION_ATTEMPTS, ReferenceError,
@@ -176,6 +180,30 @@ pub async fn create_transaction(
             Json(serde_json::json!({ "message": message })),
         )
             .into_response();
+    }
+
+    let (stored_enabled, site_key) = load_bot_protection_settings(&db).await;
+    let secret = std::env::var("TURNSTILE_SECRET_KEY").unwrap_or_default();
+    let kill_switch = kill_switch_enabled(std::env::var("TURNSTILE_DISABLED").ok().as_deref());
+    let remote_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+    if let Err(response) = enforce_turnstile(
+        stored_enabled,
+        &site_key,
+        &secret,
+        kill_switch,
+        payload.turnstile_token.as_deref(),
+        Some(remote_ip),
+        cloudflare_turnstile_verifier(),
+    )
+    .await
+    {
+        return response;
     }
 
     let products = db.collection::<Document>("products");
@@ -3197,5 +3225,30 @@ fn non_empty_or(value: String, fallback: &str) -> String {
         fallback.to_string()
     } else {
         value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn create_transaction_verifies_turnstile() {
+        let source = include_str!("transactions.rs");
+        let create_start = source
+            .find("pub async fn create_transaction")
+            .expect("create_transaction");
+        let create_end = source
+            .find("pub async fn manual_transactions")
+            .expect("manual_transactions");
+        let create = &source[create_start..create_end];
+        let enforce = create
+            .find("enforce_turnstile")
+            .expect("create_transaction must verify Turnstile");
+        let product_lookup = create
+            .find("products.find_one")
+            .expect("product lookup");
+        assert!(
+            enforce < product_lookup,
+            "enforce_turnstile must run before products.find_one"
+        );
     }
 }

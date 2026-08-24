@@ -16,6 +16,10 @@ use crate::{
     routes::auth,
     security::ErrorResponse,
     services::{
+        bot_protection::{
+            cloudflare_turnstile_verifier, enforce_turnstile, kill_switch_enabled,
+            load_bot_protection_settings,
+        },
         identifier_integrity::{
             classify_invoice_duplicate, require_identifier_indexes, retry_invoice_candidate,
             DuplicateConstraint, MAX_INVOICE_CANDIDATES,
@@ -150,6 +154,37 @@ pub async fn create_public(
         Ok(IdempotencyBegin::InProgress) => return idempotency_service::in_progress_response(),
         Err(error) => return error.into_response(),
     };
+
+    let (stored_enabled, site_key) = load_bot_protection_settings(&db).await;
+    let secret = std::env::var("TURNSTILE_SECRET_KEY").unwrap_or_default();
+    let kill_switch = kill_switch_enabled(std::env::var("TURNSTILE_DISABLED").ok().as_deref());
+    let remote_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+    if let Err(response) = enforce_turnstile(
+        stored_enabled,
+        &site_key,
+        &secret,
+        kill_switch,
+        payload.turnstile_token.as_deref(),
+        Some(remote_ip),
+        cloudflare_turnstile_verifier(),
+    )
+    .await
+    {
+        release_guest_started(
+            &store,
+            &stored_key,
+            &request_digest,
+            lease_generation,
+        )
+        .await;
+        return response;
+    }
 
     // Guest checkout has no standalone marker that can prove an absent transaction was never
     // committed. Before any domain work, turn the short execution lease into an indefinite fence.
