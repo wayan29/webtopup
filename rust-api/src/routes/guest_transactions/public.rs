@@ -835,20 +835,27 @@ fn guest_ambiguous_response() -> Response {
 }
 
 pub async fn check_public(
+    headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Path(invoice_number): Path<String>,
     Query(query): Query<CheckGuestTransactionQuery>,
 ) -> Response {
-    let normalized_whatsapp = normalize_phone(query.whatsapp.as_deref());
-    if normalized_whatsapp.is_empty() {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                message: "Nomor WhatsApp wajib diisi untuk cek transaksi",
-            }),
-        )
-            .into_response();
-    }
+    let member = auth::resolve_optional_member_access(&headers, &state).await;
+    let proof = match guest_check_proof(
+        query.whatsapp.as_deref(),
+        member.map(|access| access.user_id),
+    ) {
+        Ok(proof) => proof,
+        Err(GuestCheckProofError::WhatsappRequired) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    message: "Nomor WhatsApp wajib diisi untuk cek transaksi",
+                }),
+            )
+                .into_response();
+        }
+    };
 
     let Some(client) = &state.mongo_client else {
         return (
@@ -881,7 +888,9 @@ pub async fn check_public(
         return transaction_not_found();
     };
 
-    if normalize_phone(Some(&read_string(&document, "whatsapp"))) != normalized_whatsapp {
+    let stored_whatsapp = read_string(&document, "whatsapp");
+    let stored_user = document.get_object_id("user").ok();
+    if !guest_check_matches(&stored_whatsapp, stored_user, &proof) {
         return transaction_not_found();
     }
 

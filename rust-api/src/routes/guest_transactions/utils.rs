@@ -97,3 +97,90 @@ pub(super) fn date_string(document: &Document, key: &str) -> Option<String> {
 pub(super) fn object_id_string(document: &Document, key: &str) -> Option<String> {
     document.get_object_id(key).map(|id| id.to_hex()).ok()
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum GuestCheckProof {
+    Whatsapp(String),
+    Member(mongodb::bson::oid::ObjectId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GuestCheckProofError {
+    WhatsappRequired,
+}
+
+pub(super) fn guest_check_proof(
+    whatsapp: Option<&str>,
+    member_id: Option<mongodb::bson::oid::ObjectId>,
+) -> Result<GuestCheckProof, GuestCheckProofError> {
+    let normalized_whatsapp = normalize_phone(whatsapp);
+    if !normalized_whatsapp.is_empty() {
+        return Ok(GuestCheckProof::Whatsapp(normalized_whatsapp));
+    }
+    match member_id {
+        Some(member_id) => Ok(GuestCheckProof::Member(member_id)),
+        None => Err(GuestCheckProofError::WhatsappRequired),
+    }
+}
+
+pub(super) fn guest_check_matches(
+    stored_whatsapp: &str,
+    stored_user: Option<mongodb::bson::oid::ObjectId>,
+    proof: &GuestCheckProof,
+) -> bool {
+    match proof {
+        GuestCheckProof::Whatsapp(whatsapp) => normalize_phone(Some(stored_whatsapp)) == *whatsapp,
+        GuestCheckProof::Member(member_id) => stored_user == Some(*member_id),
+    }
+}
+
+#[cfg(test)]
+mod guest_check_proof_tests {
+    use mongodb::bson::oid::ObjectId;
+
+    use super::{guest_check_matches, guest_check_proof, GuestCheckProof, GuestCheckProofError};
+
+    #[test]
+    fn public_guest_check_requires_whatsapp() {
+        assert!(matches!(
+            guest_check_proof(None, None),
+            Err(GuestCheckProofError::WhatsappRequired)
+        ));
+        assert!(matches!(
+            guest_check_proof(Some("   "), None),
+            Err(GuestCheckProofError::WhatsappRequired)
+        ));
+    }
+
+    #[test]
+    fn logged_in_member_may_check_without_whatsapp() {
+        let member_id = ObjectId::new();
+        assert!(matches!(
+            guest_check_proof(None, Some(member_id)),
+            Ok(GuestCheckProof::Member(id)) if id == member_id
+        ));
+    }
+
+    #[test]
+    fn present_whatsapp_wins_over_member_session() {
+        let member_id = ObjectId::new();
+        match guest_check_proof(Some("0812-3456-7890"), Some(member_id)) {
+            Ok(GuestCheckProof::Whatsapp(whatsapp)) => assert_eq!(whatsapp, "081234567890"),
+            other => panic!("expected whatsapp proof, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proof_matches_only_the_authorized_invoice() {
+        let owner = ObjectId::new();
+        let other = ObjectId::new();
+        let whatsapp = GuestCheckProof::Whatsapp("081234567890".to_string());
+        let member = GuestCheckProof::Member(owner);
+
+        assert!(guest_check_matches("081234567890", Some(owner), &whatsapp));
+        assert!(!guest_check_matches("089999999999", Some(owner), &whatsapp));
+        assert!(guest_check_matches("081234567890", Some(owner), &member));
+        assert!(!guest_check_matches("081234567890", Some(other), &member));
+        assert!(!guest_check_matches("081234567890", None, &member));
+    }
+}

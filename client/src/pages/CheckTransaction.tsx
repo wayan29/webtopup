@@ -54,15 +54,15 @@ export default function CheckTransaction() {
     const [_copied, setCopied] = useState(false);
     const isEmbeddedInDashboard = location.pathname.startsWith('/dashboard/');
 
-    const fetchTransaction = async (inv: string, phone: string) => {
-        if (!inv || !phone) return;
-        
+    const fetchTransaction = async (inv: string, phone?: string) => {
+        if (!inv) return;
+        if (!isEmbeddedInDashboard && !phone) return;
+
         setLoading(true);
         setError('');
         try {
-            const params = { whatsapp: phone };
-            const res = await apiV2
-                .get(`/guest-transactions/check/${inv}`, { params });
+            const params = phone ? { whatsapp: phone } : undefined;
+            const res = await apiV2.get(`/guest-transactions/check/${inv}`, { params });
             setTransaction(res.data);
         } catch (err: any) {
             setError(err.response?.data?.message || 'Transaksi tidak ditemukan');
@@ -73,23 +73,37 @@ export default function CheckTransaction() {
     };
 
     useEffect(() => {
-        if (invoiceFromUrl && whatsappFromUrl) {
-            fetchTransaction(invoiceFromUrl, whatsappFromUrl);
+        if (isEmbeddedInDashboard) {
+            if (invoiceFromUrl) {
+                void fetchTransaction(invoiceFromUrl);
+            }
+            return;
         }
-    }, [invoiceFromUrl, whatsappFromUrl]);
+        if (invoiceFromUrl && whatsappFromUrl) {
+            void fetchTransaction(invoiceFromUrl, whatsappFromUrl);
+        }
+    }, [invoiceFromUrl, whatsappFromUrl, isEmbeddedInDashboard]);
 
     const handleSearch = (e: React.FormEvent) => {
         e.preventDefault();
         const trimmedInvoice = invoice.trim().toUpperCase();
         const trimmedWhatsapp = whatsapp.trim();
-        if (!trimmedInvoice || !trimmedWhatsapp) {
+        if (!trimmedInvoice) {
+            return;
+        }
+        if (isEmbeddedInDashboard) {
+            navigate(`/dashboard/check-transaction?invoice=${encodeURIComponent(trimmedInvoice)}`);
+            void fetchTransaction(trimmedInvoice);
+            return;
+        }
+        if (!trimmedWhatsapp) {
             return;
         }
 
         navigate(
             `/check-transaction?invoice=${encodeURIComponent(trimmedInvoice)}&whatsapp=${encodeURIComponent(trimmedWhatsapp)}`
         );
-        fetchTransaction(trimmedInvoice, trimmedWhatsapp);
+        void fetchTransaction(trimmedInvoice, trimmedWhatsapp);
     };
 
     const handleCopy = (text: string) => {
@@ -175,7 +189,7 @@ export default function CheckTransaction() {
             <div className="max-w-3xl mx-auto px-4 py-6 space-y-6">
                 {/* Search Form */}
                 <form onSubmit={handleSearch} className="ui-panel ui-border rounded-2xl border p-4">
-                    <div className="grid grid-cols-1 md:grid-cols-[1fr_1fr_auto] gap-2">
+                    <div className={`grid grid-cols-1 gap-2 ${isEmbeddedInDashboard ? 'md:grid-cols-[1fr_auto]' : 'md:grid-cols-[1fr_1fr_auto]'}`}>
                         <div>
                             <label className="ui-text-muted mb-2 block text-sm">Nomor Invoice</label>
                             <input
@@ -186,26 +200,30 @@ export default function CheckTransaction() {
                                 className="ui-field w-full rounded-xl px-4 py-3"
                             />
                         </div>
-                        <div>
-                            <label className="ui-text-muted mb-2 block text-sm">Nomor WhatsApp</label>
-                            <input
-                                type="text"
-                                value={whatsapp}
-                                onChange={(e) => setWhatsapp(e.target.value)}
-                                placeholder="Nomor yang dipakai saat checkout"
-                                className="ui-field w-full rounded-xl px-4 py-3"
-                            />
-                        </div>
+                        {!isEmbeddedInDashboard && (
+                            <div>
+                                <label className="ui-text-muted mb-2 block text-sm">Nomor WhatsApp</label>
+                                <input
+                                    type="text"
+                                    value={whatsapp}
+                                    onChange={(e) => setWhatsapp(e.target.value)}
+                                    placeholder="Nomor yang dipakai saat checkout"
+                                    className="ui-field w-full rounded-xl px-4 py-3"
+                                />
+                            </div>
+                        )}
                         <button 
                             type="submit"
-                            disabled={loading || !invoice || !whatsapp}
+                            disabled={loading || !invoice || (!isEmbeddedInDashboard && !whatsapp)}
                             className="ui-accent-solid flex items-center justify-center gap-2 self-end rounded-xl px-4 py-3 font-medium transition hover:brightness-105 disabled:opacity-50"
                         >
                             {loading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Search className="w-5 h-5" />}
                         </button>
                     </div>
                     <p className="ui-text-muted mt-2 text-xs">
-                        Untuk keamanan, cek transaksi publik membutuhkan invoice dan nomor WhatsApp yang dipakai saat checkout.
+                        {isEmbeddedInDashboard
+                            ? 'Akun login cukup memakai nomor invoice untuk cek transaksi guest yang terikat ke akun ini.'
+                            : 'Untuk keamanan, cek transaksi publik membutuhkan invoice dan nomor WhatsApp yang dipakai saat checkout.'}
                     </p>
                 </form>
 
