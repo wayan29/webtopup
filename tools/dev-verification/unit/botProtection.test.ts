@@ -56,6 +56,14 @@ test('public settings include the effective bot-protection fields', () => {
   assert.match(publicSettings, /turnstileSiteKey/);
 });
 
+test('gateway CSP allows Cloudflare Turnstile script and frame origins', () => {
+  const source = fs.readFileSync(path.join(root, 'server/src/app.ts'), 'utf8');
+  assert.match(source, /scriptSrc:[\s\S]*challenges\.cloudflare\.com/);
+  assert.match(source, /frameSrc:[\s\S]*challenges\.cloudflare\.com/);
+  assert.match(source, /connectSrc:[\s\S]*challenges\.cloudflare\.com/);
+  assert.doesNotMatch(source, /scriptSrc:\s*\[[^\]]*"'\*"/);
+});
+
 test('guest and member order payloads include turnstileToken near the transaction posts', () => {
   const source = readClient('pages/Order.tsx');
   const guestBlock = source.slice(

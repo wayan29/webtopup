@@ -43,7 +43,9 @@ export async function buildApp(): Promise<FastifyInstance> {
             directives: {
                 defaultSrc: ["'self'"],
                 styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
-                scriptSrc: ["'self'"],
+                scriptSrc: ["'self'", 'https://challenges.cloudflare.com'],
+                frameSrc: ["'self'", 'https://challenges.cloudflare.com'],
+                connectSrc: ["'self'", 'https://challenges.cloudflare.com'],
                 imgSrc: ["'self'", 'data:'],
                 fontSrc: ["'self'", 'https:', 'data:'],
                 baseUri: ["'self'"],
