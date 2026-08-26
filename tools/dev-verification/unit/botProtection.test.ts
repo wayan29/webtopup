@@ -64,6 +64,22 @@ test('gateway CSP allows Cloudflare Turnstile script and frame origins', () => {
   assert.doesNotMatch(source, /scriptSrc:\s*\[[^\]]*"'\*"/);
 });
 
+test('Order renders Turnstile inside the scrollable content above the fixed bottom bar', () => {
+  const source = readClient('pages/Order.tsx');
+  const fieldAt = source.indexOf('<TurnstileField');
+  const fixedBarAt = source.indexOf('{/* Fixed Bottom */}');
+  assert.notEqual(fieldAt, -1, 'TurnstileField missing');
+  assert.notEqual(fixedBarAt, -1, 'fixed bottom marker missing');
+  assert.ok(fieldAt < fixedBarAt, 'TurnstileField must render before the fixed bottom bar');
+  const fixedBar = source.slice(fixedBarAt);
+  const buttonAt = fixedBar.indexOf('<button');
+  assert.doesNotMatch(
+    fixedBar.slice(0, buttonAt === -1 ? fixedBar.length : buttonAt),
+    /TurnstileField/,
+    'TurnstileField must not live inside the fixed bottom bar',
+  );
+});
+
 test('guest and member order payloads include turnstileToken near the transaction posts', () => {
   const source = readClient('pages/Order.tsx');
   const guestBlock = source.slice(

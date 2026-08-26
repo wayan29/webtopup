@@ -1334,6 +1334,19 @@ export default function Order() {
                         </p>
                     </div>
                 </div>
+
+                {/* Step 6: Keamanan */}
+                {showTurnstile && siteKey ? (
+                    <div className={panelClass}>
+                        <div className={panelHeaderClass}>
+                            <span className={stepBadgeClass}>6</span>
+                            <span className="font-semibold ui-text">Keamanan</span>
+                        </div>
+                        <div className="p-4">
+                            <TurnstileField ref={turnstileRef} siteKey={siteKey} onTokenChange={setTurnstileToken} />
+                        </div>
+                    </div>
+                ) : null}
             </div>
 
             {/* Fixed Bottom */}
@@ -1397,11 +1410,6 @@ export default function Order() {
                             </div>
                         </div>
                     )}
-                    {showTurnstile && siteKey ? (
-                        <div className="mb-3">
-                            <TurnstileField ref={turnstileRef} siteKey={siteKey} onTokenChange={setTurnstileToken} />
-                        </div>
-                    ) : null}
                     <button
                         onClick={handleSubmit}
                         disabled={!selectedProduct || !target.trim() || (requiresSecondaryTarget && !serverId.trim()) || submitting || (showTurnstile && !turnstileToken)}
