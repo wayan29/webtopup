@@ -12,6 +12,10 @@ use serde_json::json;
 
 use crate::{
     security::{require_proxy_context, ErrorResponse},
+    services::bot_protection::{
+        cloudflare_turnstile_verifier, enforce_turnstile, kill_switch_enabled,
+        load_bot_protection_settings,
+    },
     state::AppState,
     utils::bson::read_string,
 };
@@ -529,6 +533,23 @@ async fn login_for_audience_core(
             axum::http::StatusCode::BAD_REQUEST,
             "Email dan password wajib diisi",
         );
+    }
+
+    let (stored_enabled, site_key) = load_bot_protection_settings(&db).await;
+    let secret = std::env::var("TURNSTILE_SECRET_KEY").unwrap_or_default();
+    let kill_switch = kill_switch_enabled(std::env::var("TURNSTILE_DISABLED").ok().as_deref());
+    if let Err(response) = enforce_turnstile(
+        stored_enabled,
+        &site_key,
+        &secret,
+        kill_switch,
+        payload.turnstile_token.as_deref(),
+        Some(ip.as_str()),
+        cloudflare_turnstile_verifier(),
+    )
+    .await
+    {
+        return response;
     }
 
     let users = db.collection::<Document>("users");
@@ -1285,6 +1306,26 @@ mod task3_issuance_route_tests {
         dummy_password_hash, effective_remember_me, hash, stored_hash_needs_rehash,
         verify_password_constant_cost, LoginAudience, DEFAULT_COST, LOGIN_TIMING_FLOOR,
     };
+
+    #[test]
+    fn login_verifies_turnstile_before_password() {
+        let src = include_str!("auth.rs");
+        let core_start = src
+            .find("async fn login_for_audience_core")
+            .expect("login core");
+        let core_end = src.find("async fn issue_session").expect("issue_session");
+        let core = &src[core_start..core_end];
+        let enforce = core
+            .find("enforce_turnstile")
+            .expect("login must evaluate Turnstile before password work");
+        let password = core
+            .find("verify_password_constant_cost_blocking")
+            .expect("constant-cost password verification");
+        assert!(
+            enforce < password,
+            "Turnstile must be verified before dummy bcrypt"
+        );
+    }
 
     #[test]
     fn login_spends_password_verification_cost_on_every_rejection() {

@@ -194,6 +194,8 @@ fn validate_setting_json_value(key: &str, value: &Value) -> Result<Value, Respon
         "maintenanceMessage" => ensure_text(value, "Pesan maintenance", 500),
         "registrationEnabled" => ensure_boolean(value, "Status registrasi"),
         "guestCheckoutEnabled" => ensure_boolean(value, "Status guest checkout"),
+        "botProtectionEnabled" => ensure_boolean(value, "Anti-bot Cloudflare"),
+        "turnstileSiteKey" => ensure_turnstile_site_key(value),
         "minDeposit" => ensure_integer(value, "Minimum deposit", 0, 100_000_000),
         "maxDeposit" => ensure_integer(value, "Maximum deposit", 0, 100_000_000),
         "depositFee" => ensure_integer(value, "Biaya deposit", 0, 100_000_000),
@@ -384,6 +386,24 @@ fn ensure_optional_whatsapp(value: &Value) -> Result<Value, Response> {
     ))
 }
 
+fn ensure_turnstile_site_key(value: &Value) -> Result<Value, Response> {
+    let normalized = value.as_str().unwrap_or("").trim().to_string();
+    if normalized.is_empty() {
+        return Ok(Value::String(String::new()));
+    }
+    if normalized.len() > 128
+        || !normalized
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    {
+        return Err(string_message(
+            axum::http::StatusCode::BAD_REQUEST,
+            "Turnstile site key tidak valid".to_string(),
+        ));
+    }
+    Ok(Value::String(normalized))
+}
+
 fn ensure_prefix(value: &Value, field_label: &str) -> Result<Value, Response> {
     let normalized = ensure_text(value, field_label, 12)?;
     let text = normalized.as_str().unwrap_or("").to_uppercase();
@@ -403,4 +423,25 @@ fn ensure_prefix(value: &Value, field_label: &str) -> Result<Value, Response> {
         ));
     }
     Ok(Value::String(text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_setting_json_value_for_policy;
+    use serde_json::json;
+
+    #[test]
+    fn turnstile_site_key_rejects_illegal_characters() {
+        assert!(validate_setting_json_value_for_policy(
+            "turnstileSiteKey",
+            &json!("sitekey_ok-1.2")
+        )
+        .is_ok());
+        assert!(validate_setting_json_value_for_policy("turnstileSiteKey", &json!("")).is_ok());
+        assert!(validate_setting_json_value_for_policy(
+            "turnstileSiteKey",
+            &json!("bad key")
+        )
+        .is_err());
+    }
 }

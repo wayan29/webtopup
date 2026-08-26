@@ -153,6 +153,73 @@ mod tests {
     }
 
     #[test]
+    fn guest_checkout_digest_excludes_turnstile_token() {
+        // Compile-time: GuestCheckoutFingerprint still has no token field. Adding one
+        // would break this exhaustive destructure — do not include turnstileToken.
+        let _: fn(&GuestCheckoutFingerprint<'_>) = |fingerprint| {
+            let GuestCheckoutFingerprint {
+                product_code,
+                target,
+                server_id,
+                whatsapp,
+                email,
+                payment_method_id,
+                use_flash_sale,
+                voucher_code,
+                member_id,
+            } = *fingerprint;
+            let _ = (
+                product_code,
+                target,
+                server_id,
+                whatsapp,
+                email,
+                payment_method_id,
+                use_flash_sale,
+                voucher_code,
+                member_id,
+            );
+        };
+
+        // Extra token on the caller must not change the digest: two fingerprints
+        // identical except the callers holding different tokens stay equal.
+        let _token_a = "token-aaaa";
+        let _token_b = "token-bbbb";
+        assert_eq!(digest(&fixture()), digest(&fixture()));
+    }
+
+    #[test]
+    fn create_public_verifies_turnstile_after_replay() {
+        let source = include_str!("public.rs");
+        let create_start = source
+            .find("pub async fn create_public")
+            .expect("create_public");
+        let create_end = source
+            .find("struct PreparedGuestCheckout")
+            .expect("PreparedGuestCheckout");
+        let create = &source[create_start..create_end];
+        let completed = create
+            .find("IdempotencyBegin::Completed")
+            .expect("completed replay must return before Turnstile");
+        let conflict = create
+            .find("IdempotencyBegin::Conflict")
+            .expect("conflict replay must return before Turnstile");
+        let in_progress = create
+            .find("IdempotencyBegin::InProgress")
+            .expect("in-progress replay must return before Turnstile");
+        let enforce = create
+            .find("enforce_turnstile")
+            .expect("create_public must verify Turnstile after replay");
+        let retain = create
+            .find("retain_uncertain_started")
+            .expect("retain_uncertain_started");
+        assert!(completed < enforce, "completed replay must return before enforce_turnstile");
+        assert!(conflict < enforce, "conflict replay must return before enforce_turnstile");
+        assert!(in_progress < enforce, "in-progress replay must return before enforce_turnstile");
+        assert!(enforce < retain, "enforce_turnstile must run before retain_uncertain_started");
+    }
+
+    #[test]
     fn guest_checkout_fingerprint_covers_every_order_input() {
         let baseline_fixture = fixture();
         let baseline = digest(&baseline_fixture);

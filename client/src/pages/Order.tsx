@@ -33,6 +33,12 @@ import {
 import { useAuthStore } from '../store/useAuthStore';
 import OperatorIcon from '../components/OperatorIcon';
 import HomeCountdown from '../components/HomeCountdown';
+import TurnstileField, { type TurnstileFieldHandle } from '../components/TurnstileField';
+import {
+    isBotProtectionResponseError,
+    shouldRenderTurnstile,
+    turnstileSiteKey,
+} from '../lib/botProtection';
 
 interface ServerOption {
     label: string;
@@ -254,6 +260,30 @@ export default function Order() {
     const [copied, setCopied] = useState<string | null>(null);
     const [showPopup, setShowPopup] = useState(false);
     const [showInstructionModal, setShowInstructionModal] = useState(false);
+    const [publicSettings, setPublicSettings] = useState<{ botProtectionEnabled?: unknown; turnstileSiteKey?: unknown }>({});
+    const [turnstileToken, setTurnstileToken] = useState<string | null>(null);
+    const turnstileRef = useRef<TurnstileFieldHandle | null>(null);
+
+    useEffect(() => {
+        let active = true;
+        const fetchPublicSettings = async () => {
+            try {
+                const res = await apiV2.get('/settings/public');
+                if (!active) return;
+                setPublicSettings({
+                    botProtectionEnabled: res.data?.botProtectionEnabled === true,
+                    turnstileSiteKey: typeof res.data?.turnstileSiteKey === 'string' ? res.data.turnstileSiteKey : '',
+                });
+            } catch {
+                if (!active) return;
+                setPublicSettings({});
+            }
+        };
+        fetchPublicSettings();
+        return () => {
+            active = false;
+        };
+    }, []);
 
     useEffect(() => {
         const fetchData = async () => {
@@ -545,6 +575,8 @@ export default function Order() {
     };
     const canValidate = needsValidation && target.trim().length >= getMinLength() &&
         (operator?.validationType !== 'mobilelegends' || serverId.trim().length >= 1);
+    const showTurnstile = shouldRenderTurnstile(publicSettings);
+    const siteKey = turnstileSiteKey(publicSettings);
     const handleSubmit = async () => {
         const normalizedTarget = target.trim();
         const normalizedServerId = serverId.trim();
@@ -570,6 +602,11 @@ export default function Order() {
             return;
         }
 
+        if (showTurnstile && !turnstileToken) {
+            alert('Selesaikan verifikasi keamanan terlebih dahulu');
+            return;
+        }
+
         setSubmitting(true);
         try {
             if (selectedPayment._id !== 'saldo') {
@@ -579,7 +616,7 @@ export default function Order() {
                     return;
                 }
 
-                const payload = {
+                const payload: Record<string, unknown> = {
                     productCode: selectedProduct.code,
                     target: normalizedTarget,
                     serverId: normalizedServerId || undefined,
@@ -604,6 +641,7 @@ export default function Order() {
                     ? current.key
                     : createIdempotencyKey();
                 transitionGuestCheckoutSubmission({ type: 'start', key: submissionKey, fingerprint });
+                if (showTurnstile && turnstileToken) payload.turnstileToken = turnstileToken;
                 const res = await apiV2.post(
                     '/guest-transactions',
                     payload,
@@ -623,18 +661,23 @@ export default function Order() {
                     return;
                 }
 
-                const payload = {
+                const payload: Record<string, unknown> = {
                     productCode: selectedProduct.code,
                     target: normalizedTarget,
                     serverId: normalizedServerId || undefined,
                     useFlashSale: selectedFlashSale,
                     voucherCode: voucher.trim() || undefined,
                 };
+                if (showTurnstile && turnstileToken) payload.turnstileToken = turnstileToken;
                 await apiV2.post('/transactions', payload);
                 alert('Transaksi berhasil dibuat!');
                 navigate('/transactions');
             }
         } catch (error: any) {
+            if (isBotProtectionResponseError(error)) {
+                turnstileRef.current?.reset();
+                setTurnstileToken(null);
+            }
             if (selectedPayment?._id !== 'saldo' && isIdempotencyInProgressFailure(error)) {
                 transitionGuestCheckoutSubmission({ type: 'in-progress' });
                 alert(`${CRITICAL_MUTATION_AMBIGUOUS_MESSAGE}. Permintaan masih direkonsiliasi; coba lagi dengan kunci yang sama.`);
@@ -1354,9 +1397,14 @@ export default function Order() {
                             </div>
                         </div>
                     )}
+                    {showTurnstile && siteKey ? (
+                        <div className="mb-3">
+                            <TurnstileField ref={turnstileRef} siteKey={siteKey} onTokenChange={setTurnstileToken} />
+                        </div>
+                    ) : null}
                     <button
                         onClick={handleSubmit}
-                        disabled={!selectedProduct || !target.trim() || (requiresSecondaryTarget && !serverId.trim()) || submitting}
+                        disabled={!selectedProduct || !target.trim() || (requiresSecondaryTarget && !serverId.trim()) || submitting || (showTurnstile && !turnstileToken)}
                         className="flex w-full items-center justify-center gap-2 rounded-[22px] ui-accent-solid py-4 font-semibold shadow-lg shadow-orange-500/20 transition hover:brightness-105 disabled:cursor-not-allowed disabled:opacity-50"
                     >
                         {submitting ? (

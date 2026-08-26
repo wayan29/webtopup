@@ -1,9 +1,16 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { useAuthStore } from '../store/useAuthStore';
 import { Mail, Lock, Eye, EyeOff, ArrowRight, ShieldCheck } from 'lucide-react';
 import DeviceLimitDialog, { type DeviceSession } from '../components/auth/DeviceLimitDialog';
+import TurnstileField, { type TurnstileFieldHandle } from '../components/TurnstileField';
 import { allowsRememberMe, audienceForRole, postLoginPath, readReturnTo, type LoginAudience } from '../auth/loginIntent';
+import { apiV2 } from '../api';
+import {
+    isBotProtectionResponseError,
+    shouldRenderTurnstile,
+    turnstileSiteKey,
+} from '../lib/botProtection';
 
 type LoginProps = {
     /** Fixed by the route; never derived from user input. Enforcement stays server-side. */
@@ -22,6 +29,9 @@ export default function Login({ audience = 'member' }: LoginProps) {
     const [loading, setLoading] = useState(false);
     const [rememberMe, setRememberMe] = useState(false);
     const [deviceChallenge, setDeviceChallenge] = useState<{ challengeToken: string; sessions: DeviceSession[] } | null>(null);
+    const [publicSettings, setPublicSettings] = useState<{ botProtectionEnabled?: unknown; turnstileSiteKey?: unknown }>({});
+    const [turnstileToken, setTurnstileToken] = useState<string | null>(null);
+    const turnstileRef = useRef<TurnstileFieldHandle | null>(null);
     const login = useAuthStore((state) => state.login);
     const verifyTwoFactorLogin = useAuthStore((state) => state.verifyTwoFactorLogin);
     const completeDeviceSelection = useAuthStore((state) => state.completeDeviceSelection);
@@ -39,6 +49,31 @@ export default function Login({ audience = 'member' }: LoginProps) {
             navigate(postLoginPath(sessionAudience, requestedReturnTo), { replace: true });
         }
     }, [isAuthenticated, user, navigate, requestedReturnTo]);
+
+    useEffect(() => {
+        let active = true;
+        const fetchPublicSettings = async () => {
+            try {
+                const res = await apiV2.get('/settings/public');
+                if (!active) return;
+                setPublicSettings({
+                    botProtectionEnabled: res.data?.botProtectionEnabled === true,
+                    turnstileSiteKey: typeof res.data?.turnstileSiteKey === 'string' ? res.data.turnstileSiteKey : '',
+                });
+            } catch {
+                if (!active) return;
+                setPublicSettings({});
+            }
+        };
+        fetchPublicSettings();
+        return () => {
+            active = false;
+        };
+    }, []);
+
+    const showTurnstile = !twoFactorChallenge && shouldRenderTurnstile(publicSettings);
+    const siteKey = turnstileSiteKey(publicSettings);
+    const loginBlockedByTurnstile = showTurnstile && !turnstileToken;
 
     // Show loading if redirecting
     if (isAuthenticated && user) {
@@ -64,7 +99,13 @@ export default function Login({ audience = 'member' }: LoginProps) {
 
         setLoading(true);
         try {
-            const result = await login(audience, normalizedEmail, password, offersRememberMe && rememberMe);
+            const result = await login(
+                audience,
+                normalizedEmail,
+                password,
+                offersRememberMe && rememberMe,
+                showTurnstile ? (turnstileToken ?? undefined) : undefined,
+            );
             if (result && 'deviceLimit' in result) {
                 setDeviceChallenge(result.deviceLimit);
             } else if (result?.requiresTwoFactor) {
@@ -73,6 +114,10 @@ export default function Login({ audience = 'member' }: LoginProps) {
             }
             // Redirect akan handled oleh useEffect
         } catch (err: any) {
+            if (isBotProtectionResponseError(err)) {
+                turnstileRef.current?.reset();
+                setTurnstileToken(null);
+            }
             // Handle axios error properly
             const message = err.response?.data?.message || 'Login failed. Please check your credentials.';
             setError(message);
@@ -259,9 +304,13 @@ export default function Login({ audience = 'member' }: LoginProps) {
                             <p className="ui-text-muted text-xs">Sesi internal berakhir setelah 8 jam dan tidak dapat diperpanjang.</p>
                             )}
 
+                            {showTurnstile && siteKey ? (
+                                <TurnstileField ref={turnstileRef} siteKey={siteKey} onTokenChange={setTurnstileToken} />
+                            ) : null}
+
                             <button
                                 type="submit"
-                                disabled={loading}
+                                disabled={loading || loginBlockedByTurnstile}
                                 className="ui-accent-solid flex w-full items-center justify-center rounded-xl px-4 py-3 text-sm font-bold shadow-lg transition-all duration-200 hover:brightness-105 focus:outline-none focus:ring-2 focus:ring-[var(--ui-ring)] disabled:cursor-not-allowed disabled:opacity-60"
                             >
                                 {loading ? 'Memproses...' : (

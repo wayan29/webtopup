@@ -31,6 +31,8 @@ pub fn default_site_settings() -> Map<String, Value> {
         ),
         ("registrationEnabled".to_string(), json!(true)),
         ("guestCheckoutEnabled".to_string(), json!(true)),
+        ("botProtectionEnabled".to_string(), json!(false)),
+        ("turnstileSiteKey".to_string(), json!("")),
         ("minDeposit".to_string(), json!(10000)),
         ("maxDeposit".to_string(), json!(10000000)),
         ("depositFee".to_string(), json!(0)),
@@ -78,6 +80,8 @@ pub fn public_site_setting_keys() -> &'static [&'static str] {
         "maintenanceMessage",
         "registrationEnabled",
         "guestCheckoutEnabled",
+        "botProtectionEnabled",
+        "turnstileSiteKey",
         "footerText",
         "termsUrl",
         "privacyUrl",
@@ -112,7 +116,17 @@ pub fn default_text(key: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_site_settings, default_text};
+    use super::{default_site_settings, default_text, public_site_setting_keys};
+    use serde_json::json;
+
+    #[test]
+    fn bot_protection_defaults_are_off_and_public() {
+        let defaults = default_site_settings();
+        assert_eq!(defaults.get("botProtectionEnabled"), Some(&json!(false)));
+        assert_eq!(defaults.get("turnstileSiteKey"), Some(&json!("")));
+        assert!(public_site_setting_keys().contains(&"botProtectionEnabled"));
+        assert!(public_site_setting_keys().contains(&"turnstileSiteKey"));
+    }
 
     #[test]
     fn bundled_brand_assets_are_the_settings_defaults() {

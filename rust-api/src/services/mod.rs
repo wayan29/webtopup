@@ -1,4 +1,5 @@
 pub mod audit_sanitize;
+pub mod bot_protection;
 pub mod correlation;
 pub mod identifier_integrity;
 pub mod idempotency;

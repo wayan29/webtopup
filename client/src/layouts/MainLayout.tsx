@@ -23,6 +23,8 @@ interface PublicSettings {
     popupBannerTitle: string;
     popupBannerDescription: string;
     popupBannerLink: string;
+    botProtectionEnabled: boolean;
+    turnstileSiteKey: string;
 }
 
 const defaultPublicSettings: PublicSettings = {
@@ -34,7 +36,9 @@ const defaultPublicSettings: PublicSettings = {
     popupBannerImage: '',
     popupBannerTitle: '',
     popupBannerDescription: '',
-    popupBannerLink: ''
+    popupBannerLink: '',
+    botProtectionEnabled: false,
+    turnstileSiteKey: ''
 };
 
 export default function MainLayout() {

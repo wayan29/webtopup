@@ -33,6 +33,8 @@ pub struct LoginPayload {
     pub(super) remember_me: Option<bool>,
     #[serde(rename = "deviceName")]
     pub(super) device_name: Option<String>,
+    #[serde(rename = "turnstileToken")]
+    pub(super) turnstile_token: Option<String>,
 }
 
 #[derive(Deserialize)]

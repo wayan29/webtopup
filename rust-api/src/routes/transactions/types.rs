@@ -136,6 +136,7 @@ pub struct CreateTransactionPayload {
     pub(super) use_flash_sale: Option<bool>,
     /// Optional checkout discount voucher code (kind=discount).
     pub(super) voucher_code: Option<String>,
+    pub(super) turnstile_token: Option<String>,
 }
 
 #[derive(Serialize)]
