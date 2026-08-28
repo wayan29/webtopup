@@ -1,0 +1,20 @@
+[Unit]
+Description=webtopup Node gateway (Bun runtime)
+After=network-online.target webtopup-rust.service
+Wants=network-online.target webtopup-rust.service
+
+[Service]
+Type=simple
+User=danayasa
+WorkingDirectory=/home/danayasa/proyek/webtopup/server
+Environment=NODE_ENV=production
+# Bun 1.4 runtime (verified on chore/bun-runtime).
+# Rollback to Node: replace the next line with
+# ExecStart=/home/danayasa/.nvm/versions/node/v26.5.1/bin/node dist/index.js
+# then: sudo systemctl daemon-reload && sudo systemctl restart webtopup-node
+ExecStart=/home/danayasa/.bun/bin/bun dist/index.js
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

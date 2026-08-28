@@ -229,7 +229,11 @@ pm2 start ./target/release/webtopup-rust-api --name "pobb-api-v2"
 pm2 save
 
 cd ../server
-pm2 start dist/index.js --name "pobb-api"
+# Gateway runtime: Bun 1.4 (see docs/ops/bun-gateway-runtime.md for the
+# production systemd unit and Node rollback instructions).
+pm2 start --interpreter ~/.bun/bin/bun dist/index.js --name "pobb-api"
+# Node fallback:
+# pm2 start dist/index.js --name "pobb-api"
 pm2 save
 pm2 startup
 ```
