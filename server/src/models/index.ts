@@ -1,55 +1,111 @@
-import User, { IUser, ITeamPermissions, IMemberPreferences } from './User';
-import Product, { IProduct } from './Product';
-import Transaction, { ITransaction } from './Transaction';
-import Vendor, { IVendor } from './Vendor';
-import Deposit, { IDeposit } from './Deposit';
-import Reward, { IReward } from './Reward';
-import PointTransaction, { IPointTransaction } from './PointTransaction';
-import Settings, { ISettings } from './Settings';
-import Category, { ICategory } from './Category';
-import Operator, { IOperator } from './Operator';
-import ProductType, { IProductType } from './ProductType';
-import PaymentMethod, { IPaymentMethod } from './PaymentMethod';
-import PaymentCategory, { IPaymentCategory } from './PaymentCategory';
-import GuestTransaction, { IGuestTransaction } from './GuestTransaction';
-import LoginLog, { ILoginLog } from './LoginLog';
-import UserBalanceAdjustment, { IUserBalanceAdjustment } from './UserBalanceAdjustment';
-import TeamAuditLog, { ITeamAuditLog } from './TeamAuditLog';
-import WebhookEventLog, { IWebhookEventLog } from './WebhookEventLog';
-import AdminAuditLog, { IAdminAuditLog } from './AdminAuditLog';
-import AdminNotificationState, { IAdminNotificationState } from './AdminNotificationState';
-import DigiflazzSellerProductMap, { IDigiflazzSellerProductMap } from './DigiflazzSellerProductMap';
-import DigiflazzSellerOrder, { IDigiflazzSellerOrder } from './DigiflazzSellerOrder';
-import Voucher, { IVoucher } from './Voucher';
-import Slider, { ISlider } from './Slider';
-import FlashSale, { IFlashSale, IFlashSaleProduct } from './FlashSale';
-import Article, { IArticle } from './Article';
+import User from './User';
+import Product from './Product';
+import Transaction from './Transaction';
+import Vendor from './Vendor';
+import Deposit from './Deposit';
+import Reward from './Reward';
+import PointTransaction from './PointTransaction';
+import Settings from './Settings';
+import Category from './Category';
+import Operator from './Operator';
+import ProductType from './ProductType';
+import PaymentMethod from './PaymentMethod';
+import PaymentCategory from './PaymentCategory';
+import GuestTransaction from './GuestTransaction';
+import LoginLog from './LoginLog';
+import UserBalanceAdjustment from './UserBalanceAdjustment';
+import TeamAuditLog from './TeamAuditLog';
+import WebhookEventLog from './WebhookEventLog';
+import AdminAuditLog from './AdminAuditLog';
+import AdminNotificationState from './AdminNotificationState';
+import DigiflazzSellerProductMap from './DigiflazzSellerProductMap';
+import DigiflazzSellerOrder from './DigiflazzSellerOrder';
+import Voucher from './Voucher';
+import Slider from './Slider';
+import FlashSale from './FlashSale';
+import Article from './Article';
+
+import type { IUser, ITeamPermissions, IMemberPreferences } from './User';
+import type { IProduct } from './Product';
+import type { ITransaction } from './Transaction';
+import type { IVendor } from './Vendor';
+import type { IDeposit } from './Deposit';
+import type { IReward } from './Reward';
+import type { IPointTransaction } from './PointTransaction';
+import type { ISettings } from './Settings';
+import type { ICategory } from './Category';
+import type { IOperator } from './Operator';
+import type { IProductType } from './ProductType';
+import type { IPaymentMethod } from './PaymentMethod';
+import type { IPaymentCategory } from './PaymentCategory';
+import type { IGuestTransaction } from './GuestTransaction';
+import type { ILoginLog } from './LoginLog';
+import type { IUserBalanceAdjustment } from './UserBalanceAdjustment';
+import type { ITeamAuditLog } from './TeamAuditLog';
+import type { IWebhookEventLog } from './WebhookEventLog';
+import type { IAdminAuditLog } from './AdminAuditLog';
+import type { IAdminNotificationState } from './AdminNotificationState';
+import type { IDigiflazzSellerProductMap } from './DigiflazzSellerProductMap';
+import type { IDigiflazzSellerOrder } from './DigiflazzSellerOrder';
+import type { IVoucher } from './Voucher';
+import type { ISlider } from './Slider';
+import type { IFlashSale, IFlashSaleProduct } from './FlashSale';
+import type { IArticle } from './Article';
 
 export {
-    User, IUser, ITeamPermissions, IMemberPreferences,
-    Product, IProduct,
-    Transaction, ITransaction,
-    Vendor, IVendor,
-    Deposit, IDeposit,
-    Reward, IReward,
-    PointTransaction, IPointTransaction,
-    Settings, ISettings,
-    Category, ICategory,
-    Operator, IOperator,
-    ProductType, IProductType,
-    PaymentMethod, IPaymentMethod,
-    PaymentCategory, IPaymentCategory,
-    GuestTransaction, IGuestTransaction,
-    LoginLog, ILoginLog,
-    UserBalanceAdjustment, IUserBalanceAdjustment,
-    TeamAuditLog, ITeamAuditLog,
-    WebhookEventLog, IWebhookEventLog,
-    AdminAuditLog, IAdminAuditLog,
-    AdminNotificationState, IAdminNotificationState,
-    DigiflazzSellerProductMap, IDigiflazzSellerProductMap,
-    DigiflazzSellerOrder, IDigiflazzSellerOrder,
-    Voucher, IVoucher,
-    Slider, ISlider,
-    FlashSale, IFlashSale, IFlashSaleProduct,
-    Article, IArticle
+    User,
+    Product,
+    Transaction,
+    Vendor,
+    Deposit,
+    Reward,
+    PointTransaction,
+    Settings,
+    Category,
+    Operator,
+    ProductType,
+    PaymentMethod,
+    PaymentCategory,
+    GuestTransaction,
+    LoginLog,
+    UserBalanceAdjustment,
+    TeamAuditLog,
+    WebhookEventLog,
+    AdminAuditLog,
+    AdminNotificationState,
+    DigiflazzSellerProductMap,
+    DigiflazzSellerOrder,
+    Voucher,
+    Slider,
+    FlashSale,
+    Article
+};
+
+export type {
+    IUser, ITeamPermissions, IMemberPreferences,
+    IProduct,
+    ITransaction,
+    IVendor,
+    IDeposit,
+    IReward,
+    IPointTransaction,
+    ISettings,
+    ICategory,
+    IOperator,
+    IProductType,
+    IPaymentMethod,
+    IPaymentCategory,
+    IGuestTransaction,
+    ILoginLog,
+    IUserBalanceAdjustment,
+    ITeamAuditLog,
+    IWebhookEventLog,
+    IAdminAuditLog,
+    IAdminNotificationState,
+    IDigiflazzSellerProductMap,
+    IDigiflazzSellerOrder,
+    IVoucher,
+    ISlider,
+    IFlashSale, IFlashSaleProduct,
+    IArticle
 };
