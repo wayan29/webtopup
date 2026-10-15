@@ -29,36 +29,7 @@ export const verifyJwtToken = <T = unknown>(token: string) => (
     jwt.verify(token, getJwtSecret()) as T
 );
 
-export type AccessJwtClaims = {
-    sub: string;
-    sid: string;
-    sessionVersion: number;
-    role: string;
-    iat: number;
-    exp: number;
-    jti: string;
-    tokenType: string;
-};
-
-export type LegacyJwtClaims = {
-    id: string;
-    email?: string;
-    role?: string;
-    sessionVersion?: number;
-    exp?: number;
-    iat?: number;
-};
-
-export const isAccessJwtClaims = (decoded: Record<string, unknown>): decoded is AccessJwtClaims => (
-    decoded.tokenType === 'access'
-    && typeof decoded.sid === 'string'
-    && typeof decoded.sub === 'string'
+export const isCanonicalUuid = (value: unknown): value is string => (
+    typeof value === 'string'
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)
 );
-
-export const decodeJwtPayload = (token: string): Record<string, unknown> | null => {
-    const decoded = jwt.decode(token);
-    if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) {
-        return null;
-    }
-    return decoded as Record<string, unknown>;
-};

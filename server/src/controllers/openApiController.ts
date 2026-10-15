@@ -98,19 +98,12 @@ export const revokeApiKey = async (request: AuthRequest, reply: FastifyReply) =>
 // ============ Open API Endpoints (using API key auth) ============
 
 export interface ApiKeyRequest extends FastifyRequest {
-    apiUser?: {
-        id: string;
-        email: string;
-        level: string;
-        balance: number;
-    };
+    apiUser?: { id: string; email: string; level: string; balance: number };
     user?: AuthRequest['user'];
 }
 
 const firstString = (value: unknown): string | undefined => {
-    if (Array.isArray(value)) {
-        return firstString(value[0]);
-    }
+    if (Array.isArray(value)) return firstString(value[0]);
     return typeof value === 'string' ? value.trim() : undefined;
 };
 
@@ -118,69 +111,36 @@ const requestValue = (request: FastifyRequest, keys: string[]): string | undefin
     const query = request.query as Record<string, unknown> | undefined;
     const body = request.body as Record<string, unknown> | undefined;
     const headers = request.headers as Record<string, unknown>;
-
     for (const key of keys) {
         const value = firstString(query?.[key]) || firstString(body?.[key]) || firstString(headers[key.toLowerCase()]);
-        if (value) {
-            return value;
-        }
+        if (value) return value;
     }
-
     return undefined;
 };
 
 const md5 = (value: string) => crypto.createHash('md5').update(value).digest('hex');
-
 const timingSafeEqualHex = (left: string, right: string) => {
-    const leftBuffer = Buffer.from(left.toLowerCase(), 'hex');
-    const rightBuffer = Buffer.from(right.toLowerCase(), 'hex');
-    return leftBuffer.length === rightBuffer.length && crypto.timingSafeEqual(leftBuffer, rightBuffer);
+    const a = Buffer.from(left.toLowerCase(), 'hex');
+    const b = Buffer.from(right.toLowerCase(), 'hex');
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
 };
 
 const setApiUser = (request: ApiKeyRequest, user: { _id: { toString(): string }; email: string; level: string; balance: number }) => {
     const id = user._id.toString();
-    request.apiUser = {
-        id,
-        email: user.email,
-        level: user.level,
-        balance: user.balance
-    };
-    request.user = {
-        id,
-        email: user.email,
-        role: 'member'
-    };
+    request.apiUser = { id, email: user.email, level: user.level, balance: user.balance };
+    request.user = { id, email: user.email, role: 'member' };
 };
 
-// Middleware to authenticate via API key
 export const authenticateApiKey = async (request: ApiKeyRequest, reply: FastifyReply) => {
     try {
-        const apiKey = request.headers['x-api-key'] as string;
-
-        if (!apiKey) {
-            return reply.status(401).send({
-                success: false,
-                message: 'API key is required. Use X-API-Key header.'
-            });
-        }
-
-        const user = await User.findOne({ apiKey, role: 'member', active: { $ne: false } })
-            .select('_id email level balance');
-
-        if (!user) {
-            return reply.status(401).send({
-                success: false,
-                message: 'Invalid API key'
-            });
-        }
-
+        const apiKey = firstString(request.headers['x-api-key']);
+        if (!apiKey) return reply.status(401).send({ success: false, message: 'API key is required. Use X-API-Key header.' });
+        const user = await User.findOne({ apiKey, role: 'member', active: { $ne: false } }).select('_id email level balance');
+        if (!user) return reply.status(401).send({ success: false, message: 'Invalid API key' });
         setApiUser(request, user);
     } catch (error) {
         console.error('API key auth error:', error);
-        return reply.status(500).send({
-            success: false,
-            message: 'Authentication error'
-        });
+        return reply.status(500).send({ success: false, message: 'Authentication error' });
     }
 };
 
@@ -190,50 +150,16 @@ export const authenticateOpenApiSignature = async (request: ApiKeyRequest, reply
         const apiKey = requestValue(request, ['api_key', 'apiKey', 'x-api-key']);
         const signature = requestValue(request, ['signature']);
         const refId = requestValue(request, ['ref_id', 'refId']);
-
-        if (!memberId || !apiKey || !signature) {
-            return reply.status(401).send({
-                success: false,
-                message: 'member_id, api_key, and signature are required'
-            });
-        }
-
-        if (!/^[a-f0-9]{32}$/i.test(signature)) {
-            return reply.status(401).send({
-                success: false,
-                message: 'Invalid signature'
-            });
-        }
-
-        const user = await User.findOne({
-            memberCode: memberId,
-            apiKey,
-            role: 'member',
-            active: { $ne: false }
-        }).select('_id email level balance apiSecret');
-
-        if (!user?.apiSecret) {
-            return reply.status(401).send({
-                success: false,
-                message: 'Invalid member_id or api_key'
-            });
-        }
-
+        if (!memberId || !apiKey || !signature) return reply.status(401).send({ success: false, message: 'member_id, api_key, and signature are required' });
+        if (!/^[a-f0-9]{32}$/i.test(signature)) return reply.status(401).send({ success: false, message: 'Invalid signature' });
+        const user = await User.findOne({ memberCode: memberId, apiKey, role: 'member', active: { $ne: false } }).select('_id email level balance apiSecret');
+        if (!user?.apiSecret) return reply.status(401).send({ success: false, message: 'Invalid member_id or api_key' });
         const expected = md5(refId ? `${memberId}:${apiKey}:${user.apiSecret}:${refId}` : `${memberId}:${apiKey}:${user.apiSecret}`);
-        if (!timingSafeEqualHex(signature, expected)) {
-            return reply.status(401).send({
-                success: false,
-                message: 'Invalid signature'
-            });
-        }
-
+        if (!timingSafeEqualHex(signature, expected)) return reply.status(401).send({ success: false, message: 'Invalid signature' });
         setApiUser(request, user);
     } catch (error) {
         console.error('Open API signature auth error:', error);
-        return reply.status(500).send({
-            success: false,
-            message: 'Authentication error'
-        });
+        return reply.status(500).send({ success: false, message: 'Authentication error' });
     }
 };
 

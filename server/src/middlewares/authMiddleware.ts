@@ -1,5 +1,15 @@
 import { FastifyRequest, FastifyReply } from 'fastify';
-import { User, ITeamPermissions } from '../models';
+export interface ITeamPermissions {
+    viewDashboard: boolean; viewReports: boolean;
+    viewTransactions: boolean; processManualTransaction: boolean;
+    viewDeposits: boolean; approveDeposits: boolean;
+    viewProducts: boolean; manageProducts: boolean; manageVouchers: boolean;
+    viewPayment: boolean; managePayment: boolean;
+    viewUsers: boolean; manageUsers: boolean;
+    viewTeam: boolean; manageTeam: boolean;
+    viewSettings: boolean; manageSettings: boolean;
+    viewVendors: boolean; manageVendors: boolean;
+}
 import { sendAuthError } from '../utils/authErrors';
 import { authenticateSession, authenticateUnlockSession } from './sessionAuth';
 
@@ -11,7 +21,7 @@ export interface AuthRequest extends FastifyRequest {
         permissions?: ITeamPermissions;
         sessionId?: string;
         /** Present for browser bearer authentication; absent for separately trusted API-key contexts. */
-        authMode?: 'legacy' | 'refresh-session';
+        authMode?: 'refresh-session';
     };
 }
 
@@ -97,14 +107,8 @@ export const hasPermission = (permission: PermissionKey) => {
 
         // For admin and cs, check specific permission
         if (request.user.role === 'admin' || request.user.role === 'cs') {
-            const user = await User.findById(request.user.id).select('permissions active');
-            
-            if (!user || user.active === false) {
-                return sendAuthError(reply, 403, 'AUTH_ACCOUNT_DISABLED', 'Forbidden: Account inactive');
-            }
-
             // Check permission
-            if (!hasResolvedPermission(user.permissions, permission)) {
+            if (!hasResolvedPermission(request.user.permissions, permission)) {
                 return sendAuthError(reply, 403, 'PERMISSION_DENIED', 'Forbidden: Permission denied');
             }
         }

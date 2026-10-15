@@ -381,6 +381,9 @@ export const createProduct = async (request: FastifyRequest, reply: FastifyReply
     }
 };
 
+type CategoryProjection = { _id: mongoose.Types.ObjectId; name: string };
+type OperatorProjection = { _id: mongoose.Types.ObjectId; name: string; categoryId: mongoose.Types.ObjectId };
+type ProductTypeProjection = { _id: mongoose.Types.ObjectId; name: string; categoryId: mongoose.Types.ObjectId; operatorId: mongoose.Types.ObjectId };
 export const getProducts = async (request: FastifyRequest, reply: FastifyReply) => {
     try {
         const { category, categoryId, operatorId, productTypeId, brand, search, status } = request.query as any;
@@ -402,35 +405,35 @@ export const getProducts = async (request: FastifyRequest, reply: FastifyReply) 
             });
         }
 
-        const resolvedCategory = categoryId && mongoose.Types.ObjectId.isValid(String(categoryId))
+        const resolvedCategory = (categoryId && mongoose.Types.ObjectId.isValid(String(categoryId))
             ? await Category.findById(categoryId).select('name')
             : category
                 ? await Category.findOne({ name: getExactNameQuery(String(category)) }).select('name')
-                : null;
+                : null) as unknown as CategoryProjection | null;
 
-        const resolvedOperator = operatorId && mongoose.Types.ObjectId.isValid(String(operatorId))
+        const resolvedOperator = (operatorId && mongoose.Types.ObjectId.isValid(String(operatorId))
             ? await Operator.findById(operatorId).select('name categoryId')
             : brand
                 ? await Operator.findOne({ name: getExactNameQuery(String(brand)) }).select('name categoryId')
-                : null;
+                : null) as unknown as OperatorProjection | null;
 
-        const resolvedProductType = productTypeId && mongoose.Types.ObjectId.isValid(String(productTypeId))
+        const resolvedProductType = (productTypeId && mongoose.Types.ObjectId.isValid(String(productTypeId))
             ? await ProductType.findById(productTypeId).select('name categoryId operatorId')
-            : null;
+            : null) as unknown as ProductTypeProjection | null;
 
-        let scopedOperator = resolvedOperator;
-        let scopedCategory = resolvedCategory;
+        let scopedOperator: OperatorProjection | null = resolvedOperator;
+        let scopedCategory: CategoryProjection | null = resolvedCategory;
 
         if (!scopedOperator && resolvedProductType) {
-            scopedOperator = await Operator.findById(resolvedProductType.operatorId).select('name categoryId');
+            scopedOperator = (await Operator.findById(resolvedProductType.operatorId).select('name categoryId')) as unknown as OperatorProjection | null;
         }
 
         if (!scopedCategory && resolvedProductType) {
-            scopedCategory = await Category.findById(resolvedProductType.categoryId).select('name');
+            scopedCategory = (await Category.findById(resolvedProductType.categoryId).select('name')) as unknown as CategoryProjection | null;
         }
 
         if (!scopedCategory && scopedOperator?.categoryId) {
-            scopedCategory = await Category.findById(scopedOperator.categoryId).select('name');
+            scopedCategory = (await Category.findById(scopedOperator.categoryId).select('name')) as unknown as CategoryProjection | null;
         }
 
         if (resolvedProductType && scopedOperator) {

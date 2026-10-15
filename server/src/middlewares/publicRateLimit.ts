@@ -1,10 +1,20 @@
 import { FastifyReply, FastifyRequest } from 'fastify';
 import { getRequestClientIp } from '../utils/requestIp';
+import { hitRedisRateLimit, type RateLimitOutcome } from '../utils/redisRateLimit';
 
-type RateLimitBucket = {
-    hits: number[];
-    blockedUntil?: number;
-};
+/**
+ * Redis-backed public rate-limit factory. Thresholds, key derivation
+ * (route + IP + body identity parts) and the 429/Retry-After contract match the
+ * previous per-process limiter, but the counters are shared by every gateway
+ * instance through the atomic Lua evaluation in utils/redisRateLimit.
+ *
+ * `failureMode` selects the outage policy:
+ * - 'closed': Redis unavailability answers 503. Used for buckets that guard
+ *   credential or financial mutations, which must not run unthrottled.
+ * - 'open': Redis unavailability only loses cross-instance throttling while the
+ *   endpoint stays available. Used for read-only validation and for provider
+ *   webhooks, which providers redeliver and the reconciler applies idempotently.
+ */
 
 type PublicRateLimitOptions = {
     name: string;
@@ -12,39 +22,11 @@ type PublicRateLimitOptions = {
     max: number;
     blockMs?: number;
     keyParts?: Array<(request: FastifyRequest) => string | undefined>;
+    failureMode?: 'open' | 'closed';
 };
 
-const buckets = new Map<string, RateLimitBucket>();
-
-const pruneBucket = (bucket: RateLimitBucket, now: number, windowMs: number) => {
-    bucket.hits = bucket.hits.filter((timestamp) => now - timestamp < windowMs);
-
-    if (bucket.blockedUntil && bucket.blockedUntil <= now) {
-        delete bucket.blockedUntil;
-    }
-};
-
-const hitBucket = (key: string, now: number, options: PublicRateLimitOptions) => {
-    const bucket = buckets.get(key) || { hits: [] };
-
-    pruneBucket(bucket, now, options.windowMs);
-
-    if (bucket.blockedUntil && bucket.blockedUntil > now) {
-        buckets.set(key, bucket);
-        return bucket.blockedUntil;
-    }
-
-    bucket.hits.push(now);
-
-    if (bucket.hits.length > options.max) {
-        bucket.blockedUntil = now + (options.blockMs ?? options.windowMs);
-        buckets.set(key, bucket);
-        return bucket.blockedUntil;
-    }
-
-    buckets.set(key, bucket);
-    return null;
-};
+const RATE_LIMIT_BLOCKED_MESSAGE = 'Terlalu banyak request. Coba lagi beberapa menit lagi.';
+const RATE_LIMIT_UNAVAILABLE_MESSAGE = 'Layanan sedang tidak tersedia. Coba lagi beberapa saat lagi.';
 
 const bodyValue = (request: FastifyRequest, field: string) => {
     const body = request.body as Record<string, unknown> | undefined;
@@ -52,7 +34,7 @@ const bodyValue = (request: FastifyRequest, field: string) => {
     return typeof value === 'string' ? value.trim().toLowerCase() : '';
 };
 
-const routeKey = (request: FastifyRequest) => request.routerPath || request.url.split('?')[0];
+const routeKey = (request: FastifyRequest) => request.routeOptions.url || request.url.split('?')[0];
 
 export const createPublicRateLimit = (options: PublicRateLimitOptions) => async (request: FastifyRequest, reply: FastifyReply) => {
     const ip = getRequestClientIp(request);
@@ -81,16 +63,27 @@ export const createPublicRateLimit = (options: PublicRateLimitOptions) => async 
         }
     }
 
-    const now = Date.now();
-
     for (const key of keys) {
-        const blockedUntil = hitBucket(key, now, options);
-        if (blockedUntil && blockedUntil > now) {
-            const retryAfterSeconds = Math.ceil((blockedUntil - now) / 1000);
-            reply.header('Retry-After', String(retryAfterSeconds));
-            return reply.status(429).send({
-                message: 'Terlalu banyak request. Coba lagi beberapa menit lagi.'
+        let outcome: RateLimitOutcome;
+        try {
+            outcome = await hitRedisRateLimit({
+                bucket: key,
+                windowMs: options.windowMs,
+                max: options.max,
+                blockMs: options.blockMs ?? options.windowMs
             });
+        } catch (error) {
+            if (options.failureMode === 'closed') {
+                request.log.error({ err: error, limiter: options.name }, 'Redis rate limiter unavailable; failing closed');
+                return reply.status(503).send({ message: RATE_LIMIT_UNAVAILABLE_MESSAGE });
+            }
+            request.log.warn({ err: error, limiter: options.name }, 'Redis rate limiter unavailable; failing open');
+            return;
+        }
+
+        if (outcome.blocked) {
+            reply.header('Retry-After', String(outcome.retryAfterSeconds));
+            return reply.status(429).send({ message: RATE_LIMIT_BLOCKED_MESSAGE });
         }
     }
 };
@@ -99,7 +92,8 @@ export const publicValidateRateLimit = createPublicRateLimit({
     name: 'public-validate',
     windowMs: 60 * 1000,
     max: 20,
-    blockMs: 5 * 60 * 1000
+    blockMs: 5 * 60 * 1000,
+    failureMode: 'open'
 });
 
 export const publicGameValidateRateLimit = createPublicRateLimit({
@@ -110,26 +104,30 @@ export const publicGameValidateRateLimit = createPublicRateLimit({
     keyParts: [
         (request) => bodyValue(request, 'userId'),
         (request) => bodyValue(request, 'zoneId')
-    ]
+    ],
+    failureMode: 'open'
 });
 
 export const guestTransactionRateLimit = createPublicRateLimit({
     name: 'guest-transaction',
     windowMs: 60 * 1000,
     max: 10,
-    blockMs: 10 * 60 * 1000
+    blockMs: 10 * 60 * 1000,
+    failureMode: 'closed'
 });
 
 export const voucherRedeemRateLimit = createPublicRateLimit({
     name: 'voucher-redeem',
     windowMs: 60 * 1000,
     max: 8,
-    blockMs: 10 * 60 * 1000
+    blockMs: 10 * 60 * 1000,
+    failureMode: 'closed'
 });
 
 export const webhookRateLimit = createPublicRateLimit({
     name: 'vendor-webhook',
     windowMs: 60 * 1000,
     max: 120,
-    blockMs: 5 * 60 * 1000
+    blockMs: 5 * 60 * 1000,
+    failureMode: 'open'
 });

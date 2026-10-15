@@ -1,4 +1,4 @@
-import { createHash, createHmac } from 'crypto';
+import { createHmac } from 'crypto';
 import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { context, propagation, SpanKind, SpanStatusCode, trace } from '@opentelemetry/api';
 import {
@@ -13,7 +13,6 @@ import {
     TRACE_RESPONSE_HEADER as GATEWAY_TRACE_RESPONSE_HEADER,
 } from '../utils/correlation';
 import { AuthRequest, authenticate, authenticateUnlock, hasPermission, isTeamMember } from '../middlewares/authMiddleware';
-import { resolveBearerToken } from '../middlewares/sessionAuth';
 import { authRateLimit } from '../middlewares/authRateLimit';
 import { adminFinancialMutationRateLimit } from '../middlewares/adminMutationRateLimit';
 import {
@@ -24,11 +23,7 @@ import {
     type StepUpActionGroup,
 } from '../middlewares/stepUp';
 import { guestTransactionRateLimit, publicGameValidateRateLimit, publicValidateRateLimit, voucherRedeemRateLimit, webhookRateLimit } from '../middlewares/publicRateLimit';
-import { ApiKeyRequest, authenticateOpenApiSignature } from '../controllers/openApiController';
-import { handleDigiflazzWebhook, handleTokovoucherWebhook } from '../controllers/webhookController';
 import {
-    CSRF_COOKIE,
-    CSRF_COOKIE_PATH,
     ensureCsrfCookie,
     REFRESH_COOKIE,
     RECOVERY_COOKIE,
@@ -40,12 +35,9 @@ import {
 } from '../utils/authCookies';
 import {
     forcedLoginReasonFromAuthCode,
-    getLegacyAccessTokenAcceptUntilMs,
-    isLegacyAccessTokenCutoffPassed,
     recordForcedLoginMetric,
 } from '../utils/sessionConfig';
 import { authCookieDisposition } from '../utils/authErrors';
-import { decodeJwtPayload } from '../utils/jwt';
 import qrcode from 'qrcode';
 
 type UploadFolder = 'icons' | 'covers' | 'popups' | 'instructions';
@@ -421,7 +413,7 @@ const forwardHeaders = (request: AuthRequest, proxySecret: string, gatewayCorrel
     return headers;
 };
 
-export const credentialResponseRequiresCookies = (payload: Record<string, unknown>, legacyAllowed = false): boolean => {
+export const credentialResponseRequiresCookies = (payload: Record<string, unknown>): boolean => {
     const keys = Object.keys(payload).sort();
     const exactChallenge = keys.length === 3
         && keys[0] === 'challengeToken'
@@ -432,17 +424,9 @@ export const credentialResponseRequiresCookies = (payload: Record<string, unknow
         && typeof payload.challengeToken === 'string'
         && payload.challengeToken.trim().length > 0
         && payload.challengeToken.length <= 4096;
-    const exactLegacy = legacyAllowed
-        && keys.length === 2
-        && keys[0] === 'accessToken'
-        && keys[1] === 'user'
-        && typeof payload.accessToken === 'string'
-        && payload.accessToken.trim().length > 0
-        && payload.accessToken.length <= 8192
-        && payload.user !== null
-        && typeof payload.user === 'object'
-        && !Array.isArray(payload.user);
-    return !exactChallenge && !exactLegacy;
+    // Every credential-bearing success envelope must carry the full refresh/recovery pair so
+    // the gateway can install HttpOnly cookies; the legacy access-token-only shape is rejected.
+    return !exactChallenge;
 };
 
 export const requireRefreshCookies = async (request: FastifyRequest, reply: FastifyReply) => {
@@ -679,6 +663,24 @@ export default async function apiV2ProxyRoutes(app: FastifyInstance, opts?: ApiV
         }
     };
 
+    const proxyRawWebhook = async (request: AuthRequest, reply: FastifyReply) => {
+        const upstreamUrl = `${getApiV2UpstreamUrl()}${toUpstreamPath(request.url)}`;
+        const candidate: object = request;
+        const rawBody = "rawBody" in candidate && Buffer.isBuffer(candidate.rawBody) ? candidate.rawBody : undefined;
+        if (!rawBody) return reply.status(400).send({ message: "Raw webhook body is required" });
+        try {
+            const { result: upstreamResponse, responseTraceId } = await runWithProxySpan(deps, request, reply, upstreamUrl, async (gatewayCorrelationId) => {
+                const headers = forwardHeadersWithTrace(request, proxySecret, gatewayCorrelationId);
+                headers.set('content-type', 'application/json');
+                return fetch(upstreamUrl, { method: 'POST', headers, body: new Uint8Array(rawBody), redirect: 'manual' });
+            });
+            return sendUpstreamResponse(upstreamResponse, reply, responseTraceId);
+        } catch (error) {
+            request.log.error({ error, upstreamUrl }, 'API v2 raw webhook upstream request failed');
+            return reply.status(502).send({ message: 'API v2 upstream unavailable' });
+        }
+    };
+
     const stripCredentialIssuanceFields = (payload: Record<string, unknown>) => {
         delete payload.refreshToken;
         delete payload.recoveryToken;
@@ -768,8 +770,7 @@ export default async function apiV2ProxyRoutes(app: FastifyInstance, opts?: ApiV
                 return reply.status(502).send(JSON.stringify({ message: 'Invalid auth upstream response' }));
             }
             const payload = await upstreamResponse.json() as Record<string, unknown>;
-            const legacyAllowed = !isLegacyAccessTokenCutoffPassed();
-            if (upstreamResponse.ok && credentialResponseRequiresCookies(payload, legacyAllowed)) {
+            if (upstreamResponse.ok && credentialResponseRequiresCookies(payload)) {
                 // Vet the audience before any cookie is written; a mismatch is an upstream fault.
                 if (!loginEnvelopeAudienceMatches(upstreamPath, payload)) {
                     request.log.error({ upstreamPath }, 'API v2 login envelope role does not match the route audience');
@@ -1084,69 +1085,6 @@ const proxyUnlock = async (request: AuthRequest, reply: FastifyReply) => {
         }
     };
 
-    const proxyLegacyMigration = async (request: AuthRequest, reply: FastifyReply) => {
-        if (isLegacyAccessTokenCutoffPassed() || request.user?.authMode !== 'legacy') {
-            return reply.status(401).send({ error: { code: 'AUTH_TOKEN_INVALID', message: 'Legacy token cannot be migrated' } });
-        }
-        const legacyToken = resolveBearerToken(request);
-        if (!legacyToken) {
-            return reply.status(401).send({ error: { code: 'AUTH_TOKEN_INVALID', message: 'Invalid legacy token' } });
-        }
-        const decoded = decodeJwtPayload(legacyToken);
-        const legacyExpiresAt = typeof decoded?.exp === 'number' ? decoded.exp : null;
-        const cutoffMs = getLegacyAccessTokenAcceptUntilMs();
-        if (!legacyExpiresAt || cutoffMs === null) {
-            clearAuthCookies(reply);
-            return reply.status(401).send({ error: { code: 'AUTH_TOKEN_INVALID', message: 'Invalid legacy token' } });
-        }
-        const upstreamUrl = `${getApiV2UpstreamUrl()}${toUpstreamPath(request.url)}`;
-        try {
-            const { result: upstreamResponse, responseTraceId } = await runWithProxySpan(
-                deps, request, reply, upstreamUrl,
-                async (gatewayCorrelationId) => {
-                    const headers = prepareRewrittenJsonHeaders(forwardHeadersWithTrace(request, proxySecret, gatewayCorrelationId));
-                    headers.delete('authorization');
-                    return fetch(upstreamUrl, {
-                        method: 'POST',
-                        headers,
-                        body: JSON.stringify({
-                            migrationOperationMarker: createHash('sha256').update(legacyToken).digest('hex'),
-                            userId: request.user!.id,
-                            legacyExpiresAt,
-                            migrationCutoffAt: Math.floor(cutoffMs / 1000),
-                        }),
-                        redirect: 'manual',
-                    });
-                }
-            );
-            reply.header(TRACE_RESPONSE_HEADER, responseTraceId);
-            const contentType = upstreamResponse.headers.get('content-type') || '';
-            if (!contentType.toLowerCase().startsWith('application/json')) {
-                return reply.status(503).send({ error: { code: 'AUTH_REFRESH_RECOVERY_UNAVAILABLE', message: 'Invalid auth upstream response' } });
-            }
-            const payload = await upstreamResponse.json() as Record<string, unknown>;
-            if (upstreamResponse.ok) {
-                if (typeof payload.refreshToken !== 'string' || typeof payload.recoveryToken !== 'string' || typeof payload.csrfToken !== 'string') {
-                    return reply.status(503).send({ error: { code: 'AUTH_REFRESH_RECOVERY_UNAVAILABLE', message: 'Invalid auth upstream response' } });
-                }
-                setRefreshCookie(reply, payload.refreshToken, typeof payload.refreshCookieMaxAgeSeconds === 'number' ? payload.refreshCookieMaxAgeSeconds : undefined);
-                setRecoveryCookie(reply, payload.recoveryToken, typeof payload.recoveryCookieMaxAgeSeconds === 'number' ? payload.recoveryCookieMaxAgeSeconds : undefined);
-                reply.setCookie(CSRF_COOKIE, payload.csrfToken, { httpOnly: false, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', path: CSRF_COOKIE_PATH });
-            } else if (upstreamResponse.status === 401 && payload.code === 'AUTH_TOKEN_INVALID') {
-                clearAuthCookies(reply);
-            }
-            delete payload.refreshToken;
-            delete payload.recoveryToken;
-            delete payload.refreshCookieMaxAgeSeconds;
-            delete payload.recoveryCookieMaxAgeSeconds;
-            delete payload.csrfToken;
-            return reply.status(upstreamResponse.status).send(payload);
-        } catch (error) {
-            request.log.error({ error, upstreamUrl }, 'API v2 legacy migration upstream request failed');
-            return reply.status(503).send({ error: { code: 'AUTH_REFRESH_RECOVERY_UNAVAILABLE', message: 'API v2 upstream unavailable' } });
-        }
-    };
-
     const proxySliderAdminReadRequest = async (
         request: AuthRequest,
         reply: FastifyReply,
@@ -1403,7 +1341,6 @@ const proxyUnlock = async (request: AuthRequest, reply: FastifyReply) => {
     app.post('/auth/sessions/revoke-current', { preHandler: [requireTrustedAuthMutation, authRateLimit, authenticate] }, proxyCurrentSessionLogout);
     app.post('/auth/sessions/revoke-device', { preHandler: [requireTrustedAuthMutation, authRateLimit, authenticate] }, proxyRequest);
     app.post('/auth/sessions/revoke-all', { preHandler: [requireTrustedAuthMutation, authRateLimit, authenticate, requireStepUp('security.sessions_all')] }, proxyCurrentSessionLogout);
-    app.post('/auth/session/migrate', { preHandler: [requireTrustedAuthRequest, authRateLimit, authenticate] }, proxyLegacyMigration);
     app.get('/auth/me', { preHandler: [authenticate] }, proxyRequest);
     app.get('/auth/2fa/status', { preHandler: [authenticate] }, proxyRequest);
     /**
@@ -1461,15 +1398,15 @@ const proxyUnlock = async (request: AuthRequest, reply: FastifyReply) => {
     app.get('/api/key', { preHandler: [authenticate] }, proxyRequest);
     app.post('/api/key/generate', { preHandler: [authenticate] }, proxyRequest);
     app.delete('/api/key/revoke', { preHandler: [authenticate] }, proxyRequest);
-    app.get('/api/profile', { preHandler: [authenticateOpenApiSignature] }, proxyRequest as unknown as (request: ApiKeyRequest, reply: FastifyReply) => Promise<unknown>);
-    app.get('/api/categories', { preHandler: [authenticateOpenApiSignature] }, proxyRequest as unknown as (request: ApiKeyRequest, reply: FastifyReply) => Promise<unknown>);
-    app.get('/api/operators', { preHandler: [authenticateOpenApiSignature] }, proxyRequest as unknown as (request: ApiKeyRequest, reply: FastifyReply) => Promise<unknown>);
-    app.get('/api/product-types', { preHandler: [authenticateOpenApiSignature] }, proxyRequest as unknown as (request: ApiKeyRequest, reply: FastifyReply) => Promise<unknown>);
-    app.get('/api/products', { preHandler: [authenticateOpenApiSignature] }, proxyRequest as unknown as (request: ApiKeyRequest, reply: FastifyReply) => Promise<unknown>);
-    app.post('/api/transaction', { preHandler: [authenticateOpenApiSignature] }, proxyRequest as unknown as (request: ApiKeyRequest, reply: FastifyReply) => Promise<unknown>);
-    app.post('/api/order', { preHandler: [authenticateOpenApiSignature] }, proxyRequest as unknown as (request: ApiKeyRequest, reply: FastifyReply) => Promise<unknown>);
-    app.get('/api/transaction/check', { preHandler: [authenticateOpenApiSignature] }, proxyRequest as unknown as (request: ApiKeyRequest, reply: FastifyReply) => Promise<unknown>);
-    app.get('/api/transactions', { preHandler: [authenticateOpenApiSignature] }, proxyRequest as unknown as (request: ApiKeyRequest, reply: FastifyReply) => Promise<unknown>);
+    app.get('/api/profile', proxyRequest);
+    app.get('/api/categories', proxyRequest);
+    app.get('/api/operators', proxyRequest);
+    app.get('/api/product-types', proxyRequest);
+    app.get('/api/products', proxyRequest);
+    app.post('/api/transaction', proxyRequest);
+    app.post('/api/order', proxyRequest);
+    app.get('/api/transaction/check', proxyRequest);
+    app.get('/api/transactions', proxyRequest);
     app.get('/articles', proxyRequest);
     app.get('/articles/:slug', proxyRequest);
     app.post('/articles', { preHandler: [authenticate, hasPermission('manageSettings')] }, proxyRequest);
@@ -1527,6 +1464,8 @@ const proxyUnlock = async (request: AuthRequest, reply: FastifyReply) => {
     app.put('/deposits/:id/approve', { preHandler: [authenticate, hasPermission('approveDeposits'), requireStepUp('finance.deposit_approval')] }, proxyRequest);
     app.put('/deposits/:id/reject', { preHandler: [authenticate, hasPermission('approveDeposits'), requireStepUp('finance.deposit_approval')] }, proxyRequest);
     app.all('/deposits/*', { preHandler: [authenticate, hasPermission('viewDeposits')] }, proxyRequest);
+    app.post('/webhook/digiflazz', { preHandler: [webhookRateLimit] }, proxyRawWebhook);
+    app.post('/webhook/tokovoucher', { preHandler: [webhookRateLimit] }, proxyRawWebhook);
     app.post('/digiflazz-seller/prepaid', proxyRequest);
     app.get('/digiflazz-seller/center-summary', { preHandler: [authenticate, hasPermission('manageVendors')] }, proxyRequest);
     app.get('/digiflazz-seller/orders/admin', { preHandler: [authenticate, hasPermission('viewTransactions')] }, proxyRequest);
@@ -1699,7 +1638,5 @@ const proxyUnlock = async (request: AuthRequest, reply: FastifyReply) => {
     // Checkout discount validation is public (guest checkout) with rate limit; optional auth enriches one-per-user checks.
     app.post('/vouchers/discount/validate', { preHandler: [guestTransactionRateLimit] }, proxyRequest);
     app.all('/vouchers*', { preHandler: [authenticate, hasPermission('manageVouchers')] }, proxyRequest);
-    app.post('/webhook/digiflazz', { preHandler: [webhookRateLimit] }, handleDigiflazzWebhook);
-    app.post('/webhook/tokovoucher', { preHandler: [webhookRateLimit] }, handleTokovoucherWebhook);
     app.all('/webhook/*', { preHandler: [authenticate, hasPermission('manageVendors')] }, proxyRequest);
 }

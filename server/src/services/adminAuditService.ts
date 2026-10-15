@@ -1,5 +1,4 @@
 import { FastifyRequest } from 'fastify';
-import { AdminAuditLog, User } from '../models';
 import { AuthRequest } from '../middlewares/authMiddleware';
 import { getRequestClientIp } from '../utils/requestIp';
 import { getAuthoritativeAuditCorrelation } from '../utils/correlation';
@@ -147,20 +146,25 @@ export type AdminAuditWriterDependencies = {
     createAuditLog(document: Record<string, unknown>): Promise<unknown>;
 };
 
-const defaultAdminAuditWriterDependencies: AdminAuditWriterDependencies = {
-    findActor: async (id) => User.findById(id).select('name email role').lean() as Promise<{
-        _id: unknown;
-        name?: string;
-        email: string;
-        role: string;
-    } | null>,
-    createAuditLog: async (document) => AdminAuditLog.create(document),
+const defaultAdminAuditWriterDependencies: Pick<AdminAuditWriterDependencies, 'createAuditLog'> = {
+    createAuditLog: async (document) => {
+        const secret = process.env.API_V2_PROXY_SECRET?.trim();
+        if (!secret || secret.length < 32) throw new Error('API_V2_PROXY_SECRET is not configured');
+        const upstream = (process.env.API_V2_UPSTREAM_URL?.trim() || 'http://127.0.0.1:9010').replace(/\/+$/, '');
+        const response = await fetch(`${upstream}/v2/internal/audit`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-api-v2-proxy-secret': secret },
+            body: JSON.stringify(document),
+            signal: AbortSignal.timeout(5000),
+        });
+        if (!response.ok) throw new Error(`Audit persistence failed (${response.status})`);
+    },
 };
 
 export const recordAdminAuditLog = async (
     request: AuthRequest,
     statusCode: number,
-    dependencies: AdminAuditWriterDependencies = defaultAdminAuditWriterDependencies,
+    dependencies: Pick<AdminAuditWriterDependencies, 'createAuditLog'> & Partial<Pick<AdminAuditWriterDependencies, 'findActor'>> = defaultAdminAuditWriterDependencies,
 ) => {
     if (!shouldAuditRequest(request)) {
         return;
@@ -169,10 +173,10 @@ export const recordAdminAuditLog = async (
     const correlation = getAuthoritativeAuditCorrelation(request);
 
     try {
-        const actor = await dependencies.findActor(request.user!.id);
-        if (!actor) {
-            return;
-        }
+        const actor = dependencies.findActor
+            ? await dependencies.findActor(request.user!.id)
+            : { _id: request.user!.id, email: request.user!.email, role: request.user!.role };
+        if (!actor) return;
 
         const method = request.method.toUpperCase();
         const path = getPathname(request);
@@ -195,6 +199,8 @@ export const recordAdminAuditLog = async (
             method,
             path,
             statusCode,
+            outcome: statusCode < 400 ? 'success' : statusCode === 401 || statusCode === 403 ? 'unauthorized' : 'failed',
+            correlation: correlation.traceId || '',
             ip: getRequestClientIp(request),
             userAgent: String(request.headers['user-agent'] || ''),
             summary: `${method} ${path}`,
