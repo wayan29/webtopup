@@ -3,16 +3,15 @@ import type { AuthChannel } from './channel.ts';
 import type { AccessOrder, AuthChannelMessage, AuthPhase, RefreshResponse, RetryableRequest } from './types.ts';
 
 type AuthCode = string | undefined;
-type LegacyStorage = { readOnce(): string | null; remove(): void };
 export class CoordinatorDisposedError extends Error { constructor() { super('Auth coordinator disposed'); this.name = 'CoordinatorDisposedError'; } }
 export class CoordinatorOperationSupersededError extends Error { constructor() { super('Auth coordinator operation superseded'); this.name = 'CoordinatorOperationSupersededError'; } }
 
 export type CoordinatorDependencies = {
-    refresh(): Promise<RefreshResponse>; migrate(legacyToken: string): Promise<RefreshResponse>;
+    refresh(): Promise<RefreshResponse>;
     tokenStore: AccessTokenStore; channel: AuthChannel; setPhase(phase: AuthPhase): void;
     acceptRemote?(result: RefreshResponse): boolean;
     onAuthenticated(result: RefreshResponse, source: 'local' | 'remote'): void; onTerminal(code: string): void;
-    delay(ms: number): Promise<void>; now(): number; legacyStorage?: LegacyStorage;
+    delay(ms: number): Promise<void>; now(): number;
     recoveryBackoffsMs?: readonly number[]; raceWaitMs?: number;
     scheduleTimer?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
 };
@@ -41,7 +40,7 @@ function tokenOrder(token: string): AccessOrder | null {
 function compareOrder(a: AccessOrder, b: AccessOrder): number { return a.issuedAt - b.issuedAt || a.tokenId.localeCompare(b.tokenId); }
 
 export function createAuthCoordinator(deps: CoordinatorDependencies) {
-    let inFlight: Promise<RefreshResponse> | null = null, terminalTransitioned = false, legacyRead = false, disposed = false;
+    let inFlight: Promise<RefreshResponse> | null = null, terminalTransitioned = false, disposed = false;
     let proactiveTimer: ReturnType<typeof setTimeout> | null = null, channelUnsubscribe: (() => void) | null = null;
     let currentSid: string | null = null, currentOrder: AccessOrder | null = null, acceptsRemoteAccess = false, credentialGeneration = 0;
     const waiters = new Set<{ reject(error: Error): void }>();
@@ -110,13 +109,7 @@ export function createAuthCoordinator(deps: CoordinatorDependencies) {
     function refreshOnce(_reason: string): Promise<RefreshResponse> { ensureActive(); if (!inFlight) inFlight = performRefresh().finally(() => { inFlight = null; }); return inFlight; }
     async function bootstrapSession() {
         ensureActive(); deps.setPhase('initializing');
-        try { const result = await performRefresh({deferTerminalInvalid:true}); deps.legacyStorage?.remove(); return result; }
-        catch (refreshError) {
-            if (refreshError instanceof CoordinatorOperationSupersededError) throw refreshError;
-            const {code}=errorInfo(refreshError);
-            if (!legacyRead && code==='AUTH_TOKEN_INVALID' && deps.legacyStorage) { legacyRead=true; const legacy=deps.legacyStorage.readOnce(); if (legacy) { const migrationGeneration=credentialGeneration; try { const result=await untilDisposed(deps.migrate(legacy)); if(credentialGeneration!==migrationGeneration) throw new CoordinatorOperationSupersededError(); return install(result,true,true); } finally { deps.legacyStorage.remove(); } } transitionTerminal('AUTH_TOKEN_INVALID'); }
-            throw refreshError;
-        }
+        return performRefresh();
     }
     async function handleAuthFailure<T>(config: RetryableRequest,retry:(config:RetryableRequest)=>Promise<T>,error:unknown):Promise<T>{
         const {code}=errorInfo(error); if(code!=='AUTH_ACCESS_EXPIRED'||config._authRetried||config.url?.includes('/auth/refresh')||!isReplayEligible(config)) throw error;

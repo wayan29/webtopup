@@ -21,7 +21,6 @@ test('locking a session cancels its scheduled proactive refresh', async () => {
             refreshCalls += 1;
             throw new Error('proactive refresh must not run while locked');
         },
-        migrate: async () => { throw new Error('unused'); },
         tokenStore: {
             get: () => storedToken,
             set: (value) => { storedToken = value; },

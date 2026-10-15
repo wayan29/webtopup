@@ -4,9 +4,8 @@ import { createBrowserAuthChannel, type AuthChannel } from './channel.ts';
 import { createAuthCoordinator } from './coordinator.ts';
 import type { AuthPhase, RefreshResponse, SessionPolicy } from './types.ts';
 
-const LEGACY_TOKEN_KEY = 'token';
 const CSRF_COOKIE = 'wb_csrf';
-const CANONICAL_SID = /^[0-9a-f]{24}$/;
+const CANONICAL_SID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const STAFF_ROLES = new Set(['owner', 'admin', 'cs']);
 
 export type SessionUser = {
@@ -47,89 +46,55 @@ function parseSessionPolicy(
     session: Record<string, unknown> | undefined,
     accessToken: string,
     roleClass: SessionPolicy['roleClass'],
+    user: Record<string, unknown>,
 ): SessionPolicy {
+    const payload = decodeJwtPayload(accessToken);
     const sid = typeof session?.sid === 'string' ? session.sid : typeof session?.sessionId === 'string' ? session.sessionId : '';
-    let accessExpiresAt = typeof session?.accessExpiresAt === 'string' ? session.accessExpiresAt : '';
-    if (!accessExpiresAt) {
-        const payload = decodeJwtPayload(accessToken);
-        if (typeof payload?.exp === 'number' && Number.isFinite(payload.exp)) {
-            accessExpiresAt = new Date(payload.exp * 1000).toISOString();
-        } else {
-            accessExpiresAt = new Date(Date.now() + 300_000).toISOString();
-        }
+    if (!payload || payload.tokenType !== 'access'
+        || typeof payload.sid !== 'string' || !CANONICAL_SID.test(payload.sid)
+        || typeof payload.sub !== 'string' || !CANONICAL_SID.test(payload.sub)
+        || payload.sub !== user.id || payload.role !== user.role
+        || !CANONICAL_SID.test(sid) || sid !== payload.sid) {
+        throw new Error('Invalid auth credential identity binding');
     }
-    let sidFinal = sid;
-    if (!sidFinal) {
-        const payload = decodeJwtPayload(accessToken);
-        sidFinal = typeof payload?.sid === 'string' ? payload.sid : '';
+    if (typeof payload.exp !== 'number' || !Number.isSafeInteger(payload.exp)
+        || typeof payload.iat !== 'number' || !Number.isSafeInteger(payload.iat)
+        || payload.exp <= payload.iat) throw new Error('Invalid auth access expiry');
+    const expiry = new Date(payload.exp * 1000);
+    if (!Number.isFinite(expiry.getTime())) throw new Error('Invalid auth access expiry');
+    const accessExpiresAt = session?.accessExpiresAt;
+    if (typeof accessExpiresAt !== 'string' || !Number.isFinite(Date.parse(accessExpiresAt))
+        || Math.floor(Date.parse(accessExpiresAt) / 1000) !== payload.exp) {
+        throw new Error('Auth access expiry mismatch');
     }
-    return { sid: sidFinal, roleClass, accessExpiresAt };
+    if (session?.roleClass !== roleClass) throw new Error('Auth role class mismatch');
+    return { sid, roleClass, accessExpiresAt };
 }
 
 export function parseValidatedRefreshResponse(data: Record<string, unknown>): RefreshResponse {
-    const accessToken = typeof data.accessToken === 'string' ? data.accessToken : typeof data.token === 'string' ? data.token : '';
+    const accessToken = typeof data.accessToken === 'string' ? data.accessToken : '';
     if (!accessToken) throw new Error('Missing access token in auth response');
     const roleClass = authoritativeRoleClass(data.user);
+    const user = data.user as Record<string, unknown>;
+    if (typeof user.id !== 'string' || !CANONICAL_SID.test(user.id)) throw new Error('Invalid auth user id');
+    const session = data.session;
+    if (!session || typeof session !== 'object' || Array.isArray(session)) throw new Error('Missing auth session');
     return {
         accessToken,
-        policy: parseSessionPolicy(data.session as Record<string, unknown> | undefined, accessToken, roleClass),
-        user: data.user,
+        policy: parseSessionPolicy(session as Record<string, unknown>, accessToken, roleClass, user),
+        user,
     };
-}
-
-function parseUnlockUser(user: unknown): SessionUser {
-    if (!user || typeof user !== 'object') throw new Error('Invalid unlock user');
-    const record = user as Record<string, unknown>;
-    const id = typeof record.id === 'string' ? record.id.trim() : '';
-    const name = typeof record.name === 'string' ? record.name.trim() : '';
-    const email = typeof record.email === 'string' ? record.email.trim() : '';
-    const role = record.role;
-    if (!id || !name || !email) throw new Error('Invalid unlock user identity');
-    if (role !== 'owner' && role !== 'admin' && role !== 'cs') throw new Error('Invalid unlock user role');
-    return { ...record, id, name, email, role } as SessionUser;
 }
 
 export function parseValidatedUnlockResponse(data: Record<string, unknown>): RefreshResponse & { user: SessionUser } {
-    const accessToken = typeof data.accessToken === 'string' ? data.accessToken : typeof data.token === 'string' ? data.token : '';
-    if (!accessToken) throw new Error('Missing access token in unlock response');
-
-    const session = data.session as Record<string, unknown> | undefined;
-    let sid = typeof session?.sid === 'string' ? session.sid : typeof session?.sessionId === 'string' ? session.sessionId : '';
-    let accessExpiresAt = typeof session?.accessExpiresAt === 'string' ? session.accessExpiresAt : '';
-    const roleClassRaw = session?.roleClass;
-
-    const payload = decodeJwtPayload(accessToken);
-    const jwtSid = typeof payload?.sid === 'string' && CANONICAL_SID.test(payload.sid) ? payload.sid : '';
-
-    if (!CANONICAL_SID.test(sid) || !accessExpiresAt || !Number.isFinite(Date.parse(accessExpiresAt))) {
-        if (!CANONICAL_SID.test(sid) && jwtSid) sid = jwtSid;
-        if ((!accessExpiresAt || !Number.isFinite(Date.parse(accessExpiresAt))) && typeof payload?.exp === 'number' && Number.isFinite(payload.exp)) {
-            accessExpiresAt = new Date(payload.exp * 1000).toISOString();
-        }
+    const result = parseValidatedRefreshResponse(data);
+    const user = result.user as Record<string, unknown>;
+    if (result.policy.roleClass !== 'staff' || !STAFF_ROLES.has(String(user.role))) throw new Error('Invalid unlock user role');
+    if (typeof user.name !== 'string' || !user.name.trim() || typeof user.email !== 'string' || !user.email.trim()) {
+        throw new Error('Invalid unlock user identity');
     }
-
-    if (jwtSid && CANONICAL_SID.test(sid) && jwtSid !== sid) throw new Error('Unlock session id mismatch');
-    if (!CANONICAL_SID.test(sid)) throw new Error('Invalid unlock session id');
-    if (!accessExpiresAt || !Number.isFinite(Date.parse(accessExpiresAt))) throw new Error('Invalid unlock access expiry');
-
-    const roleClass: SessionPolicy['roleClass'] =
-        roleClassRaw === 'staff'
-            ? 'staff'
-            : roleClassRaw === 'member'
-                ? 'member'
-                : typeof session?.role === 'string' && STAFF_ROLES.has(session.role)
-                    ? 'staff'
-                    : 'member';
-    if (roleClass !== 'staff') throw new Error('Invalid unlock role class');
-
-    const user = parseUnlockUser(data.user);
-    if (!STAFF_ROLES.has(user.role)) throw new Error('Unlock user role mismatch');
-
-    return {
-        accessToken,
-        policy: { sid, roleClass, accessExpiresAt },
-        user,
-    };
+    // Shared response validation establishes UUID identity and the role union before installation.
+    return { ...result, user: user as SessionUser };
 }
 
 type RuntimeCallbacks = {
@@ -158,31 +123,8 @@ export function initAuthSessionRuntime(
         onTerminal: callbacks.onTerminal,
         delay: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
         now: () => Date.now(),
-        legacyStorage: {
-            readOnce: () => {
-                try {
-                    return localStorage.getItem(LEGACY_TOKEN_KEY);
-                } catch {
-                    return null;
-                }
-            },
-            remove: () => {
-                try {
-                    localStorage.removeItem(LEGACY_TOKEN_KEY);
-                } catch {
-                    /* ignore */
-                }
-            },
-        },
         refresh: async () => {
             const res = await api.post('/auth/refresh', {}, { _skipAuthRefresh: true } as never);
-            return parseValidatedRefreshResponse(res.data as Record<string, unknown>);
-        },
-        migrate: async (legacyToken) => {
-            const res = await api.post('/auth/session/migrate', {}, {
-                headers: { Authorization: `Bearer ${legacyToken}` },
-                _skipAuthRefresh: true,
-            } as never);
             return parseValidatedRefreshResponse(res.data as Record<string, unknown>);
         },
     });
@@ -198,11 +140,6 @@ export function getAuthCoordinator() {
 }
 
 export function applyValidatedLoginResponse(validated: RefreshResponse): RefreshResponse {
-    try {
-        localStorage.removeItem(LEGACY_TOKEN_KEY);
-    } catch {
-        /* ignore */
-    }
     const active = coordinator;
     if (!active) throw new Error('Auth session runtime is not initialized');
     return active.installLocalCredential(validated);
