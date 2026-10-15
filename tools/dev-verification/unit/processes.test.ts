@@ -55,10 +55,10 @@ test('device-policy profile requires stable exact disposable Mongo identity', ()
   assert.throws(() => assertDevicePolicyTarget({ mongo: 27018 }, hello, marker, { ...hello, hosts: ['localhost:27018'] }, marker), /changed/);
 });
 
-test('disabled profile forces rollout and cutoff off despite inherited environment', () => {
-  const inherited = { SESSION_REFRESH_ENABLED: 'true', SESSION_REFRESH_MEMBER_COHORT_PERCENT: '100', SESSION_REFRESH_CS_COHORT_PERCENT: '100', SESSION_REFRESH_ADMIN_COHORT_PERCENT: '100', SESSION_REFRESH_OWNER_COHORT_PERCENT: '100', LEGACY_ACCESS_TOKEN_ACCEPT_UNTIL: '2099-01-01T00:00:00Z' };
+test('disabled profile forces rollout off despite inherited environment', () => {
+  const inherited = { SESSION_REFRESH_ENABLED: 'true', SESSION_REFRESH_MEMBER_COHORT_PERCENT: '100', SESSION_REFRESH_CS_COHORT_PERCENT: '100', SESSION_REFRESH_ADMIN_COHORT_PERCENT: '100', SESSION_REFRESH_OWNER_COHORT_PERCENT: '100' };
   const env = buildHostChildEnv({ inherited, shared: inherited, secrets: inherited, profile: 'disabled' });
-  assert.deepEqual({ enabled: env.SESSION_REFRESH_ENABLED, member: env.SESSION_REFRESH_MEMBER_COHORT_PERCENT, cs: env.SESSION_REFRESH_CS_COHORT_PERCENT, admin: env.SESSION_REFRESH_ADMIN_COHORT_PERCENT, owner: env.SESSION_REFRESH_OWNER_COHORT_PERCENT, cutoff: env.LEGACY_ACCESS_TOKEN_ACCEPT_UNTIL }, { enabled: 'false', member: '0', cs: '0', admin: '0', owner: '0', cutoff: '' });
+  assert.deepEqual({ enabled: env.SESSION_REFRESH_ENABLED, member: env.SESSION_REFRESH_MEMBER_COHORT_PERCENT, cs: env.SESSION_REFRESH_CS_COHORT_PERCENT, admin: env.SESSION_REFRESH_ADMIN_COHORT_PERCENT, owner: env.SESSION_REFRESH_OWNER_COHORT_PERCENT }, { enabled: 'false', member: '0', cs: '0', admin: '0', owner: '0' });
 });
 
 test('bounded rollout has final precedence over inherited and secret environments', () => {

@@ -10,8 +10,8 @@ set -uo pipefail
 
 PUBLIC_BASE="${PUBLIC_BASE:-https://danayasa.biz.id}"
 BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/webtopup}"
-BACKUP_DB="${BACKUP_DB:-POBB}"
-MONGO_CONTAINER="${MONGO_CONTAINER:-webtopup-mongo}"
+BACKUP_DB="${BACKUP_DB:-webtopup_pg_dev}"
+POSTGRES_CONTAINER="${POSTGRES_CONTAINER:-webtopup-pg-migration-postgres-1}"
 BACKUP_MAX_AGE_HOURS="${BACKUP_MAX_AGE_HOURS:-25}"
 DISK_WARN_PCT="${DISK_WARN_PCT:-85}"
 DISK_FAIL_PCT="${DISK_FAIL_PCT:-95}"
@@ -61,28 +61,19 @@ public="$(http_code "$PUBLIC_BASE/api/v2/health")"
 [ "$public" = 200 ] && record PASS "health:public" "200" \
   || record FAIL "health:public" "$public"
 
-# --- mongo -------------------------------------------------------------------
-MONGO_PROBE="$(docker exec "$MONGO_CONTAINER" mongosh --quiet admin --eval '
-let ok = "fail";
-try {
-  const ping = db.adminCommand({ ping: 1 });
-  const rs = db.adminCommand({ replSetGetStatus: 1 });
-  const primary = Array.isArray(rs.members) && rs.members.some((m) => m.state === 1);
-  ok = ping.ok === 1 && primary ? "ok" : "degraded";
-} catch (e) { ok = "fail"; }
-print(ok);' 2>/dev/null | tail -1 || echo fail)"
-case "$MONGO_PROBE" in
-  ok) record PASS "mongo:$MONGO_CONTAINER" "ping ok, primary present" ;;
-  degraded) record WARN "mongo:$MONGO_CONTAINER" "ping ok, no primary found" ;;
-  *) record FAIL "mongo:$MONGO_CONTAINER" "unreachable" ;;
-esac
+# --- postgres -----------------------------------------------------------------
+if docker exec "$POSTGRES_CONTAINER" pg_isready -h 127.0.0.1 -p 55432 -U migration_admin -d "$BACKUP_DB" >/dev/null 2>&1; then
+  record PASS "postgres:$POSTGRES_CONTAINER" "ready"
+else
+  record FAIL "postgres:$POSTGRES_CONTAINER" "not ready"
+fi
 
 # --- backup freshness --------------------------------------------------------
 NEWEST_BACKUP=""
 NEWEST_EPOCH=0
 if [ -d "$BACKUP_ROOT" ]; then
-  for f in "$BACKUP_ROOT"/daily/"$BACKUP_DB"-*.archive.gz \
-           "$BACKUP_ROOT"/weekly/"$BACKUP_DB"-*.archive.gz; do
+  for f in "$BACKUP_ROOT"/daily/"$BACKUP_DB"-*.dump.enc \
+           "$BACKUP_ROOT"/weekly/"$BACKUP_DB"-*.dump.enc; do
     [ -f "$f" ] || continue
     m="$(stat -c %Y "$f")"
     if [ "$m" -gt "$NEWEST_EPOCH" ]; then NEWEST_EPOCH="$m"; NEWEST_BACKUP="$f"; fi

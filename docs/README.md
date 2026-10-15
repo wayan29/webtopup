@@ -12,6 +12,11 @@
 - [API_V2_TRANSACTION_CREATE_DRY_RUN_TEMPLATE.md](project/API_V2_TRANSACTION_CREATE_DRY_RUN_TEMPLATE.md): template bukti dry-run transaksi
 - [API_V2_TRANSACTION_CREATE_REVIEW.md](project/API_V2_TRANSACTION_CREATE_REVIEW.md): review endpoint create transaction v2
 
+## Database Migration Planning
+
+- [PostgreSQL + Redis migration plan](superpowers/plans/2026-10-14-postgresql-redis-migration-plan.md): rancangan perubahan storage, kontrak keamanan/transaksi, fresh start, dan cutover; belum diimplementasikan.
+- [PostgreSQL + Redis migration tasks](superpowers/plans/2026-10-14-postgresql-redis-migration-tasks.md): checklist berurutan, dependensi, acceptance criteria, dan bukti verifikasi.
+
 ## GitHub & Workflow
 
 - [GITHUB_SETUP.md](github/GITHUB_SETUP.md): setup awal repository GitHub

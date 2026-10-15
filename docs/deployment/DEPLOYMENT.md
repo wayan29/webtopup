@@ -6,6 +6,15 @@ Production configuration must use **safe placeholders only** until real secrets 
 
 **Replace every `.invalid` host and every `replace-with-*` / `<same-as-*>` placeholder with your real values before running Certbot, curl, Nginx enablement, or any live deploy command.**
 
+### Current server domain deployment (2026-10-14)
+
+- Public origin: `https://danayasa.com`; HTTP and `www` redirect to this origin.
+- Nginx config: `/etc/nginx/conf.d/danayasa.com.conf`, proxying to `127.0.0.1:9016`.
+- PM2 services: `webtopup-gateway` (Bun 1.4) and `webtopup-rust-api` (`127.0.0.1:9010`); process list saved.
+- Node `PUBLIC_APP_URL` and Rust `API_V2_ALLOWED_ORIGIN` use the public HTTPS origin. Gateway uses `NODE_ENV=production` for secure cookies; providers remain sandbox.
+- Let's Encrypt certificate covers apex and `www`; renewal deploy hook `/etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh` validates and reloads Nginx.
+- Cloudflare proxy is enabled; operators should use Full (strict) TLS. This does not make standalone MongoDB transaction-capable: financial and slider readiness gates remain in effect.
+
 ## 1. Prerequisites
 
 - **Node.js** `^20.19.0` or `>=22.12.0` (required by Vite 7). Recommend current supported LTS that satisfies this range (Node 22 LTS, or Node 20.19+)

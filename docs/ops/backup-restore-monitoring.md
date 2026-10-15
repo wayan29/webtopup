@@ -1,100 +1,33 @@
-# Backup, Restore, dan Monitoring — Runbook Operasional
+# Backup, Restore, dan Monitoring — PostgreSQL
 
-Status: **teruji** (backup + restore-verify + status report diuji pada 2026-08-17; restore diuji hanya ke database disposable `webtopup_task14_dev`).
+Status: teruji pada 2026-10-14. Restore hanya menuju `webtopup_restore_proof`.
 
-## Lingkup
+## Kebijakan
 
-| Komponen | Alat | Jalur |
-|---|---|---|
-| Backup Mongo produksi | `scripts/ops/backup-mongo.sh` | `/var/backups/webtopup/{daily,weekly}/` |
-| Uji restore (disposable) | `scripts/ops/restore-mongo-verify.sh` | database `webtopup_task14_dev` di port 27018 |
-| Monitoring ringan | `scripts/ops/status-report.sh` | output teks/JSON, exit code |
-
-Fakta lingkungan:
-
-- Produksi: container Docker `webtopup-mongo` (mongo:7, replica set `rs0`, port `127.0.0.1:27017`), database `POBB`.
-- Host tidak punya `mongodump`/`mongorestore`; semua tooling Mongo berjalan via `docker exec` image mongo.
-- Stack disposable (compose project `webtopup-task14-dev`) menjalankan mongod sendiri di port **27018** dengan volume sendiri — terisolasi penuh dari produksi.
+- RPO: 24 jam.
+- RTO: 4 jam.
+- Redis menyimpan cache dan rate limit. Kehilangan data Redis saat restart diterima; data uang, sesi, dan idempotensi tetap di PostgreSQL.
+- Backup memakai `pg_dump --format=custom`, dienkripsi AES-256-CBC, mode file `0600`, disertai SHA-256 dan manifest jumlah baris.
+- Credential tidak ditulis ke nama file, manifest, atau output skrip.
 
 ## Backup
 
 ```bash
-sudo /home/danayasa/proyek/webtopup/scripts/ops/backup-mongo.sh daily    # retensi 7 terakhir
-sudo /home/danayasa/proyek/webtopup/scripts/ops/backup-mongo.sh weekly   # retensi 4 terakhir
+PGPASSWORD="$PGPASSWORD" BACKUP_ENCRYPTION_KEY="$BACKUP_ENCRYPTION_KEY" \
+  scripts/ops/backup-postgres.sh daily
 ```
 
-Jaminan tiap run:
+Retensi default: 7 backup harian dan 4 backup mingguan. Sumber `pobb`, `ppob`, dan `webtopup` ditolak.
 
-1. `flock` mencegah tumpang-tindih.
-2. `mongodump --archive --gzip` (read-only terhadap database).
-3. Arsip **divalidasi dulu** dengan `mongorestore --dryRun` (`0 document(s) failed to restore`) sebelum diterima; arsip yang gagal validasi tidak pernah dipublikasikan.
-4. Sidecar `.sha256` dan `.manifest.json` (jumlah dokumen per collection, ukuran, hash).
-5. Mode `0600`, direktori `0700`.
-6. Pruning retensi hanya menyentuh pola `<db>-*.archive.gz` (+ sidecar) pada bucket mode yang sama.
-
-Override via environment: `MONGO_CONTAINER`, `SOURCE_DB`, `BACKUP_ROOT`, `KEEP_DAILY`, `KEEP_WEEKLY`.
-
-## Uji restore (WAJIB disposable)
-
-Prosedur verifikasi bahwa backup benar-benar bisa direstore — hanya ke database disposable:
+## Restore
 
 ```bash
-cd /home/danayasa/proyek/webtopup
-
-# 1) Naikkan mongo disposable (port 27018, container terpisah, volume terpisah)
-docker compose -f compose.dev-verification.yml up -d mongo mongo-init
-
-# 2) Tunggu primary siap (keluar saat "true")
-until docker exec webtopup-task14-dev-mongo-1 mongosh --quiet \
-  'mongodb://127.0.0.1:27018/admin?directConnection=true' \
-  --eval 'print(db.hello().isWritablePrimary)' | grep -q true; do sleep 2; done
-
-# 3) Restore-verify arsip terbaru
-LATEST=$(sudo sh -c "ls -1t /var/backups/webtopup/daily/POBB-*.archive.gz | head -1")
-scripts/ops/restore-mongo-verify.sh "$LATEST" --drop
-
-# 4) Turunkan kembali stack disposable
-docker compose -f compose.dev-verification.yml down
+PGPASSWORD="$PGPASSWORD" BACKUP_ENCRYPTION_KEY="$BACKUP_ENCRYPTION_KEY" \
+  scripts/ops/restore-postgres-verify.sh /var/backups/webtopup-sql/daily/<arsip>.dump.enc
 ```
 
-Skrip restore menolak keras (exit 125/1) bila: nama DB target bukan persis `webtopup_task14_dev`, port target 27017, container adalah `webtopup-mongo`, checksum tidak cocok, atau target sudah berisi dokumen tanpa `--drop`. Verifikasi akhir membandingkan jumlah dokumen per collection dengan manifest backup (`ALL COUNTS MATCH`).
-
-## Disaster recovery produksi (MANUAL — tidak diotomasi)
-
-Direstore ke produksi **hanya** oleh operator secara manual, dengan urutan:
-
-1. Hentikan penulis: `sudo systemctl stop webtopup-node webtopup-rust`.
-2. Buat backup kondisi-rusak dulu: `sudo scripts/ops/backup-mongo.sh daily` (agar ada jejak forensik).
-3. Restore arsip terpilih ke `POBB`:
-   ```bash
-   sudo sh -c 'docker exec -i webtopup-mongo mongorestore --archive --gzip --drop --nsInclude="POBB.*" < /var/backups/webtopup/daily/POBB-<pilih>.archive.gz'
-   ```
-4. Bandingkan jumlah per collection dengan `.manifest.json` arsip yang dipakai.
-5. Nyalakan ulang: `sudo systemctl start webtopup-rust webtopup-node`, lalu jalankan `scripts/ops/status-report.sh` dan smoke test UI.
-6. Catat insiden + arsip yang dipakai di `/var/backups/webtopup/` (catatan tekstual).
-
-Tidak ada jalur otomatis yang bisa menimpa `POBB`; skrip restore selalu menargetkan disposable.
+Target selain `webtopup_restore_proof` ditolak. Skrip juga menolak sumber yang sama dengan target. Setelah restore, bandingkan owner, katalog, order, dan ledger dengan manifest.
 
 ## Monitoring
 
-```bash
-scripts/ops/status-report.sh            # laporan teks lengkap
-scripts/ops/status-report.sh --quiet    # hanya WARN/FAIL + ringkasan
-scripts/ops/status-report.sh --json     # JSON; kirim ke webhook bila ALERT_WEBHOOK diset & ada FAIL
-```
-
-Cek: unit systemd (`webtopup-rust`, `webtopup-node`, `docker`), health lokal Rust/Node, health publik via Cloudflare, ping Mongo + keberadaan PRIMARY, kesegaran backup (default maks 25 jam), dan pemakaian disk (`/` dan `/var/backups`; WARN ≥ 85%, FAIL ≥ 95%). Exit 0 hanya bila tidak ada FAIL.
-
-## Cron ops (TERPASANG 2026-08-17)
-
-File `/etc/cron.d/webtopup-ops` (root:root 644) aktif di daemon cron:
-
-```cron
-15 2 * * *  root /home/danayasa/proyek/webtopup/scripts/ops/backup-mongo.sh daily  >> /var/log/webtopup/backup.log 2>&1
-20 2 * * 0  root /home/danayasa/proyek/webtopup/scripts/ops/backup-mongo.sh weekly >> /var/log/webtopup/backup.log 2>&1
-*/10 * * * * root /home/danayasa/proyek/webtopup/scripts/ops/status-report.sh --quiet >> /var/log/webtopup/status.log 2>&1
-```
-
-Bukti pasang: journal cron `22:10:01` mengeksekusi status-report tepat jadwal (`SUMMARY pass=10 warn=0 fail=0` di `/var/log/webtopup/status.log`, file 600 root:root); backup daily/weekly disimulasikan manual sukses sebelum pemasangan. Higienitas: direktori `/var/backups/webtopup/{daily,weekly}` 700 root:root, arsip 600, log 600.
-
-Saat ini `ALERT_WEBHOOK` belum diset (monitoring pasif via log). Bila ingin notifikasi aktif, tambahkan variabel tersebut pada baris status di file cron.
+`scripts/ops/status-report.sh` memeriksa health gateway, kesegaran backup, dan disk. Backup dianggap gagal bila usia arsip terbaru melewati 25 jam. Ambang disk: peringatan 85%, gagal 95%.

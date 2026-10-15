@@ -400,7 +400,6 @@ async function startDisabledRust(shared: Env, rust: Env): Promise<ChildProcess> 
     SESSION_REFRESH_CS_COHORT_PERCENT: '0',
     SESSION_REFRESH_ADMIN_COHORT_PERCENT: '100',
     SESSION_REFRESH_OWNER_COHORT_PERCENT: '0',
-    LEGACY_ACCESS_TOKEN_ACCEPT_UNTIL: '',
     OTEL_ENABLED: 'false',
   };
   const child = spawn(path.join(root, 'rust-api', 'target', 'debug', 'webtopup-rust-api'), [], { cwd: path.join(root, 'rust-api'), env, stdio: ['ignore', 'ignore', 'ignore'] });

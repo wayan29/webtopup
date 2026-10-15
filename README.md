@@ -41,6 +41,12 @@ Jika Rust belum terpasang, install lewat rustup:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+Open API partner secrets are stored as encrypted PostgreSQL envelopes. Configure a distinct
+`OPEN_API_ENCRYPTION_KEY` for the Rust API before issuing keys. Generate it with
+`openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n'` and store the output in the deployment
+secret manager; never commit an actual key or reuse JWT/session encryption keys. Missing or
+malformed keys fail closed for Open API credential issue and signature verification.
+
 ```
 
 ## Quick Start

@@ -9,6 +9,13 @@ Operator procedure for refresh-backed sessions, security audits, metrics gates, 
 
 The `auth_parallel_waiter` metric is unavailable/PENDING until a trusted coordinator exporter exists. It is excluded from rollout gates and denominators. Rust's `auth_refresh_outcome` is the authoritative refresh denominator; Node gateway metrics are operationally informative only and are excluded from that denominator.
 
+### SQL candidate: idle unlock verification
+
+For the PostgreSQL candidate, `POST /v2/auth/unlock` must reach the credential-pair handler without ordinary bearer admission in the global enrollment middleware. The handler still verifies the proxy secret, session state, refresh/recovery proofs, password, and enabled OTP before rotating credentials. Other methods and neighboring paths remain subject to normal admission.
+
+`scripts/smoke/sql-browser-auth-smoke.js` verifies staff login, forced idle lock, browser unlock, logout, and SQL session revocation against a disposable `webtopup_ci_*` database. Run a local HTTP gateway with `NODE_ENV=development`; production Secure cookies require HTTPS. Use a fresh Redis namespace for isolated runs, not shared rate-limit state.
+
+
 ---
 
 ## 1. Prerequisites (cookie / TLS / secrets)

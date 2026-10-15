@@ -387,7 +387,6 @@ test('local login supersedes an older anonymous bootstrap failure', async () => 
   let memoryToken: string | null = null;
   const coordinator = createAuthCoordinator({
     refresh: () => bootstrapResponse,
-    migrate: async () => { throw new Error('not used'); },
     tokenStore: { get: () => memoryToken, set: (value) => { memoryToken = value; }, clear: () => { memoryToken = null; } },
     channel: { post: () => undefined, subscribe: () => () => undefined, close: () => undefined },
     setPhase: (phase) => phases.push(phase),
@@ -395,7 +394,6 @@ test('local login supersedes an older anonymous bootstrap failure', async () => 
     onTerminal: (code) => terminal.push(code),
     delay: async () => undefined,
     now: () => 0,
-    legacyStorage: { readOnce: () => null, remove: () => undefined },
     scheduleTimer: () => 0 as unknown as ReturnType<typeof setTimeout>,
   });
   const bootstrap = coordinator.bootstrapSession();
@@ -414,7 +412,7 @@ test('logout supersedes an older refresh success', async () => {
   const response = new Promise<{ accessToken: string; policy: { sid: string; roleClass: 'staff'; accessExpiresAt: string } }>((resolve) => { resolveRefresh = resolve; });
   let memoryToken: string | null = null;
   const coordinator = createAuthCoordinator({
-    refresh: () => response, migrate: async () => { throw new Error('not used'); },
+    refresh: () => response,
     tokenStore: { get: () => memoryToken, set: (value) => { memoryToken = value; }, clear: () => { memoryToken = null; } },
     channel: { post: () => undefined, subscribe: () => () => undefined, close: () => undefined },
     setPhase: () => undefined, onAuthenticated: () => undefined, onTerminal: () => undefined,
@@ -436,7 +434,7 @@ test('remote revocation supersedes an older refresh success', async () => {
   let memoryToken: string | null = null;
   const phases: string[] = [];
   const coordinator = createAuthCoordinator({
-    refresh: () => response, migrate: async () => { throw new Error('not used'); },
+    refresh: () => response,
     tokenStore: { get: () => memoryToken, set: (value) => { memoryToken = value; }, clear: () => { memoryToken = null; } },
     channel: { post: () => undefined, subscribe: () => () => undefined, close: () => undefined },
     setPhase: (phase) => phases.push(phase), onAuthenticated: () => undefined, onTerminal: () => undefined,
@@ -454,39 +452,12 @@ test('remote revocation supersedes an older refresh success', async () => {
   coordinator.dispose();
 });
 
-test('local login supersedes a deferred legacy migration', async () => {
-  let rejectRefresh!: (error: unknown) => void;
-  let resolveMigration!: (result: { accessToken: string; policy: { sid: string; roleClass: 'staff'; accessExpiresAt: string } }) => void;
-  const refreshResponse = new Promise<never>((_, reject) => { rejectRefresh = reject; });
-  const migrationResponse = new Promise<{ accessToken: string; policy: { sid: string; roleClass: 'staff'; accessExpiresAt: string } }>((resolve) => { resolveMigration = resolve; });
-  let memoryToken: string | null = null;
-  const coordinator = createAuthCoordinator({
-    refresh: () => refreshResponse, migrate: () => migrationResponse,
-    tokenStore: { get: () => memoryToken, set: (value) => { memoryToken = value; }, clear: () => { memoryToken = null; } },
-    channel: { post: () => undefined, subscribe: () => () => undefined, close: () => undefined },
-    setPhase: () => undefined, onAuthenticated: () => undefined, onTerminal: () => undefined,
-    delay: async () => undefined, now: () => 0,
-    legacyStorage: { readOnce: () => 'legacy', remove: () => undefined },
-    scheduleTimer: () => 0 as unknown as ReturnType<typeof setTimeout>,
-  });
-  const bootstrap = coordinator.bootstrapSession();
-  rejectRefresh({ response: { status: 401, data: { error: { code: 'AUTH_TOKEN_INVALID' } } } });
-  await new Promise((resolve) => setImmediate(resolve));
-  const loginToken = token(3, 'login');
-  coordinator.installLocalCredential({ accessToken: loginToken, policy: { sid: 'a'.repeat(24), roleClass: 'staff', accessExpiresAt: '2099-01-01T00:00:00.000Z' } });
-  resolveMigration({ accessToken: token(2, 'migration'), policy: { sid: 'b'.repeat(24), roleClass: 'staff', accessExpiresAt: '2099-01-01T00:00:00.000Z' } });
-  await assert.rejects(bootstrap, { name: 'CoordinatorOperationSupersededError' });
-  assert.equal(memoryToken, loginToken);
-  coordinator.dispose();
-});
-
 test('local login supersedes an older anonymous bootstrap success', async () => {
   let resolveBootstrap!: (result: { accessToken: string; policy: { sid: string; roleClass: 'staff'; accessExpiresAt: string } }) => void;
   const bootstrapResponse = new Promise<{ accessToken: string; policy: { sid: string; roleClass: 'staff'; accessExpiresAt: string } }>((resolve) => { resolveBootstrap = resolve; });
   let memoryToken: string | null = null;
   const coordinator = createAuthCoordinator({
     refresh: () => bootstrapResponse,
-    migrate: async () => { throw new Error('not used'); },
     tokenStore: { get: () => memoryToken, set: (value) => { memoryToken = value; }, clear: () => { memoryToken = null; } },
     channel: { post: () => undefined, subscribe: () => () => undefined, close: () => undefined },
     setPhase: () => undefined,
@@ -494,7 +465,6 @@ test('local login supersedes an older anonymous bootstrap success', async () => 
     onTerminal: () => undefined,
     delay: async () => undefined,
     now: () => 0,
-    legacyStorage: { readOnce: () => null, remove: () => undefined },
     scheduleTimer: () => 0 as unknown as ReturnType<typeof setTimeout>,
   });
   const bootstrap = coordinator.bootstrapSession();

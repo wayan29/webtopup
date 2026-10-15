@@ -8,12 +8,24 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 35
     services:
-      mongo:
-        image: mongo:7
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: ci-postgres
+          POSTGRES_DB: webtopup_ci_mutation
         ports:
-          - 27017:27017
+          - 55432:5432
         options: >-
-          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ ping: 1 })'"
+          --health-cmd "pg_isready -U postgres -d webtopup_ci_mutation"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:8
+        ports:
+          - 56379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 10
@@ -23,10 +35,8 @@ jobs:
       API_V2_UPSTREAM_URL: http://127.0.0.1:9010
       API_V2_PROXY_SECRET: ci-api-v2-proxy-secret
       JWT_SECRET: ci-jwt-secret
-      MONGO_URI: mongodb://127.0.0.1:27017/webtopup_ci
-      MONGO_DB: webtopup_ci
-      SMOKE_MONGO_URI: mongodb://127.0.0.1:27017/webtopup_ci
-      SMOKE_MONGO_DB: webtopup_ci
+      DATABASE_URL: postgres://postgres:ci-postgres@127.0.0.1:55432/webtopup_ci_mutation
+      REDIS_URL: redis://127.0.0.1:56379/0
       SMOKE_EMAIL: api-v2-ci-admin@example.com
       SMOKE_PASSWORD: ApiV2CiAdmin2909!
       SMOKE_MEMBER_EMAIL: api-v2-member-smoke@example.com
@@ -57,6 +67,16 @@ jobs:
 
       - name: Build services
         run: npm run api-v2:build && npm run build
+
+      - name: Apply SQL migrations
+        run: node tools/postgres-migration/migrate.mjs
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: 55432
+          PGUSER: postgres
+          PGPASSWORD: ci-postgres
+          PGDATABASE: webtopup_ci_mutation
+          MIGRATION_DATABASE: webtopup_ci_mutation
 
       - name: Seed smoke fixtures
         run: npm run api-v2:seed:ci

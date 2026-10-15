@@ -24,7 +24,7 @@ export function faultProfilePorts(ports: Pick<VerificationPorts, 'node' | 'rust'
 }
 
 export function disabledRolloutEnv(): Record<string, string> {
-  return { SESSION_REFRESH_ENABLED: 'false', SESSION_REFRESH_MEMBER_COHORT_PERCENT: '0', SESSION_REFRESH_CS_COHORT_PERCENT: '0', SESSION_REFRESH_ADMIN_COHORT_PERCENT: '0', SESSION_REFRESH_OWNER_COHORT_PERCENT: '0', LEGACY_ACCESS_TOKEN_ACCEPT_UNTIL: '' };
+  return { SESSION_REFRESH_ENABLED: 'false', SESSION_REFRESH_MEMBER_COHORT_PERCENT: '0', SESSION_REFRESH_CS_COHORT_PERCENT: '0', SESSION_REFRESH_ADMIN_COHORT_PERCENT: '0', SESSION_REFRESH_OWNER_COHORT_PERCENT: '0' };
 }
 
 export function sessionTestRolloutEnv(): Record<string, string> {
@@ -47,8 +47,8 @@ export function devicePolicyRolloutEnv(): Record<string, string> {
   };
 }
 
-export function rolloutTransitionEnv(cutoff: string): Record<string, string> {
-  return { SESSION_REFRESH_ENABLED: 'true', SESSION_REFRESH_MEMBER_COHORT_PERCENT: '0', SESSION_REFRESH_CS_COHORT_PERCENT: '100', SESSION_REFRESH_ADMIN_COHORT_PERCENT: '0', SESSION_REFRESH_OWNER_COHORT_PERCENT: '0', LEGACY_ACCESS_TOKEN_ACCEPT_UNTIL: cutoff };
+export function rolloutTransitionEnv(): Record<string, string> {
+  return { SESSION_REFRESH_ENABLED: 'true', SESSION_REFRESH_MEMBER_COHORT_PERCENT: '0', SESSION_REFRESH_CS_COHORT_PERCENT: '100', SESSION_REFRESH_ADMIN_COHORT_PERCENT: '0', SESSION_REFRESH_OWNER_COHORT_PERCENT: '0' };
 }
 
 export function financePolicyRolloutEnv(): Record<string, string> {
@@ -67,10 +67,8 @@ export function buildHostChildEnv(input: {
   secrets: Record<string, string>;
   profile: ProcessManifest['profile'];
 }): NodeJS.ProcessEnv {
-  const rollout = input.profile === 'session-rollout-pre-cutoff'
-    ? rolloutTransitionEnv('2099-01-01T00:00:00Z')
-    : input.profile === 'session-rollout-post-cutoff'
-      ? rolloutTransitionEnv('2000-01-01T00:00:00Z')
+  const rollout = input.profile === 'session-rollout-pre-cutoff' || input.profile === 'session-rollout-post-cutoff'
+    ? rolloutTransitionEnv()
     : input.profile === 'session-device-policy'
     ? devicePolicyRolloutEnv()
     : input.profile === 'session-finance-policy' || input.profile === 'session-finance-fault'
@@ -78,7 +76,7 @@ export function buildHostChildEnv(input: {
     : input.profile === 'session-cs' || input.profile === 'session-cs-fault'
       ? sessionTestRolloutEnv()
       : disabledRolloutEnv();
-  return { ...input.inherited, ...input.shared, ...input.secrets, ...rollout, LEGACY_ACCESS_TOKEN_ACCEPT_UNTIL: rollout.LEGACY_ACCESS_TOKEN_ACCEPT_UNTIL ?? '', OTEL_ENABLED: 'false', MONGO_TRANSACTIONS_ENABLED: 'true' };
+  return { ...input.inherited, ...input.shared, ...input.secrets, ...rollout, OTEL_ENABLED: 'false', MONGO_TRANSACTIONS_ENABLED: 'true' };
 }
 
 export function assertDevicePolicyTarget(
