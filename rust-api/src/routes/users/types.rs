@@ -223,9 +223,10 @@ pub(super) struct LoginActivityResponse {
 pub(super) struct LoginActivityItem {
     #[serde(rename = "_id")]
     pub(super) id: String,
-    pub(super) ip: String,
-    #[serde(rename = "userAgent")]
-    pub(super) user_agent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ip: Option<String>,
+    #[serde(rename = "userAgent", skip_serializing_if = "Option::is_none")]
+    pub(super) user_agent: Option<String>,
     #[serde(rename = "createdAt")]
     pub(super) created_at: String,
 }

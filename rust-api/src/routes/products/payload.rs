@@ -1,74 +1,72 @@
-use axum::{response::IntoResponse, Json};
-use mongodb::bson::{oid::ObjectId, Bson, Document};
+use axum::{http::StatusCode, response::{IntoResponse, Response}, Json};
 use serde_json::Value;
+use sqlx::PgConnection;
+use uuid::Uuid;
 
-use crate::utils::bson::{read_i64, read_string};
+use crate::security::ErrorResponse;
 
 use super::{
-    id_from_bson, object_id, price_from_doc, resolve_category_by_id, resolve_category_by_name,
-    resolve_category_by_object_id, resolve_operator_by_id, resolve_operator_by_name,
-    resolve_operator_by_object_id, resolve_product_type, vendor_from_doc, AdminProductsQuery,
-    ProductNormalizedPayload, ProductPrice, ProductVendor,
+    status_message, ProductNormalizedPayload, ProductPrice, ProductVendor, ResolvedCategory,
+    ResolvedOperator, ResolvedProductType,
 };
 
 pub(super) async fn build_product_payload(
-    db: &mongodb::Database,
+    conn: &mut PgConnection,
     payload: &Value,
-    existing: Option<&Document>,
-) -> Result<ProductNormalizedPayload, axum::response::Response> {
+    existing: Option<&Value>,
+) -> Result<ProductNormalizedPayload, Response> {
     let name = field_string(payload, "name")
-        .or_else(|| existing.map(|document| read_string(document, "name")))
+        .or_else(|| existing.and_then(|value| value_string(value.get("name"))))
         .unwrap_or_default();
     if name.is_empty() {
         return Err(product_error("PRODUCT_NAME_REQUIRED"));
     }
     let code = field_string(payload, "code")
-        .or_else(|| existing.map(|document| read_string(document, "code")))
+        .or_else(|| existing.and_then(|value| value_string(value.get("code"))))
         .unwrap_or_default();
     if code.is_empty() {
         return Err(product_error("PRODUCT_CODE_REQUIRED"));
     }
 
-    let category_id_input = field_id(payload, "categoryId").or_else(|| {
-        existing.and_then(|document| non_empty_id_from_bson(document.get("categoryId")))
-    });
-    let operator_id_input = field_id(payload, "operatorId").or_else(|| {
-        existing.and_then(|document| non_empty_id_from_bson(document.get("operatorId")))
-    });
-    let product_type_id_input = field_id(payload, "productTypeId").or_else(|| {
-        existing.and_then(|document| non_empty_id_from_bson(document.get("productTypeId")))
-    });
+    let category_id_input = field_id(payload, "categoryId")
+        .or_else(|| existing.and_then(|value| value_string(value.get("categoryId"))));
+    let operator_id_input = field_id(payload, "operatorId")
+        .or_else(|| existing.and_then(|value| value_string(value.get("operatorId"))));
+    let product_type_id_input = field_id(payload, "productTypeId")
+        .or_else(|| existing.and_then(|value| value_string(value.get("productTypeId"))));
     let category_name_input = field_string(payload, "category")
-        .or_else(|| existing.map(|document| read_string(document, "category")))
+        .or_else(|| existing.and_then(|value| value_string(value.get("category"))))
         .unwrap_or_default();
     let brand_input = field_string(payload, "brand")
-        .or_else(|| existing.map(|document| read_string(document, "brand")))
+        .or_else(|| existing.and_then(|value| value_string(value.get("brand"))))
         .unwrap_or_default();
 
     let mut category = if let Some(id) = category_id_input
         .as_deref()
+        .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        let Some(object_id) = object_id(Some(id)) else {
+        let Some(id) = Uuid::parse_str(id).ok() else {
             return Err(product_error("INVALID_CATEGORY_ID"));
         };
-        let Some(category) = resolve_category_by_object_id(db, object_id).await else {
+        let Some(category) = resolve_category_by_id(conn, id).await else {
             return Err(product_error("CATEGORY_NOT_FOUND"));
         };
         Some(category)
     } else if !category_name_input.is_empty() {
-        resolve_category_by_name(db, &category_name_input).await
+        resolve_category_by_name(conn, &category_name_input).await
     } else {
         None
     };
     let mut operator = if let Some(id) = operator_id_input
         .as_deref()
+        .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        let Some(object_id) = object_id(Some(id)) else {
+        let Some(id) = Uuid::parse_str(id).ok() else {
             return Err(product_error("INVALID_OPERATOR_ID"));
         };
-        let Some(operator) = resolve_operator_by_object_id(db, object_id).await else {
+        let Some(operator) = resolve_operator_by_id(conn, id).await else {
             return Err(product_error("OPERATOR_NOT_FOUND"));
         };
         Some(operator)
@@ -77,21 +75,13 @@ pub(super) async fn build_product_payload(
     };
     let product_type = if let Some(id) = product_type_id_input
         .as_deref()
+        .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        let Some(object_id) = object_id(Some(id)) else {
+        let Some(id) = Uuid::parse_str(id).ok() else {
             return Err(product_error("INVALID_PRODUCT_TYPE_ID"));
         };
-        let query = AdminProductsQuery {
-            category: None,
-            category_id: None,
-            operator_id: None,
-            product_type_id: Some(object_id.to_hex()),
-            brand: None,
-            search: None,
-            status: None,
-        };
-        let Some(product_type) = resolve_product_type(db, &query).await else {
+        let Some(product_type) = resolve_product_type_by_id(conn, id).await else {
             return Err(product_error("PRODUCT_TYPE_NOT_FOUND"));
         };
         Some(product_type)
@@ -100,7 +90,7 @@ pub(super) async fn build_product_payload(
     };
     if operator.is_none() {
         if let Some(product_type) = &product_type {
-            operator = resolve_operator_by_id(db, &product_type.operator_id).await;
+            operator = resolve_operator_by_id(conn, product_type.operator_id).await;
             if operator.is_none() {
                 return Err(product_error("OPERATOR_NOT_FOUND"));
             }
@@ -108,7 +98,7 @@ pub(super) async fn build_product_payload(
     }
     if category.is_none() {
         if let Some(operator) = &operator {
-            category = resolve_category_by_id(db, &operator.category_id).await;
+            category = resolve_category_by_id(conn, operator.category_id).await;
             if category.is_none() {
                 return Err(product_error("CATEGORY_NOT_FOUND"));
             }
@@ -116,18 +106,18 @@ pub(super) async fn build_product_payload(
     }
     if category.is_none() {
         if let Some(product_type) = &product_type {
-            category = resolve_category_by_id(db, &product_type.category_id).await;
+            category = resolve_category_by_id(conn, product_type.category_id).await;
             if category.is_none() {
                 return Err(product_error("CATEGORY_NOT_FOUND"));
             }
         }
     }
     if operator.is_none() && !brand_input.is_empty() {
-        operator = resolve_operator_by_name(db, &brand_input, category.as_ref()).await;
+        operator = resolve_operator_by_name(conn, &brand_input, category.as_ref()).await;
     }
     if category.is_none() {
         if let Some(operator) = &operator {
-            category = resolve_category_by_id(db, &operator.category_id).await;
+            category = resolve_category_by_id(conn, operator.category_id).await;
             if category.is_none() {
                 return Err(product_error("CATEGORY_NOT_FOUND"));
             }
@@ -146,23 +136,23 @@ pub(super) async fn build_product_payload(
     if operator.category_id != category.id {
         return Err(product_error("OPERATOR_CATEGORY_MISMATCH"));
     }
-    if product_type.operator_id != operator.object_id.to_hex() {
+    if product_type.operator_id != operator.id {
         return Err(product_error("PRODUCT_TYPE_OPERATOR_MISMATCH"));
     }
     if product_type.category_id != category.id {
         return Err(product_error("PRODUCT_TYPE_CATEGORY_MISMATCH"));
     }
 
-    let payment_type = field_string_raw(payload, "paymentType")
-        .or_else(|| existing.map(|document| read_string(document, "paymentType")))
+    let payment_type = field_string(payload, "paymentType")
+        .or_else(|| existing.and_then(|value| value_string(value.get("paymentType"))))
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "prabayar".to_string());
     if payment_type != "prabayar" && payment_type != "pascabayar" {
         return Err(product_error("INVALID_PAYMENT_TYPE"));
     }
     let fallback_price = existing
-        .and_then(|document| document.get_document("price").ok())
-        .map(price_from_doc)
+        .and_then(|value| value.get("price"))
+        .map(price_from_value)
         .unwrap_or_default();
     let price = if let Some(price) = payload.get("price") {
         normalize_price_value(price, fallback_price)
@@ -173,17 +163,17 @@ pub(super) async fn build_product_payload(
         .map(normalize_non_negative_number)
         .unwrap_or_else(|| {
             existing
-                .map(|document| read_i64(document, "costPrice"))
+                .and_then(|value| value.get("costPrice").and_then(Value::as_i64))
                 .unwrap_or_default()
         });
     let reward_points = field_number(payload, "rewardPoints")
         .map(|value| normalize_non_negative_number(value.round()))
         .unwrap_or_else(|| {
             existing
-                .map(|document| read_i64(document, "rewardPoints"))
+                .and_then(|value| value.get("rewardPoints").and_then(Value::as_i64))
                 .unwrap_or_default()
         });
-    let previous_icon = existing.map(|document| read_string(document, "icon"));
+    let previous_icon = existing.and_then(|value| value_string(value.get("icon")));
     let icon = field_string(payload, "icon")
         .or_else(|| previous_icon.clone())
         .unwrap_or_default();
@@ -200,8 +190,8 @@ pub(super) async fn build_product_payload(
         return Err(response);
     }
     let fallback_vendor = existing
-        .and_then(|document| document.get_document("vendor").ok())
-        .map(vendor_from_doc)
+        .and_then(|value| value.get("vendor"))
+        .map(vendor_from_value)
         .unwrap_or_default();
     let vendor = if let Some(vendor) = payload.get("vendor") {
         ProductVendor {
@@ -213,7 +203,7 @@ pub(super) async fn build_product_payload(
     };
     let status = field_bool(payload, "status").unwrap_or_else(|| {
         existing
-            .and_then(|document| document.get_bool("status").ok())
+            .and_then(|value| value.get("status").and_then(Value::as_bool))
             .unwrap_or(true)
     });
     let sort_order = if payload.get("sortOrder").is_some() {
@@ -221,22 +211,18 @@ pub(super) async fn build_product_payload(
             field_number(payload, "sortOrder").unwrap_or_default(),
         ))
     } else {
-        existing.and_then(|document| {
-            document
-                .get("sortOrder")
-                .map(|_| read_i64(document, "sortOrder"))
-        })
+        existing.and_then(|value| value.get("sortOrder").and_then(Value::as_i64))
     };
 
     Ok(ProductNormalizedPayload {
+        category: category.name,
+        category_id: category.id,
+        operator_id: operator.id,
+        product_type_id: product_type.id,
+        brand: operator.name,
         name,
         code,
-        category: category.name,
-        category_id: ObjectId::parse_str(&category.id).unwrap_or_else(|_| ObjectId::new()),
-        operator_id: operator.object_id,
-        product_type_id: product_type.object_id,
         payment_type,
-        brand: operator.name,
         cost_price,
         price,
         reward_points,
@@ -247,12 +233,107 @@ pub(super) async fn build_product_payload(
     })
 }
 
-fn field_string(payload: &Value, key: &str) -> Option<String> {
-    field_string_raw(payload, key).map(|value| value.trim().to_string())
+pub(super) async fn resolve_category_by_id(
+    conn: &mut PgConnection,
+    id: Uuid,
+) -> Option<ResolvedCategory> {
+    sqlx::query_as::<_, (Uuid, String)>("SELECT id,name FROM categories WHERE id=$1")
+        .bind(id)
+        .fetch_optional(conn)
+        .await
+        .ok()
+        .flatten()
+        .map(|(id, name)| ResolvedCategory { id, name })
 }
 
-fn field_string_raw(payload: &Value, key: &str) -> Option<String> {
-    payload.get(key).and_then(value_to_string)
+pub(super) async fn resolve_category_by_name(
+    conn: &mut PgConnection,
+    name: &str,
+) -> Option<ResolvedCategory> {
+    sqlx::query_as::<_, (Uuid, String)>(
+        "SELECT id,name FROM categories WHERE lower(name)=lower($1) ORDER BY id LIMIT 1",
+    )
+    .bind(name.trim())
+    .fetch_optional(conn)
+    .await
+    .ok()
+    .flatten()
+    .map(|(id, name)| ResolvedCategory { id, name })
+}
+
+pub(super) async fn resolve_operator_by_id(
+    conn: &mut PgConnection,
+    id: Uuid,
+) -> Option<ResolvedOperator> {
+    sqlx::query_as::<_, (Uuid, String, Uuid)>(
+        "SELECT id,name,category_id FROM operators WHERE id=$1",
+    )
+    .bind(id)
+    .fetch_optional(conn)
+    .await
+    .ok()
+    .flatten()
+    .map(|(id, name, category_id)| ResolvedOperator {
+        id,
+        name,
+        category_id,
+    })
+}
+
+pub(super) async fn resolve_operator_by_name(
+    conn: &mut PgConnection,
+    name: &str,
+    category: Option<&ResolvedCategory>,
+) -> Option<ResolvedOperator> {
+    let row = match category {
+        Some(category) => {
+            sqlx::query_as::<_, (Uuid, String, Uuid)>(
+                "SELECT id,name,category_id FROM operators WHERE lower(name)=lower($1) AND category_id=$2 ORDER BY sort_order,name,id LIMIT 1",
+            )
+            .bind(name.trim())
+            .bind(category.id)
+            .fetch_optional(conn)
+            .await
+        }
+        None => {
+            sqlx::query_as::<_, (Uuid, String, Uuid)>(
+                "SELECT id,name,category_id FROM operators WHERE lower(name)=lower($1) ORDER BY sort_order,name,id LIMIT 1",
+            )
+            .bind(name.trim())
+            .fetch_optional(conn)
+            .await
+        }
+    };
+    row.ok()
+        .flatten()
+        .map(|(id, name, category_id)| ResolvedOperator {
+            id,
+            name,
+            category_id,
+        })
+}
+
+pub(super) async fn resolve_product_type_by_id(
+    conn: &mut PgConnection,
+    id: Uuid,
+) -> Option<ResolvedProductType> {
+    sqlx::query_as::<_, (Uuid, Uuid, Uuid)>(
+        "SELECT id,category_id,operator_id FROM product_types WHERE id=$1",
+    )
+    .bind(id)
+    .fetch_optional(conn)
+    .await
+    .ok()
+    .flatten()
+    .map(|(id, category_id, operator_id)| ResolvedProductType {
+        id,
+        category_id,
+        operator_id,
+    })
+}
+
+fn field_string(payload: &Value, key: &str) -> Option<String> {
+    payload.get(key).and_then(value_to_string).map(|value| value.trim().to_string())
 }
 
 fn nested_field_string(payload: &Value, key: &str) -> Option<String> {
@@ -271,6 +352,10 @@ fn value_to_string(value: &Value) -> Option<String> {
     }
 }
 
+fn value_string(value: Option<&Value>) -> Option<String> {
+    value.and_then(value_to_string).map(|value| value.trim().to_string()).filter(|value| !value.is_empty())
+}
+
 fn field_id(payload: &Value, key: &str) -> Option<String> {
     let value = payload.get(key)?;
     if let Some(id) = value_to_string(value).map(|value| value.trim().to_string()) {
@@ -281,11 +366,6 @@ fn field_id(payload: &Value, key: &str) -> Option<String> {
         .and_then(value_to_string)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-}
-
-fn non_empty_id_from_bson(value: Option<&Bson>) -> Option<String> {
-    let id = id_from_bson(value);
-    (!id.trim().is_empty()).then_some(id)
 }
 
 fn field_number(payload: &Value, key: &str) -> Option<f64> {
@@ -316,27 +396,30 @@ fn field_bool(payload: &Value, key: &str) -> Option<bool> {
     }
 }
 
-fn normalize_price_value(value: &Value, fallback: ProductPrice) -> ProductPrice {
+fn price_from_value(value: &Value) -> ProductPrice {
     ProductPrice {
-        basic: value
-            .get("basic")
-            .and_then(number_from_value)
-            .map(normalize_non_negative_number)
-            .unwrap_or(fallback.basic),
-        gold: value
-            .get("gold")
-            .and_then(number_from_value)
-            .map(normalize_non_negative_number)
-            .unwrap_or(fallback.gold),
-        platinum: value
-            .get("platinum")
-            .and_then(number_from_value)
-            .map(normalize_non_negative_number)
-            .unwrap_or(fallback.platinum),
+        basic: value.get("basic").and_then(number_from_value).map(normalize_non_negative_number).unwrap_or_default(),
+        gold: value.get("gold").and_then(number_from_value).map(normalize_non_negative_number).unwrap_or_default(),
+        platinum: value.get("platinum").and_then(number_from_value).map(normalize_non_negative_number).unwrap_or_default(),
     }
 }
 
-fn normalize_non_negative_number(value: f64) -> i64 {
+fn vendor_from_value(value: &Value) -> ProductVendor {
+    ProductVendor {
+        name: nested_field_string(value, "name").unwrap_or_default(),
+        sku: nested_field_string(value, "sku").unwrap_or_default(),
+    }
+}
+
+fn normalize_price_value(value: &Value, fallback: ProductPrice) -> ProductPrice {
+    ProductPrice {
+        basic: value.get("basic").and_then(number_from_value).map(normalize_non_negative_number).unwrap_or(fallback.basic),
+        gold: value.get("gold").and_then(number_from_value).map(normalize_non_negative_number).unwrap_or(fallback.gold),
+        platinum: value.get("platinum").and_then(number_from_value).map(normalize_non_negative_number).unwrap_or(fallback.platinum),
+    }
+}
+
+pub(super) fn normalize_non_negative_number(value: f64) -> i64 {
     if !value.is_finite() || value < 0.0 {
         0
     } else {
@@ -344,7 +427,7 @@ fn normalize_non_negative_number(value: f64) -> i64 {
     }
 }
 
-fn product_error(code: &str) -> axum::response::Response {
+fn product_error(code: &str) -> Response {
     let message = match code {
         "PRODUCT_NAME_REQUIRED" => "Nama produk wajib diisi",
         "PRODUCT_CODE_REQUIRED" => "Kode produk wajib diisi",
@@ -364,8 +447,23 @@ fn product_error(code: &str) -> axum::response::Response {
         _ => "Internal Server Error",
     };
     (
-        axum::http::StatusCode::BAD_REQUEST,
-        Json(crate::security::ErrorResponse { message }),
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse { message }),
     )
         .into_response()
 }
+
+pub(super) fn unavailable() -> Response {
+    status_message(StatusCode::SERVICE_UNAVAILABLE, "Layanan database belum tersedia")
+}
+
+/// SQL LIKE pattern equivalent of the legacy case-insensitive contains regex.
+pub(super) fn like_pattern(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%{escaped}%")
+}
+
+

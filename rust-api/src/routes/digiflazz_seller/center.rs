@@ -2,281 +2,58 @@
 
 use std::sync::Arc;
 
-use axum::{
-    extract::State,
-    http::HeaderMap,
-    response::IntoResponse,
-    response::Response,
-    Json,
-};
-use futures_util::TryStreamExt;
-use mongodb::bson::{doc, Bson, DateTime, Document};
+use axum::{extract::State, http::HeaderMap, response::IntoResponse, response::Response, Json};
+use serde_json::Value;
+use sqlx::Row;
 
-use crate::{
-    routes::irs_seller,
-    security::require_proxy_context,
-    state::AppState,
-    utils::bson::{read_i64, read_string},
-};
+use crate::{security::require_proxy_context, state::AppState};
 
 use super::{
     SellerCenterDigiflazz, SellerCenterDigiflazzOrders, SellerCenterIrs, SellerCenterIssue,
     SellerCenterMappings, SellerCenterOrderCounts, SellerCenterSummaryResponse,
 };
 
-const SELLER_CONFIG_KEY: &str = "digiflazzSellerConfig";
-
 fn digiflazz_center_status(configured: bool, active_mappings: i64, present: bool) -> &'static str {
-    if !present {
-        "unavailable"
-    } else if !configured {
-        "needs_setup"
-    } else if active_mappings <= 0 {
-        "attention"
-    } else {
-        "ready"
-    }
+    if !present { "unavailable" } else if !configured { "needs_setup" } else if active_mappings <= 0 { "attention" } else { "ready" }
 }
-
 fn irs_center_status(enabled: bool, configured: bool, active_mappings: i64, present: bool) -> &'static str {
-    if !present {
-        "unavailable"
-    } else if !enabled {
-        "disabled"
-    } else if !configured {
-        "needs_setup"
-    } else if active_mappings <= 0 {
-        "attention"
-    } else {
-        "ready"
-    }
+    if !present { "unavailable" } else if !enabled { "disabled" } else if !configured { "needs_setup" } else if active_mappings <= 0 { "attention" } else { "ready" }
 }
+fn config_string(config: &Value, key: &str) -> String { config.get(key).and_then(Value::as_str).unwrap_or_default().trim().to_string() }
 
-/// Corrected pending callback count: only required, undelivered callbacks.
-fn center_callback_pending_expression() -> Document {
-    doc! { "$and": [
-        { "$eq": ["$callbackRequired", true] },
-        { "$eq": [ { "$ifNull": ["$callbackDeliveredAt", Bson::Null] }, Bson::Null ] }
-    ] }
-}
-
-async fn digiflazz_order_counts(
-    db: &mongodb::Database,
-) -> mongodb::error::Result<SellerCenterDigiflazzOrders> {
-    let mut cursor = db
-        .collection::<Document>("digiflazzsellerorders")
-        .aggregate(vec![doc! { "$group": {
-            "_id": Bson::Null,
-            "total": { "$sum": 1 },
-            "pending": { "$sum": { "$cond": [ { "$eq": ["$status", "pending"] }, 1, 0 ] } },
-            "failed": { "$sum": { "$cond": [ { "$eq": ["$status", "failed"] }, 1, 0 ] } },
-            "callbackPending": { "$sum": { "$cond": [ center_callback_pending_expression(), 1, 0 ] } }
-        } }])
-        .await?;
-    let doc = cursor.try_next().await?;
-    Ok(doc
-        .map(|doc| SellerCenterDigiflazzOrders {
-            total: read_i64(&doc, "total"),
-            pending: read_i64(&doc, "pending"),
-            failed: read_i64(&doc, "failed"),
-            callback_pending: read_i64(&doc, "callbackPending"),
-        })
-        .unwrap_or_default())
-}
-
-async fn irs_order_counts(db: &mongodb::Database) -> mongodb::error::Result<SellerCenterOrderCounts> {
-    let mut cursor = db
-        .collection::<Document>("irssellerorders")
-        .aggregate(vec![doc! { "$group": {
-            "_id": Bson::Null,
-            "total": { "$sum": 1 },
-            "pending": { "$sum": { "$cond": [ { "$eq": ["$status", "pending"] }, 1, 0 ] } },
-            "failed": { "$sum": { "$cond": [ { "$eq": ["$status", "failed"] }, 1, 0 ] } }
-        } }])
-        .await?;
-    let doc = cursor.try_next().await?;
-    Ok(doc
-        .map(|doc| SellerCenterOrderCounts {
-            total: read_i64(&doc, "total"),
-            pending: read_i64(&doc, "pending"),
-            failed: read_i64(&doc, "failed"),
-        })
-        .unwrap_or_default())
-}
-
-async fn mapping_counts(db: &mongodb::Database) -> mongodb::error::Result<SellerCenterMappings> {
-    let collection = db.collection::<Document>("digiflazzsellerproductmaps");
-    let total = collection.count_documents(doc! {}).await? as i64;
-    let active = collection
-        .count_documents(doc! { "isActive": true })
-        .await? as i64;
-    Ok(SellerCenterMappings { total, active })
-}
-
-async fn digiflazz_config(db: &mongodb::Database) -> mongodb::error::Result<Option<Document>> {
-    let document = db
-        .collection::<Document>("settings")
-        .find_one(doc! { "key": SELLER_CONFIG_KEY })
-        .await?;
-    Ok(document.and_then(|document| document.get_document("value").ok().cloned()))
-}
-
-pub async fn center_summary(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> Response {
-    if let Err(response) = require_proxy_context(&headers, &state) {
-        return response;
-    }
-    let Some(client) = &state.mongo_client else {
-        let response = SellerCenterSummaryResponse {
-            ok: false,
-            partial: false,
-            issues: vec![SellerCenterIssue::new(
-                "SELLER_CONFIG_UNAVAILABLE",
-                "mongodb.settings.digiflazzSeller",
-            )],
-            generated_at: rfc3339_now(),
-            digiflazz: SellerCenterDigiflazz {
-                configured: false,
-                ready: false,
-                status: "unavailable".to_string(),
-                orders: SellerCenterDigiflazzOrders::default(),
-            },
-            irs: SellerCenterIrs {
-                enabled: false,
-                configured: false,
-                ready: false,
-                status: "unavailable".to_string(),
-                orders: SellerCenterOrderCounts::default(),
-            },
-            mappings: SellerCenterMappings::default(),
-        };
-        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(response)).into_response();
-    };
-    let db = client.database(&state.mongo_db);
-    let mut issues: Vec<SellerCenterIssue> = Vec::new();
-
-    let seller_config = digiflazz_config(&db).await.map_err(|_| {
-        issues.push(SellerCenterIssue::new(
-            "SELLER_CONFIG_UNAVAILABLE",
-            "mongodb.settings.digiflazzSeller",
-        ));
-    });
-    let irs_config = irs_seller::stored_config(&db).await.map_err(|_| {
-        issues.push(SellerCenterIssue::new(
-            "IRS_CONFIG_UNAVAILABLE",
-            "mongodb.settings.irsSeller",
-        ));
-    });
-    let mappings = mapping_counts(&db).await.map_err(|_| {
-        issues.push(SellerCenterIssue::new(
-            "SELLER_MAPPING_SUMMARY_UNAVAILABLE",
-            "mongodb.digiflazzSellerMappings",
-        ));
-    });
-    let digiflazz_orders = digiflazz_order_counts(&db).await.map_err(|_| {
-        issues.push(SellerCenterIssue::new(
-            "SELLER_ORDER_SUMMARY_UNAVAILABLE",
-            "mongodb.digiflazzSellerOrders",
-        ));
-    });
-    let irs_orders = irs_order_counts(&db).await.map_err(|_| {
-        issues.push(SellerCenterIssue::new(
-            "IRS_ORDER_SUMMARY_UNAVAILABLE",
-            "mongodb.irsSellerOrders",
-        ));
-    });
-    issues.dedup_by(|left, right| left.code == right.code && left.source == right.source);
-
+pub async fn center_summary(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
+    if let Err(response) = require_proxy_context(&headers, &state) { return response; }
+    let mut issues = Vec::new();
+    let digiflazz_config = crate::services::seller_sql::stored_settings(&state.pg_pool,"digiflazz").await;
+    if digiflazz_config.is_err() { issues.push(SellerCenterIssue::new("SELLER_CONFIG_UNAVAILABLE","sql.seller_settings.digiflazz")); }
+    let irs_config = crate::services::seller_sql::stored_settings(&state.pg_pool,"irs").await;
+    if irs_config.is_err() { issues.push(SellerCenterIssue::new("IRS_CONFIG_UNAVAILABLE","sql.seller_settings.irs")); }
+    let mappings = sqlx::query("SELECT count(*)::bigint AS total,count(*) FILTER(WHERE enabled)::bigint AS active FROM seller_mappings WHERE channel='digiflazz'").fetch_one(&state.pg_pool).await;
+    if mappings.is_err() { issues.push(SellerCenterIssue::new("SELLER_MAPPING_SUMMARY_UNAVAILABLE","sql.seller_mappings.digiflazz")); }
+    let digiflazz_orders = sqlx::query("SELECT count(*)::bigint AS total,count(*) FILTER(WHERE o.status='pending')::bigint AS pending,count(*) FILTER(WHERE o.status='failed')::bigint AS failed,count(*) FILTER(WHERE c.delivered_at IS NULL AND c.ref_id IS NOT NULL)::bigint AS callback_pending FROM seller_orders o LEFT JOIN seller_callbacks c ON c.channel=o.channel AND c.ref_id=o.reference_id WHERE o.channel='digiflazz'").fetch_one(&state.pg_pool).await;
+    if digiflazz_orders.is_err() { issues.push(SellerCenterIssue::new("SELLER_ORDER_SUMMARY_UNAVAILABLE","sql.seller_orders.digiflazz")); }
+    let irs_orders = sqlx::query("SELECT count(*)::bigint AS total,count(*) FILTER(WHERE status='pending')::bigint AS pending,count(*) FILTER(WHERE status='failed')::bigint AS failed FROM seller_orders WHERE channel='irs'").fetch_one(&state.pg_pool).await;
+    if irs_orders.is_err() { issues.push(SellerCenterIssue::new("IRS_ORDER_SUMMARY_UNAVAILABLE","sql.seller_orders.irs")); }
     let mappings_present = mappings.is_ok();
-    let mappings = mappings.unwrap_or_default();
-    let active_mappings = if mappings_present {
-        mappings.active
-    } else {
-        -1
-    };
-
-    let (digiflazz_config_present, seller_configured) = match &seller_config {
-        Ok(config) => (
-            true,
-            config
-                .as_ref()
-                .map(|config| {
-                    !read_string(config, "username").is_empty()
-                        && !read_string(config, "apiKey").is_empty()
-                })
-                .unwrap_or(false),
-        ),
-        Err(_) => (false, false),
-    };
-    let digiflazz_status = digiflazz_center_status(
-        seller_configured,
-        active_mappings,
-        digiflazz_config_present && mappings_present,
-    );
-
-    let (irs_present, irs_enabled, irs_configured) = match &irs_config {
-        Ok(config) => {
-            let config = config.as_ref();
-            (
-                true,
-                config.map(|config| config.get_bool("enabled").unwrap_or(false)).unwrap_or(false),
-                config
-                    .map(|config| {
-                        !read_string(config, "merchantId").is_empty()
-                            && !read_string(config, "password").is_empty()
-                            && !read_string(config, "pin").is_empty()
-                            && !read_string(config, "secret").is_empty()
-                    })
-                    .unwrap_or(false),
-            )
-        }
-        Err(_) => (false, false, false),
-    };
-    let irs_status = irs_center_status(
-        irs_enabled,
-        irs_configured,
-        active_mappings,
-        irs_present && mappings_present,
-    );
-
-    let digiflazz_orders_present = digiflazz_orders.is_ok();
-    let irs_orders_present = irs_orders.is_ok();
-    let digiflazz_status = if digiflazz_orders_present {
-        digiflazz_status
-    } else {
-        "unavailable"
-    };
-    let irs_status = if irs_orders_present { irs_status } else { "unavailable" };
-
+    let (mapping_total,mapping_active) = mappings.map(|r|(r.get::<i64,_>("total"),r.get::<i64,_>("active"))).unwrap_or_default();
+    let mappings = SellerCenterMappings { total:mapping_total,active:mapping_active };
+    let digiflazz_config = digiflazz_config.unwrap_or_else(|_|serde_json::json!({}));
+    let seller_configured = !config_string(&digiflazz_config,"username").is_empty() && !config_string(&digiflazz_config,"apiKey").is_empty();
+    let mut digiflazz_status = digiflazz_center_status(seller_configured,if mappings_present {mapping_active} else {-1},digiflazz_config != serde_json::json!({}) || !issues.iter().any(|i|i.code=="SELLER_CONFIG_UNAVAILABLE") && mappings_present);
+    let irs_config = irs_config.unwrap_or_else(|_|serde_json::json!({}));
+    let irs_enabled = irs_config.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+    let irs_configured = ["merchantId","password","pin","secret"].iter().all(|key|!config_string(&irs_config,key).is_empty());
+    let mut irs_status = irs_center_status(irs_enabled,irs_configured,if mappings_present {mapping_active} else {-1},!issues.iter().any(|i|i.code=="IRS_CONFIG_UNAVAILABLE") && mappings_present);
+    let digiflazz_orders = digiflazz_orders.map(|row|SellerCenterDigiflazzOrders {total:row.get("total"),pending:row.get("pending"),failed:row.get("failed"),callback_pending:row.get("callback_pending")});
+    if digiflazz_orders.is_err() { digiflazz_status="unavailable"; }
+    let irs_orders = irs_orders.map(|row|SellerCenterOrderCounts {total:row.get("total"),pending:row.get("pending"),failed:row.get("failed")});
+    if irs_orders.is_err() { irs_status="unavailable"; }
     let body = SellerCenterSummaryResponse {
-        ok: true,
-        partial: !issues.is_empty(),
-        issues,
-        generated_at: rfc3339_now(),
-        digiflazz: SellerCenterDigiflazz {
-            configured: seller_configured,
-            ready: digiflazz_status == "ready",
-            status: digiflazz_status.to_string(),
-            orders: digiflazz_orders.unwrap_or_default(),
-        },
-        irs: SellerCenterIrs {
-            enabled: irs_enabled,
-            configured: irs_configured,
-            ready: irs_status == "ready",
-            status: irs_status.to_string(),
-            orders: irs_orders.unwrap_or_default(),
-        },
-        mappings,
+        ok:true, partial:!issues.is_empty(), issues, generated_at:chrono::Utc::now().to_rfc3339(),
+        digiflazz:SellerCenterDigiflazz {configured:seller_configured,ready:digiflazz_status=="ready",status:digiflazz_status.to_string(),orders:digiflazz_orders.unwrap_or_default()},
+        irs:SellerCenterIrs {enabled:irs_enabled,configured:irs_configured,ready:irs_status=="ready",status:irs_status.to_string(),orders:irs_orders.unwrap_or_default()}, mappings,
     };
     Json(body).into_response()
-}
-
-fn rfc3339_now() -> String {
-    DateTime::now()
-        .try_to_rfc3339_string()
-        .unwrap_or_else(|_| String::new())
 }
 
 #[cfg(test)]
@@ -302,12 +79,12 @@ mod tests {
 
     #[test]
     fn summary_issue_codes_are_stable_and_non_secret() {
-        let issue = SellerCenterIssue::new("IRS_ORDER_SUMMARY_UNAVAILABLE", "mongodb.irsSellerOrders");
+        let issue = SellerCenterIssue::new("IRS_ORDER_SUMMARY_UNAVAILABLE", "postgres.irs_seller_orders");
         assert_eq!(
             serde_json::to_value(issue).unwrap(),
             serde_json::json!({
                 "code": "IRS_ORDER_SUMMARY_UNAVAILABLE",
-                "source": "mongodb.irsSellerOrders"
+                "source": "postgres.irs_seller_orders"
             })
         );
     }
@@ -319,7 +96,7 @@ mod tests {
             partial: true,
             issues: vec![SellerCenterIssue::new(
                 "SELLER_MAPPING_SUMMARY_UNAVAILABLE",
-                "mongodb.digiflazzSellerMappings",
+                "postgres.digiflazz_seller_mappings",
             )],
             generated_at: "2026-08-20T00:00:00.000Z".to_string(),
             digiflazz: SellerCenterDigiflazz {

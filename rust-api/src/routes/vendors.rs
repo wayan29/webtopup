@@ -1,5 +1,4 @@
 use axum::{response::IntoResponse, response::Response, Json};
-use mongodb::bson::Document;
 
 use crate::security::ErrorResponse;
 
@@ -8,7 +7,6 @@ mod admin;
 mod config;
 mod digiflazz;
 mod health;
-mod json;
 mod providers;
 mod settings;
 mod sync_pricing;
@@ -46,12 +44,6 @@ fn vendor_balance_bad_request(message: &str) -> Response {
         .into_response()
 }
 
-fn vendor_id(document: &Document) -> String {
-    document
-        .get_object_id("_id")
-        .map(|id| id.to_hex())
-        .unwrap_or_default()
-}
 
 fn status_message(status: axum::http::StatusCode, message: &'static str) -> Response {
     (status, Json(ErrorResponse { message })).into_response()
@@ -81,9 +73,6 @@ impl IfEmpty for String {
 fn unavailable() -> Response {
     (
         axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        Json(ErrorResponse {
-            message: "MONGO_URI is not configured",
-        }),
-    )
-        .into_response()
+        Json(ErrorResponse { message: "SQL store is not available" }),
+    ).into_response()
 }

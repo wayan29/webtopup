@@ -1,0 +1,10 @@
+ALTER TABLE seller_orders
+    ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}';
+
+ALTER TABLE seller_callbacks
+    ADD COLUMN IF NOT EXISTS last_error TEXT NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS attempt_count BIGINT NOT NULL DEFAULT 0;
+
+ALTER TABLE seller_mappings
+    ADD COLUMN IF NOT EXISTS legacy_id TEXT;

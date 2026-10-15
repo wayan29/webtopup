@@ -1,7 +1,6 @@
 //! Private same-filesystem staging and atomic batch publication for uploads.
 
 use std::{
-    future::Future,
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -19,9 +18,7 @@ use super::{
     policy::{CanonicalImage, CanonicalImageFormat},
     types::{UploadErrorBody, UploadErrorEnvelope},
 };
-use crate::services::managed_asset_registry::{
-    CanonicalImageMetadata, PublishedAssetRegistration, RegistryError,
-};
+use crate::services::managed_asset_registry::CanonicalImageMetadata;
 
 #[derive(Debug)]
 pub struct StagedUpload {
@@ -31,9 +28,6 @@ pub struct StagedUpload {
     filename: String,
     metadata: CanonicalImageMetadata,
     published: bool,
-    /// Test-only: force rename failure during publish.
-    #[cfg(test)]
-    force_publish_failure: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,17 +92,6 @@ impl IntoResponse for UploadStorageError {
             }),
         )
             .into_response()
-    }
-}
-
-impl PublishedUpload {
-    pub fn registry_registration(&self) -> PublishedAssetRegistration {
-        PublishedAssetRegistration {
-            url: self.url.clone(),
-            filename: self.filename.clone(),
-            path: self.path.clone(),
-            metadata: self.metadata.clone(),
-        }
     }
 }
 
@@ -198,87 +181,53 @@ pub fn stage_canonical_image(
         filename,
         metadata,
         published: false,
-        #[cfg(test)]
-        force_publish_failure: false,
     })
 }
 
-pub fn publish_batch(mut staged: Vec<StagedUpload>) -> Result<Vec<PublishedUpload>, UploadStorageError> {
-    let mut published: Vec<PublishedUpload> = Vec::with_capacity(staged.len());
-
+/// Persist publication intent before exposing any file; recovery owns all staged paths after
+/// this commit, including ambiguous outcomes. No rollback unlinks a possibly committed asset.
+pub async fn publish_sql_batch(
+    pool: &sqlx::PgPool,
+    root: &Path,
+    mut staged: Vec<StagedUpload>,
+) -> Result<Vec<PublishedUpload>, UploadStorageError> {
+    let payload = serde_json::Value::Array(
+        staged
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "url": item.public_url,
+                    "metadata": {
+                        "format": item.metadata.format,
+                        "width": item.metadata.width,
+                        "height": item.metadata.height,
+                        "byteLength": item.metadata.byte_length
+                    }
+                })
+            })
+            .collect(),
+    );
+    // Retain durable staging on every uncertain journal insertion outcome. A database outage
+    // may leave private staging garbage, but must never destroy data needed by recovery.
     for item in &mut staged {
-        #[cfg(test)]
-        if item.force_publish_failure {
-            // Roll back any already-published files from this batch only.
-            for done in &published {
-                let _ = fs::remove_file(&done.path);
-            }
-            return Err(UploadStorageError::Failed);
-        }
-
-        if let Err(error) = fs::rename(&item.temp_path, &item.final_path) {
-            for done in &published {
-                let _ = fs::remove_file(&done.path);
-            }
-            let _ = error;
-            return Err(UploadStorageError::Failed);
-        }
         item.mark_published();
-        published.push(PublishedUpload {
+    }
+    let id = crate::services::managed_asset_registry::prepare_publication(pool, &payload)
+        .await
+        .map_err(|_| UploadStorageError::RegistryReconciliationRequired)?;
+    crate::services::managed_asset_registry::finish_operation(pool, root, id)
+        .await
+        .map_err(|_| UploadStorageError::RegistryReconciliationRequired)?;
+    Ok(staged
+        .into_iter()
+        .map(|item| PublishedUpload {
             url: item.public_url.clone(),
             filename: item.filename.clone(),
             path: item.final_path.clone(),
             metadata: item.metadata.clone(),
-        });
-    }
-
-    // Prevent Drop from deleting published temps (already renamed away).
-    for item in &mut staged {
-        item.mark_published();
-    }
-
-    Ok(published)
+        })
+        .collect())
 }
-
-/// Publish files before invoking the registry callback. Any registry error rolls back every
-/// file published by this call, so callers cannot observe a successful upload without a durable
-/// managed-assets row.
-pub async fn publish_and_register_batch<F, Fut>(
-    staged: Vec<StagedUpload>,
-    register: F,
-) -> Result<Vec<PublishedUpload>, UploadStorageError>
-where
-    F: FnOnce(&[PublishedUpload]) -> Fut,
-    Fut: Future<Output = Result<(), RegistryError>>,
-{
-    let published = publish_batch(staged)?;
-    if let Err(error) = register(&published).await {
-        if error.requires_reconciliation() {
-            // An UnknownTransactionCommitResult means the server may have committed the rows.
-            // Unlinking here could leave durable registry metadata pointing at missing bytes.
-            return Err(UploadStorageError::RegistryReconciliationRequired);
-        }
-        rollback_published_files(&published)?;
-        return Err(UploadStorageError::RegistryUnavailable);
-    }
-    Ok(published)
-}
-
-fn rollback_published_files(published: &[PublishedUpload]) -> Result<(), UploadStorageError> {
-    let mut cleanup_failed = false;
-    for upload in published {
-        match fs::remove_file(&upload.path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => cleanup_failed = true,
-        }
-    }
-    if cleanup_failed {
-        return Err(UploadStorageError::RegistryUnavailable);
-    }
-    Ok(())
-}
-
 fn generate_canonical_filename(format: CanonicalImageFormat) -> String {
     let mut bytes = [0_u8; 8];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -297,15 +246,9 @@ fn generate_canonical_filename(format: CanonicalImageFormat) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        routes::uploads::policy::{validate_and_reencode_image, CanonicalImageFormat},
-        services::managed_asset_registry::RegistryError,
-    };
+    use crate::routes::uploads::policy::{validate_and_reencode_image, CanonicalImageFormat};
     use image::{DynamicImage, ImageBuffer, ImageEncoder, Rgba};
-    use std::{
-        sync::{Arc, Mutex},
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn fixture_root() -> PathBuf {
         let nanos = SystemTime::now()
@@ -337,148 +280,6 @@ mod tests {
         validate_and_reencode_image(&out).unwrap()
     }
 
-    fn valid_staged(root: &Path, folder: &str) -> StagedUpload {
-        stage_canonical_image(root, folder, fixture_canonical_png()).unwrap()
-    }
-
-    fn forced_publish_failure(root: &Path, folder: &str) -> StagedUpload {
-        let mut staged = valid_staged(root, folder);
-        staged.force_publish_failure = true;
-        staged
-    }
-
-    fn create_existing_public_file(root: &Path, folder: &str, name: &str) -> PathBuf {
-        let path = root.join(folder).join(name);
-        fs::write(&path, b"existing").unwrap();
-        path
-    }
-
-    fn public_batch_files(root: &Path) -> Vec<PathBuf> {
-        public_batch_files_in(root, "icons")
-    }
-
-    fn public_batch_files_in(root: &Path, folder: &str) -> Vec<PathBuf> {
-        let dir = root.join(folder);
-        fs::read_dir(dir)
-            .unwrap()
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name != "existing.png" && !name.starts_with('.'))
-            })
-            .collect()
-    }
-
-    fn private_stage_files(root: &Path) -> Vec<PathBuf> {
-        let staging = staging_root(root);
-        match fs::read_dir(staging) {
-            Ok(entries) => entries
-                .filter_map(Result::ok)
-                .map(|entry| entry.path())
-                .collect(),
-            Err(_) => Vec::new(),
-        }
-    }
-
-    #[tokio::test]
-    async fn published_file_is_removed_when_registry_insert_fails() {
-        let root = fixture_root();
-        let staged = valid_staged(&root, "covers");
-        let result = publish_and_register_batch(vec![staged], |_uploads| async {
-            Err(RegistryError::Storage)
-        })
-        .await;
-        assert_eq!(result.unwrap_err().code(), "MANAGED_ASSET_REGISTRY_UNAVAILABLE");
-        assert!(public_batch_files_in(&root, "covers").is_empty());
-        assert!(private_stage_files(&root).is_empty());
-        if let Some(base) = root.parent() {
-            let _ = fs::remove_dir_all(base);
-        }
-    }
-
-    #[tokio::test]
-    async fn ambiguous_registry_commit_fails_closed_and_retains_published_files_for_reconciliation() {
-        let root = fixture_root();
-        let staged = valid_staged(&root, "covers");
-        let result = publish_and_register_batch(vec![staged], |_uploads| async {
-            Err(RegistryError::AmbiguousCommit)
-        })
-        .await;
-        let error = result.unwrap_err();
-        assert_eq!(error.code(), "MANAGED_ASSET_REGISTRY_UNAVAILABLE");
-        assert!(error.requires_reconciliation());
-        let files = public_batch_files_in(&root, "covers");
-        assert_eq!(files.len(), 1);
-        assert!(files[0].is_file());
-        assert!(private_stage_files(&root).is_empty());
-        if let Some(base) = root.parent() {
-            let _ = fs::remove_dir_all(base);
-        }
-    }
-
-    #[tokio::test]
-    async fn duplicate_canonical_path_rolls_back_the_published_batch() {
-        let root = fixture_root();
-        let first = valid_staged(&root, "covers");
-        let mut second = valid_staged(&root, "covers");
-        // Force the registry's canonical-path uniqueness constraint while keeping distinct
-        // staged/final filesystem paths so rollback must remove both published files.
-        second.public_url = first.public_url.clone();
-        let staged = vec![first, second];
-        let rows = Arc::new(Mutex::new(Vec::<String>::new()));
-        let callback_rows = Arc::clone(&rows);
-        let result = publish_and_register_batch(staged, move |uploads| {
-            let rows = Arc::clone(&callback_rows);
-            let paths = uploads.iter().map(|upload| upload.url.clone()).collect::<Vec<_>>();
-            async move {
-                if paths.windows(2).any(|pair| pair[0] == pair[1]) {
-                    // Simulate the unique canonical-path index rejecting the batch. The callback
-                    // models a transaction, so no provisional rows remain after the error.
-                    rows.lock().unwrap().clear();
-                    return Err(RegistryError::ReferenceMismatch);
-                }
-                rows.lock().unwrap().extend(paths);
-                Ok(())
-            }
-        })
-        .await;
-        assert_eq!(result.unwrap_err().code(), "MANAGED_ASSET_REGISTRY_UNAVAILABLE");
-        assert!(rows.lock().unwrap().is_empty());
-        assert!(public_batch_files_in(&root, "covers").is_empty());
-        if let Some(base) = root.parent() {
-            let _ = fs::remove_dir_all(base);
-        }
-    }
-
-    #[tokio::test]
-    async fn partial_registry_batch_rolls_back_rows_and_published_files() {
-        let root = fixture_root();
-        let staged = vec![valid_staged(&root, "covers"), valid_staged(&root, "covers")];
-        let rows = Arc::new(Mutex::new(Vec::<String>::new()));
-        let callback_rows = Arc::clone(&rows);
-        let result = publish_and_register_batch(staged, move |uploads| {
-            let rows = Arc::clone(&callback_rows);
-            let first = uploads.first().map(|upload| upload.url.clone());
-            async move {
-                if let Some(first) = first {
-                    rows.lock().unwrap().push(first);
-                }
-                // A transactional registry abort removes the first insert before returning.
-                rows.lock().unwrap().clear();
-                Err(RegistryError::Storage)
-            }
-        })
-        .await;
-        assert_eq!(result.unwrap_err().code(), "MANAGED_ASSET_REGISTRY_UNAVAILABLE");
-        assert!(rows.lock().unwrap().is_empty());
-        assert!(public_batch_files_in(&root, "covers").is_empty());
-        if let Some(base) = root.parent() {
-            let _ = fs::remove_dir_all(base);
-        }
-    }
-
     #[test]
     fn dropped_staged_upload_removes_private_temp_file() {
         let root = fixture_root();
@@ -486,36 +287,6 @@ mod tests {
         let temp = staged.temp_path().to_path_buf();
         assert!(temp.exists());
         drop(staged);
-        assert!(!temp.exists());
-        if let Some(base) = root.parent() {
-            let _ = fs::remove_dir_all(base);
-        }
-    }
-
-    #[test]
-    fn failed_batch_publication_removes_only_files_from_that_batch() {
-        let root = fixture_root();
-        let existing = create_existing_public_file(&root, "icons", "existing.png");
-        let staged = vec![valid_staged(&root, "icons"), forced_publish_failure(&root, "icons")];
-        assert!(publish_batch(staged).is_err());
-        assert!(existing.exists());
-        assert!(public_batch_files(&root).is_empty());
-        assert!(private_stage_files(&root).is_empty());
-        if let Some(base) = root.parent() {
-            let _ = fs::remove_dir_all(base);
-        }
-    }
-
-    #[test]
-    fn successful_batch_publishes_canonical_extension_only() {
-        let root = fixture_root();
-        let staged = valid_staged(&root, "icons");
-        let temp = staged.temp_path().to_path_buf();
-        let published = publish_batch(vec![staged]).unwrap();
-        assert_eq!(published.len(), 1);
-        assert!(published[0].filename.ends_with(".png"));
-        assert!(!published[0].filename.contains("client"));
-        assert!(published[0].path.exists());
         assert!(!temp.exists());
         if let Some(base) = root.parent() {
             let _ = fs::remove_dir_all(base);

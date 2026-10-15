@@ -1,55 +1,110 @@
-use std::collections::HashMap;
+use chrono::{DateTime as ChronoDateTime, Utc};
+use sqlx::{postgres::PgRow, Row};
 
-use futures_util::TryStreamExt;
-use mongodb::bson::{doc, Bson, DateTime, Document};
+use super::types::{AdminDepositItem, MemberDepositItem, MemberUserBrief, PaymentMethodBrief, UserBrief};
 
-use crate::utils::bson::{read_i64, read_string};
+fn row_date(row: &PgRow, key: &str) -> Option<String> {
+    row.try_get::<Option<ChronoDateTime<Utc>>, _>(key)
+        .ok()
+        .flatten()
+        .map(|value| value.to_rfc3339())
+}
 
-use super::types::{
-    AdminDepositItem, MemberDepositItem, MemberUserBrief, PaymentMethodBrief, UserBrief,
-};
-
-pub(super) fn admin_deposit_item_from_doc(mut document: Document) -> AdminDepositItem {
-    let id = document
-        .remove("_id")
-        .and_then(|value| value.as_object_id())
-        .map(|id| id.to_hex())
+pub(super) fn admin_deposit_item_from_row(row: &PgRow) -> AdminDepositItem {
+    let brief = |prefix: &str| {
+        let id_column = format!("{prefix}_id");
+        let name_column = format!("{prefix}_name");
+        let email_column = format!("{prefix}_email");
+        let role_column = format!("{prefix}_role");
+        let id = row
+            .try_get::<Option<uuid::Uuid>, _>(id_column.as_str())
+            .ok()
+            .flatten()
+            .map(|id| id.to_string())
+            .unwrap_or_default();
+        if id.is_empty() {
+            return UserBrief::default();
+        }
+        UserBrief {
+            id,
+            name: row.try_get::<Option<String>, _>(name_column.as_str()).ok().flatten().unwrap_or_default(),
+            email: row.try_get::<Option<String>, _>(email_column.as_str()).ok().flatten().unwrap_or_default(),
+            role: row.try_get::<Option<String>, _>(role_column.as_str()).ok().flatten(),
+        }
+    };
+    let payment_method = row
+        .try_get::<Option<uuid::Uuid>, _>("payment_method_id")
+        .ok()
+        .flatten()
+        .map(|id| PaymentMethodBrief {
+            id: id.to_string(),
+            name: row.try_get::<Option<String>, _>("payment_method_name").ok().flatten().unwrap_or_default(),
+            account_number: row.try_get::<Option<String>, _>("payment_method_account_number").ok().flatten().unwrap_or_default(),
+            account_name: row.try_get::<Option<String>, _>("payment_method_account_name").ok().flatten().unwrap_or_default(),
+        })
         .unwrap_or_default();
-
     AdminDepositItem {
+        id: row.try_get::<uuid::Uuid, _>("id").map(|id| id.to_string()).unwrap_or_default(),
+        amount: row.try_get("amount").unwrap_or_default(),
+        unique_code: row.try_get("unique_code").unwrap_or_default(),
+        admin_fee: row.try_get("admin_fee").unwrap_or_default(),
+        total_amount: row.try_get::<Option<i64>, _>("total_amount").ok().flatten().unwrap_or_default(),
+        net_amount: row.try_get::<Option<i64>, _>("net_amount").ok().flatten().unwrap_or_default(),
+        status: row.try_get("status").unwrap_or_default(),
+        created_at: row_date(row, "created_at").unwrap_or_default(),
+        updated_at: row_date(row, "updated_at").unwrap_or_default(),
+        assigned_at: row_date(row, "assigned_at"),
+        processed_at: row_date(row, "processed_at"),
+        processing_note: row.try_get::<Option<String>, _>("processing_note").ok().flatten().unwrap_or_default(),
+        invoice_code: row.try_get::<Option<String>, _>("invoice_code").ok().flatten().unwrap_or_default(),
+        user: brief("user"),
+        payment_method,
+        assigned_to: brief("assigned_to"),
+        processed_by: brief("processed_by"),
+    }
+}
+pub(super) fn member_deposit_item_from_row(row: &PgRow) -> MemberDepositItem {
+    let id = row
+        .try_get::<uuid::Uuid, _>("id")
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+    let user_id = row
+        .try_get::<Option<uuid::Uuid>, _>("user_id")
+        .ok()
+        .flatten()
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+    let payment_method_id = row
+        .try_get::<Option<uuid::Uuid>, _>("payment_method_id")
+        .ok()
+        .flatten()
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+    let admin_fee = row.try_get("admin_fee").unwrap_or_default();
+    MemberDepositItem {
+        admin_fee_before_id: Some(admin_fee),
         id,
-        amount: read_i64(&document, "amount"),
-        unique_code: read_i64(&document, "uniqueCode"),
-        admin_fee: read_i64(&document, "adminFee"),
-        total_amount: read_i64(&document, "totalAmount"),
-        net_amount: read_i64(&document, "netAmount"),
-        status: read_string(&document, "status"),
-        created_at: date_string(&document, "createdAt").unwrap_or_default(),
-        updated_at: date_string(&document, "updatedAt").unwrap_or_default(),
-        assigned_at: date_string(&document, "assignedAt"),
-        processed_at: date_string(&document, "processedAt"),
-        processing_note: read_string(&document, "processingNote"),
-        invoice_code: read_string(&document, "invoiceCode"),
-        user: document
-            .get_document("user")
-            .ok()
-            .and_then(user_brief_from_doc)
-            .unwrap_or_default(),
-        payment_method: document
-            .get_document("paymentMethod")
-            .ok()
-            .and_then(payment_method_from_doc)
-            .unwrap_or_default(),
-        assigned_to: document
-            .get_document("assignedTo")
-            .ok()
-            .and_then(user_brief_from_doc)
-            .unwrap_or_default(),
-        processed_by: document
-            .get_document("processedBy")
-            .ok()
-            .and_then(user_brief_from_doc)
-            .unwrap_or_default(),
+        user: MemberUserBrief {
+            id: user_id,
+            email: row.try_get::<Option<String>, _>("user_email").ok().flatten().unwrap_or_default(),
+            name: row.try_get::<Option<String>, _>("user_name").ok().flatten().unwrap_or_default(),
+        },
+        amount: row.try_get("amount").unwrap_or_default(),
+        unique_code: row.try_get("unique_code").unwrap_or_default(),
+        admin_fee_before_total: None,
+        admin_fee_after_version: None,
+        total_amount: row.try_get::<Option<i64>, _>("total_amount").ok().flatten().unwrap_or_default(),
+        payment_method: PaymentMethodBrief {
+            id: payment_method_id,
+            name: row.try_get::<Option<String>, _>("payment_method_name").ok().flatten().unwrap_or_default(),
+            account_number: row.try_get::<Option<String>, _>("payment_method_account_number").ok().flatten().unwrap_or_default(),
+            account_name: row.try_get::<Option<String>, _>("payment_method_account_name").ok().flatten().unwrap_or_default(),
+        },
+        status: row.try_get("status").unwrap_or_default(),
+        proof: row.try_get("proof").unwrap_or_default(),
+        created_at: row_date(row, "created_at").unwrap_or_default(),
+        updated_at: row_date(row, "updated_at").unwrap_or_default(),
+        version: 0,
     }
 }
 
@@ -125,210 +180,6 @@ fn csv_escape(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
-pub(super) fn date_key(date: DateTime) -> String {
-    date.try_to_rfc3339_string()
-        .ok()
-        .and_then(|value| value.get(0..10).map(ToString::to_string))
-        .unwrap_or_else(|| "unknown-date".to_string())
-}
-
-pub(super) fn member_deposit_item_from_doc(
-    mut document: Document,
-    users: &HashMap<String, MemberUserBrief>,
-    payment_methods: &HashMap<String, PaymentMethodBrief>,
-) -> MemberDepositItem {
-    let id = document
-        .remove("_id")
-        .and_then(|value| value.as_object_id())
-        .map(|id| id.to_hex())
-        .unwrap_or_default();
-    let user_id = document
-        .get_object_id("user")
-        .map(|id| id.to_hex())
-        .unwrap_or_default();
-    let payment_method_id = document
-        .get_object_id("paymentMethod")
-        .map(|id| id.to_hex())
-        .unwrap_or_default();
-    let has_admin_fee = has_numeric_value(&document, "adminFee");
-    let admin_fee = if has_admin_fee {
-        Some(read_i64(&document, "adminFee"))
-    } else {
-        Some(0)
-    };
-    let admin_fee_before_id = !has_admin_fee || key_is_before(&document, "adminFee", "_id");
-    let admin_fee_before_total =
-        !admin_fee_before_id && key_is_before(&document, "adminFee", "totalAmount");
-
-    MemberDepositItem {
-        admin_fee_before_id: if admin_fee_before_id { admin_fee } else { None },
-        id,
-        user: users.get(&user_id).cloned().unwrap_or_default(),
-        amount: read_i64(&document, "amount"),
-        unique_code: read_i64(&document, "uniqueCode"),
-        admin_fee_before_total: if admin_fee_before_total {
-            admin_fee
-        } else {
-            None
-        },
-        admin_fee_after_version: if admin_fee_before_total {
-            None
-        } else {
-            admin_fee
-        },
-        total_amount: read_i64(&document, "totalAmount"),
-        payment_method: payment_methods
-            .get(&payment_method_id)
-            .cloned()
-            .unwrap_or_default(),
-        status: read_string(&document, "status"),
-        proof: document.get_str("proof").ok().map(ToString::to_string),
-        created_at: member_date_string(&document, "createdAt"),
-        updated_at: member_date_string(&document, "updatedAt"),
-        version: read_i64(&document, "__v"),
-    }
-}
-
-pub(super) async fn member_deposit_users(
-    db: &mongodb::Database,
-    deposits: &[Document],
-) -> HashMap<String, MemberUserBrief> {
-    let mut ids = deposits
-        .iter()
-        .filter_map(|doc| doc.get_object_id("user").ok())
-        .collect::<Vec<_>>();
-    ids.sort_by_key(|id| id.to_hex());
-    ids.dedup();
-    if ids.is_empty() {
-        return HashMap::new();
-    }
-    match db
-        .collection::<Document>("users")
-        .find(doc! { "_id": { "$in": ids } })
-        .projection(doc! { "email": 1, "name": 1 })
-        .await
-    {
-        Ok(cursor) => cursor
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|doc| member_user_brief_from_doc(&doc).map(|user| (user.id.clone(), user)))
-            .collect(),
-        Err(_) => HashMap::new(),
-    }
-}
-
-pub(super) async fn member_deposit_payment_methods(
-    db: &mongodb::Database,
-    deposits: &[Document],
-) -> HashMap<String, PaymentMethodBrief> {
-    let mut ids = deposits
-        .iter()
-        .filter_map(|doc| doc.get_object_id("paymentMethod").ok())
-        .collect::<Vec<_>>();
-    ids.sort_by_key(|id| id.to_hex());
-    ids.dedup();
-    if ids.is_empty() {
-        return HashMap::new();
-    }
-    match db
-        .collection::<Document>("paymentmethods")
-        .find(doc! { "_id": { "$in": ids } })
-        .projection(doc! { "name": 1, "accountNumber": 1, "accountName": 1 })
-        .await
-    {
-        Ok(cursor) => cursor
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|doc| {
-                payment_method_from_doc(&doc).map(|method| (method.id.clone(), method))
-            })
-            .collect(),
-        Err(_) => HashMap::new(),
-    }
-}
-
-pub(super) fn member_user_brief_from_doc(document: &Document) -> Option<MemberUserBrief> {
-    let id = document.get_object_id("_id").map(|id| id.to_hex()).ok()?;
-    Some(MemberUserBrief {
-        id,
-        email: read_string(document, "email"),
-        name: read_string(document, "name"),
-    })
-}
-
-fn has_numeric_value(document: &Document, key: &str) -> bool {
-    matches!(
-        document.get(key),
-        Some(Bson::Int32(_)) | Some(Bson::Int64(_)) | Some(Bson::Double(_))
-    )
-}
-
-fn key_is_before(document: &Document, left: &str, right: &str) -> bool {
-    let mut left_index = None;
-    let mut right_index = None;
-    for (index, key) in document.keys().enumerate() {
-        if key == left {
-            left_index = Some(index);
-        } else if key == right {
-            right_index = Some(index);
-        }
-    }
-    matches!((left_index, right_index), (Some(left), Some(right)) if left < right)
-}
-
-fn user_brief_from_doc(document: &Document) -> Option<UserBrief> {
-    let id = document.get_object_id("_id").map(|id| id.to_hex()).ok()?;
-    if id.is_empty() {
-        return None;
-    }
-
-    Some(UserBrief {
-        id,
-        name: read_string(document, "name"),
-        email: read_string(document, "email"),
-        role: document.get_str("role").ok().map(ToString::to_string),
-    })
-}
-
-pub(super) fn payment_method_from_doc(document: &Document) -> Option<PaymentMethodBrief> {
-    let id = document.get_object_id("_id").map(|id| id.to_hex()).ok()?;
-    Some(PaymentMethodBrief {
-        id,
-        name: read_string(document, "name"),
-        account_number: read_string(document, "accountNumber"),
-        account_name: read_string(document, "accountName"),
-    })
-}
-
-fn date_string(document: &Document, key: &str) -> Option<String> {
-    document
-        .get_datetime(key)
-        .map(|value| {
-            value
-                .try_to_rfc3339_string()
-                .unwrap_or_else(|_| value.to_string())
-        })
-        .ok()
-}
-
-fn member_date_string(document: &Document, key: &str) -> String {
-    document
-        .get_datetime(key)
-        .map(|value| {
-            let mut text = value
-                .try_to_rfc3339_string()
-                .unwrap_or_else(|_| value.to_string());
-            if let Some((prefix, suffix)) =
-                text.strip_suffix('Z').and_then(|body| body.split_once('.'))
-            {
-                let millis = format!("{suffix:0<3}");
-                text = format!("{prefix}.{}Z", &millis[..3]);
-            }
-            text
-        })
-        .unwrap_or_default()
+pub(super) fn date_key(date: ChronoDateTime<Utc>) -> String {
+    date.format("%Y-%m-%d").to_string()
 }

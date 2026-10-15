@@ -1,4 +1,3 @@
-use mongodb::bson::DateTime;
 use serde::{Deserialize, Serialize};
 
 use crate::security::ProxyContextResponse;
@@ -97,8 +96,3 @@ pub struct NotificationStats {
 pub const STUCK_TRANSACTION_MINUTES: i64 = 15;
 pub const HIGH_CALLBACK_ATTEMPT_THRESHOLD: i64 = 5;
 
-pub fn date_to_string(value: &DateTime) -> String {
-    value
-        .try_to_rfc3339_string()
-        .unwrap_or_else(|_| value.to_string())
-}

@@ -172,42 +172,6 @@ pub async fn enforce_turnstile<V: TurnstileVerifier>(
     }
 }
 
-fn bson_to_bool(value: &mongodb::bson::Bson) -> bool {
-    match value {
-        mongodb::bson::Bson::Boolean(value) => *value,
-        mongodb::bson::Bson::String(value) => value == "true" || value == "1",
-        mongodb::bson::Bson::Int32(value) => *value != 0,
-        mongodb::bson::Bson::Int64(value) => *value != 0,
-        mongodb::bson::Bson::Double(value) => *value != 0.0,
-        _ => false,
-    }
-}
-
-pub async fn load_bot_protection_settings(db: &mongodb::Database) -> (bool, String) {
-    let settings = db.collection::<mongodb::bson::Document>("settings");
-    let stored_enabled = settings
-        .find_one(mongodb::bson::doc! { "key": "botProtectionEnabled" })
-        .await
-        .ok()
-        .flatten()
-        .and_then(|document| document.get("value").cloned())
-        .map(|value| bson_to_bool(&value))
-        .unwrap_or(false);
-    let site_key = settings
-        .find_one(mongodb::bson::doc! { "key": "turnstileSiteKey" })
-        .await
-        .ok()
-        .flatten()
-        .and_then(|document| document.get("value").cloned())
-        .and_then(|value| match value {
-            mongodb::bson::Bson::String(value) => Some(value),
-            other => Some(other.to_string()),
-        })
-        .map(|value| value.trim().to_string())
-        .unwrap_or_default();
-    (stored_enabled, site_key)
-}
-
 pub fn cloudflare_turnstile_verifier() -> &'static CloudflareTurnstileVerifier {
     static VERIFIER: std::sync::OnceLock<CloudflareTurnstileVerifier> = std::sync::OnceLock::new();
     VERIFIER.get_or_init(CloudflareTurnstileVerifier::new)

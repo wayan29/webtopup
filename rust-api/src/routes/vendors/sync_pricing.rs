@@ -4,8 +4,8 @@
 //! membership tiers derived from the global margin settings (percent over cost),
 //! not at the inverted 0.98/0.95 "discount from cost" that treated cost as MSRP.
 
-/// Default membership margins when the `margins` settings document is missing.
-/// Matches `rust-api/src/routes/margins` setOnInsert defaults.
+/// Default membership margins when the `margins` setting is absent from SQL.
+/// Matches `rust-api/src/routes/margins` defaults.
 pub(super) const DEFAULT_MARGIN_BASIC: f64 = 10.0;
 pub(super) const DEFAULT_MARGIN_GOLD: f64 = 5.0;
 pub(super) const DEFAULT_MARGIN_PLATINUM: f64 = 0.0;

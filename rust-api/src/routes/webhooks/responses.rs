@@ -10,10 +10,7 @@ pub fn provider_not_found() -> Response {
 }
 
 pub fn unavailable() -> Response {
-    status_message(
-        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        "MONGO_URI is not configured",
-    )
+    status_message(axum::http::StatusCode::SERVICE_UNAVAILABLE, "SQL store unavailable")
 }
 
 pub fn status_message(status: axum::http::StatusCode, message: &'static str) -> Response {

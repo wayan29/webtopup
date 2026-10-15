@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use axum::{extract::State, response::IntoResponse, response::Response, Json};
-use mongodb::bson::doc;
 use serde::Serialize;
+use sqlx::Row;
 
 use crate::{
     security::{require_proxy_context, ProxyContextResponse},
@@ -38,30 +38,21 @@ pub async fn system_status(
         Err(response) => return response,
     };
 
-    let database = match &state.mongo_client {
-        Some(client) => match client
-            .database("admin")
-            .run_command(doc! { "ping": 1 })
-            .await
-        {
-            Ok(_) => DatabaseStatus {
-                configured: true,
-                ok: true,
-                name: state.mongo_db.clone(),
-                message: "MongoDB ping ok".to_string(),
-            },
-            Err(error) => DatabaseStatus {
-                configured: true,
-                ok: false,
-                name: state.mongo_db.clone(),
-                message: error.to_string(),
-            },
+    let database = match sqlx::query("SELECT current_database() AS name")
+        .fetch_one(&state.pg_pool)
+        .await
+    {
+        Ok(row) => DatabaseStatus {
+            configured: true,
+            ok: true,
+            name: row.get("name"),
+            message: "PostgreSQL ping ok".to_string(),
         },
-        None => DatabaseStatus {
-            configured: false,
+        Err(error) => DatabaseStatus {
+            configured: true,
             ok: false,
-            name: state.mongo_db.clone(),
-            message: "MONGO_URI is not configured".to_string(),
+            name: String::new(),
+            message: error.to_string(),
         },
     };
 

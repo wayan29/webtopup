@@ -1,11 +1,14 @@
 mod routes;
 mod security;
-#[cfg(test)]
-mod security_hardening_checks;
 mod services;
 mod state;
 mod telemetry;
 mod utils;
+#[path = "wallet_store.rs"]
+mod wallet_store;
+#[path = "postgres_auth.rs"]
+mod postgres_auth;
+mod sql_auth;
 
 use std::{env, net::SocketAddr, sync::Arc};
 
@@ -24,129 +27,63 @@ async fn main() -> anyhow::Result<()> {
         .context("API_V2_HOST/API_V2_PORT must form a valid socket address")?;
 
     let mut state = state::AppState::from_env().await?;
-    let cleanup_config = routes::auth::legacy_migration_cleanup::CleanupWorkerConfig::from_env()
-        .map_err(anyhow::Error::msg)?;
-    if let Some(client) = &state.mongo_client {
-        let limits = routes::auth::session_migration::SessionMigrationLimits::default();
-        let db = client.database(&state.mongo_db);
-        routes::auth::legacy_migration_store::ensure_legacy_migration_indexes(&db)
-            .await
-            .context("legacy migration indexes failed before listener readiness")?;
-        let cleanup_store =
-            routes::auth::legacy_migration_store::MongoLegacyMigrationStore { db: &db };
-        routes::auth::legacy_migration_cleanup::cleanup_expired_legacy_migrations(
-            &cleanup_store,
-            mongodb::bson::DateTime::now(),
-            cleanup_config.batch_size,
-        )
+    verify_sql_schema(&state.pg_pool).await?;
+
+    routes::settings::ensure_site_config_foundation_indexes(&state.pg_pool)
         .await
-        .map_err(|_| {
-            anyhow::anyhow!("legacy migration cleanup failed before listener readiness")
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "site config foundation indexes failed before listener readiness: {error:?}"
+            )
         })?;
-        routes::auth::session_migration::migrate_session_version_at_issue(&db, limits)
-            .await
-            .context("auth session migration failed before listener readiness")?;
-        routes::auth::session_migration::verify_predecessor_encryption_residue(
-            &db,
-            &state.recovery_encryption_keys,
-            limits,
-        )
-        .await
-        .context("auth recovery encryption startup verification failed")?;
-        // Session slot uniqueness, session cleanup TTL, and device challenge indexes
-        // are readiness requirements, not lazy first-login side effects.
-        routes::auth::session_store::ensure_slot_indexes_ready(&db)
-            .await
-            .context("auth session indexes failed before listener readiness")?;
-        // Critical financial mutations require unique(actorId,routeKey,idempotencyKey)
-        // + completed-only TTL before any request can race insert_one without exclusivity.
-        services::idempotency::MongoIdempotencyStore::ensure_indexes(&db)
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!("idempotency indexes failed before listener readiness: {error:?}")
-            })?;
-        routes::vouchers::ensure_giveaway_indexes(&db)
-            .await
-            .context("giveaway idempotency indexes failed before listener readiness")?;
-        routes::settings::ensure_site_config_foundation_indexes(&db)
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "site config foundation indexes failed before listener readiness: {error:?}"
-                )
-            })?;
-        // Seller order refId uniqueness is a readiness requirement: exact unique
-        // indexes must already exist (created by the guarded readiness tool);
-        // startup verifies and never creates or drops them.
-        services::seller_integrity::ensure_seller_order_indexes_ready(&db)
-            .await
-            .context("seller order indexes failed before listener readiness")?;
-        // Slider readiness is inspection-only in production.  Missing indexes/data are logged as
-        // a false capability state; no production index creation, registration, or repair occurs.
-        let slider_report = services::slider_readiness::inspect_slider_foundation(
-            &db,
-            &routes::uploads::upload_root(),
-        )
-        .await
-        .map_err(|error| anyhow::anyhow!("slider readiness inspection failed: {error}"))?;
-        let capability = services::slider_readiness::SliderMutationReadiness::from_report(
-            &slider_report,
-            state.mongo_transactions_enabled,
-        );
-        if let Some(app_state) = Arc::get_mut(&mut state) {
-            app_state.slider_mutation_readiness = capability;
-        }
-        info!(
-            mutation_ready = capability.mutation_ready,
-            indexes_ready = slider_report.indexes.ready,
-            findings = slider_report.findings.len(),
-            "slider mutation capability readiness inspected; mutation handlers remain gated"
-        );
-    }
+    // Pending publish/delete journal operations must finish (or fail closed) before any
+    // upload/delete request can race recovery against a live publisher.
+    crate::services::managed_asset_registry::recover_pending(
+        &state.pg_pool,
+        &routes::uploads::upload_root(),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("managed asset journal recovery failed before listener readiness: {error:?}"))?;
+    let readiness = crate::services::slider_readiness::probe(
+        &state.pg_pool,
+        &routes::uploads::upload_root(),
+    )
+    .await
+    .context("PostgreSQL slider readiness probe failed before listener readiness")?;
+    Arc::get_mut(&mut state)
+        .expect("application state has not been shared before readiness")
+        .slider_mutation_readiness = readiness;
     // Build the login timing material before the listener accepts traffic, so the first rejected
     // login does not pay an extra bcrypt hash and stand out from every later attempt.
-    routes::auth::warm_login_timing_material();
+    crate::sql_auth::warm_login_timing_material();
     let app = routes::app(Arc::clone(&state));
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind API v2 on {addr}"))?;
 
-    // Worker starts only after startup/index/migration checks and listener readiness.
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let worker_state = Arc::clone(&state);
-    let worker = tokio::spawn(routes::auth::legacy_migration_cleanup::run_cleanup_worker(
-        cleanup_config,
-        shutdown_rx,
-        move |limit| {
-            let state = Arc::clone(&worker_state);
-            async move {
-                let Some(client) = &state.mongo_client else {
-                    return Ok(());
-                };
-                let db = client.database(&state.mongo_db);
-                let store =
-                    routes::auth::legacy_migration_store::MongoLegacyMigrationStore { db: &db };
-                routes::auth::legacy_migration_cleanup::cleanup_expired_legacy_migrations(
-                    &store,
-                    mongodb::bson::DateTime::now(),
-                    limit,
-                )
-                .await
-                .map(|_| ())
-            }
-        },
-    ));
-
     info!(%addr, "API v2 listening");
-    let result = axum::serve(listener, app)
+    axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .context("API v2 server failed");
-    let _ = shutdown_tx.send(true);
-    let _ = worker.await;
-    result?;
+        .context("API v2 server failed")?;
 
     telemetry.shutdown();
+    Ok(())
+}
+
+async fn verify_sql_schema(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    const EXPECTED_MIGRATIONS: i64 = 49;
+    const EXPECTED_HEAD: &str = "0058_giveaway_campaigns.sql";
+    use sqlx::Row;
+    let row = sqlx::query("SELECT count(*)::BIGINT AS applied, max(version) AS head FROM schema_migrations")
+        .fetch_one(pool)
+        .await
+        .context("PostgreSQL migration ledger unavailable before listener readiness")?;
+    let applied: i64 = row.try_get("applied").context("PostgreSQL migration count missing")?;
+    let head: Option<String> = row.try_get("head").context("PostgreSQL migration head missing")?;
+    if applied != EXPECTED_MIGRATIONS || head.as_deref() != Some(EXPECTED_HEAD) {
+        anyhow::bail!("PostgreSQL schema is not at the application migration head");
+    }
     Ok(())
 }
 

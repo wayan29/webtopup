@@ -17,6 +17,7 @@ use crate::routes::content::MAX_SLIDER_JSON_BYTES;
 
 pub mod articles;
 pub mod audit_logs;
+#[path = "auth_sql.rs"]
 pub mod auth;
 pub mod content;
 pub mod dashboard;
@@ -29,6 +30,7 @@ pub mod leaderboard;
 pub mod margins;
 pub mod notifications;
 pub mod open_api;
+pub mod orders;
 pub mod payment;
 pub mod products;
 pub mod reports;
@@ -52,59 +54,53 @@ pub fn app(state: Arc<AppState>) -> Router {
         .route("/health", get(health::health))
         .route(
             "/v2/auth/member/login",
-            axum::routing::post(auth::member_login),
+            axum::routing::post(crate::sql_auth::member_login),
         )
         .route(
             "/v2/auth/staff/login",
-            axum::routing::post(auth::staff_login),
+            axum::routing::post(crate::sql_auth::staff_login),
         )
-        .route("/v2/auth/register", axum::routing::post(auth::register))
-        .route("/v2/auth/refresh", axum::routing::post(auth::refresh))
-        .route("/v2/auth/unlock", axum::routing::post(auth::unlock))
-        .route("/v2/auth/step-up", axum::routing::post(auth::step_up))
-        .route("/v2/auth/logout", axum::routing::post(auth::logout))
-        .route(
-            "/v2/auth/session/migrate",
-            axum::routing::post(auth::migrate_legacy_session),
-        )
-        .route(
-            "/v2/internal/auth/legacy-migration/acknowledge",
-            axum::routing::post(auth::acknowledge_legacy_migration),
-        )
+        .route("/v2/auth/register", axum::routing::post(crate::sql_auth::register))
+        .route("/v2/auth/refresh", axum::routing::post(crate::sql_auth::refresh))
+        .route("/v2/auth/unlock", axum::routing::post(crate::sql_auth::unlock))
+        .route("/v2/auth/step-up", axum::routing::post(crate::sql_auth::step_up))
+        .route("/v2/auth/logout", axum::routing::post(crate::sql_auth::logout))
+        .route("/v2/internal/auth/admit", post(crate::sql_auth::internal_admit))
+        .route("/v2/internal/audit", post(audit_logs::sql_record_audit))
         .route(
             "/v2/auth/device-selection",
-            axum::routing::post(auth::device_selection),
+            axum::routing::post(crate::sql_auth::device_selection),
         )
-        .route("/v2/auth/me", get(auth::me))
-        .route("/v2/auth/2fa/status", get(auth::two_factor_status))
+        .route("/v2/auth/me", get(crate::sql_auth::me))
+        .route("/v2/auth/2fa/status", get(crate::sql_auth::two_factor_status))
         .route(
             "/v2/auth/2fa/login-verify",
-            axum::routing::post(auth::verify_two_factor_login),
+            axum::routing::post(crate::sql_auth::verify_two_factor_login),
         )
         .route(
             "/v2/auth/2fa/setup",
-            axum::routing::post(auth::two_factor_setup),
+            axum::routing::post(crate::sql_auth::two_factor_setup),
         )
         .route(
             "/v2/auth/2fa/confirm",
-            axum::routing::post(auth::two_factor_confirm),
+            axum::routing::post(crate::sql_auth::two_factor_confirm),
         )
         .route(
             "/v2/auth/2fa/disable",
-            axum::routing::post(auth::two_factor_disable),
+            axum::routing::post(crate::sql_auth::two_factor_disable),
         )
-        .route("/v2/auth/activity", post(auth::activity))
-        .route("/v2/auth/activity-status", get(auth::activity_status))
-        .route("/v2/auth/sessions", get(auth::list_sessions))
+        .route("/v2/auth/activity", post(crate::sql_auth::activity))
+        .route("/v2/auth/activity-status", get(crate::sql_auth::activity_status))
+        .route("/v2/auth/sessions", get(crate::sql_auth::list_sessions))
         .route(
             "/v2/auth/sessions/revoke-current",
-            post(auth::revoke_current),
+            post(crate::sql_auth::revoke_current),
         )
-        .route("/v2/auth/sessions/revoke-device", post(auth::revoke_device))
-        .route("/v2/auth/sessions/revoke-all", post(auth::revoke_all))
+        .route("/v2/auth/sessions/revoke-device", post(crate::sql_auth::revoke_device))
+        .route("/v2/auth/sessions/revoke-all", post(crate::sql_auth::revoke_all))
         .route(
             "/v2/auth/sessions/revoke",
-            axum::routing::post(auth::revoke_sessions),
+            axum::routing::post(crate::sql_auth::revoke_all),
         )
         .route("/v2/api/key", get(open_api::get_key))
         .route(
@@ -239,6 +235,8 @@ pub fn app(state: Arc<AppState>) -> Router {
             "/v2/vouchers/{id}/restore",
             axum::routing::patch(vouchers::restore),
         )
+        .route("/v2/webhook/digiflazz", post(webhooks::receive))
+        .route("/v2/webhook/tokovoucher", post(webhooks::receive))
         .route("/v2/webhook/{provider}/config", get(webhooks::config))
         .route(
             "/v2/webhook/{provider}/config",
@@ -363,6 +361,9 @@ pub fn app(state: Arc<AppState>) -> Router {
             "/v2/digiflazz-seller/orders/process-callback-retries/scheduler",
             post(digiflazz_seller::process_due_callback_retries_scheduler),
         )
+        .route("/v2/seller-callbacks/{channel}/{ref_id}/claim", post(digiflazz_seller::claim_seller_callback))
+        .route("/v2/seller-callbacks/{channel}/{ref_id}/fail", post(digiflazz_seller::fail_seller_callback))
+        .route("/v2/seller-callbacks/process-due", post(digiflazz_seller::process_sql_seller_callbacks))
         .route("/v2/sliders", get(content::sliders_public))
         .route("/v2/flash-sales/active", get(content::flash_sales_active))
         .route(
@@ -436,6 +437,7 @@ pub fn app(state: Arc<AppState>) -> Router {
             "/v2/reports/sales/export",
             get(reports::export_sales_report),
         )
+        .route("/v2/reports/sql/summary", get(reports::sql_report_summary))
         .route("/v2/rewards", get(rewards::rewards_public))
         .route("/v2/rewards/{id}", get(rewards::reward_public_detail))
         .route("/v2/rewards/admin/create", post(rewards::reward_create))
@@ -444,6 +446,10 @@ pub fn app(state: Arc<AppState>) -> Router {
             axum::routing::put(rewards::reward_update).delete(rewards::reward_delete),
         )
         .route("/v2/rewards/admin/all", get(rewards::rewards_admin_all))
+        .route("/v2/rewards/sql", post(rewards::sql_create_reward))
+        .route("/v2/rewards/sql/claim", post(rewards::sql_claim_reward))
+        .route("/v2/rewards/sql/refund", post(rewards::sql_refund_reward))
+        .route("/v2/rewards/sql/delete", post(rewards::sql_delete_reward))
         .route(
             "/v2/points/settings",
             get(rewards::points_settings).put(rewards::points_settings_update),

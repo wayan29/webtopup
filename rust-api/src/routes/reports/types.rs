@@ -1,12 +1,5 @@
 use serde::{ser::SerializeStruct, Deserialize, Serialize};
 
-#[derive(Clone, Copy)]
-pub(super) struct SimpleDate {
-    pub(super) year: i32,
-    pub(super) month: u32,
-    pub(super) day: u32,
-}
-
 #[derive(Deserialize)]
 pub struct SalesSummaryQuery {
     #[serde(rename = "startDate")]

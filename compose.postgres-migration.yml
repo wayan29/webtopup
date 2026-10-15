@@ -1,0 +1,37 @@
+name: webtopup-pg-migration
+services:
+  postgres:
+    image: postgres:17.6
+    network_mode: host
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: migration_admin
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_admin_password
+    secrets:
+      - postgres_admin_password
+    command: ["postgres", "-c", "listen_addresses=127.0.0.1", "-c", "port=55432"]
+    volumes:
+      - webtopup-pg-data:/var/lib/postgresql/data
+      - ./infra/postgres-migration/init.sql:/docker-entrypoint-initdb.d/010-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 55432 -U migration_admin -d webtopup_pg_dev"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  redis:
+    image: redis:8.2.2
+    network_mode: host
+    command: ["redis-server", "--bind", "127.0.0.1", "--port", "56379", "--protected-mode", "yes", "--save", "1 1", "--appendonly", "yes", "--dir", "/data", "--maxmemory", "128mb", "--maxmemory-policy", "noeviction", "--requirepass", "webtopup-dev-redis"]
+    volumes:
+      - webtopup-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-h", "127.0.0.1", "-p", "56379", "-a", "webtopup-dev-redis", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+secrets:
+  postgres_admin_password:
+    file: ./infra/postgres-migration/admin-password.txt
+volumes:
+  webtopup-pg-data:
+  webtopup-redis-data:

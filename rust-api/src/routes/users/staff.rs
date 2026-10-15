@@ -10,13 +10,11 @@
 use std::sync::Arc;
 
 use axum::{extract::State, response::IntoResponse, Json};
-use bcrypt::{hash, verify, DEFAULT_COST};
-use mongodb::bson::{doc, DateTime, Document};
 
-use crate::{security::require_team_user, state::AppState, utils::bson::read_string};
+use crate::state::AppState;
 
 use super::{
-    responses::{internal_error, not_found, status_message, unavailable},
+    responses::{internal_error, not_found, status_message},
     types::{ChangeMyPasswordPayload, UpdateStaffProfilePayload},
     validation::{validate_staff_password, validate_staff_profile, StaffCredentialError},
 };
@@ -43,14 +41,11 @@ fn credential_error_response(error: StaffCredentialError) -> axum::response::Res
     })
 }
 
-fn staff_profile_json(doc: &Document) -> serde_json::Value {
+fn staff_profile_json(user: &crate::sql_auth::User) -> serde_json::Value {
     serde_json::json!({
-        "id": doc.get_object_id("_id").map(|id| id.to_hex()).unwrap_or_default(),
-        "name": read_string(doc, "name"),
-        "email": read_string(doc, "email"),
-        "avatarUrl": read_string(doc, "avatarUrl"),
-        "role": read_string(doc, "role"),
-        "twoFactorEnabled": doc.get_bool("twoFactorEnabled").unwrap_or(false),
+        "id": user.id.to_string(), "name": user.name, "email": user.email,
+        "avatarUrl": user.avatar_url, "role": user.role,
+        "twoFactorEnabled": user.two_factor_enabled,
     })
 }
 
@@ -58,25 +53,12 @@ pub async fn staff_me_profile(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> axum::response::Response {
-    let staff = match require_team_user(&headers, &state).await {
-        Ok(user) => user,
-        Err(response) => return response,
+    let staff = match crate::sql_auth::current(&headers, &state).await {
+        Ok(user) if STAFF_ROLES.contains(&user.role.as_str()) => user,
+        Ok(_) => return status_message(axum::http::StatusCode::FORBIDDEN, "Forbidden: No access to admin panel"),
+        Err(error) => return error.into_response(),
     };
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let users = client
-        .database(&state.mongo_db)
-        .collection::<Document>("users");
-    match users
-        .find_one(doc! { "_id": staff.id, "role": { "$in": STAFF_ROLES.to_vec() } })
-        .projection(doc! { "_id": 1, "name": 1, "email": 1, "role": 1, "twoFactorEnabled": 1, "avatarUrl": 1 })
-        .await
-    {
-        Ok(Some(doc)) => Json(serde_json::json!({ "profile": staff_profile_json(&doc) })).into_response(),
-        Ok(None) => not_found("Akun staff tidak ditemukan"),
-        Err(_) => internal_error(),
-    }
+    Json(serde_json::json!({ "profile": staff_profile_json(&staff) })).into_response()
 }
 
 pub async fn update_staff_me_profile(
@@ -84,123 +66,50 @@ pub async fn update_staff_me_profile(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<UpdateStaffProfilePayload>,
 ) -> axum::response::Response {
-    let staff = match require_team_user(&headers, &state).await {
-        Ok(user) => user,
-        Err(response) => return response,
+    let staff = match crate::sql_auth::current(&headers, &state).await {
+        Ok(user) if STAFF_ROLES.contains(&user.role.as_str()) => user,
+        Ok(_) => return status_message(axum::http::StatusCode::FORBIDDEN, "Forbidden: No access to admin panel"),
+        Err(error) => return error.into_response(),
     };
-    let (name, email) = match validate_staff_profile(
-        &payload.name.unwrap_or_default(),
-        &payload.email.unwrap_or_default(),
-    ) {
+    let (name,email) = match validate_staff_profile(&payload.name.unwrap_or_default(), &payload.email.unwrap_or_default()) {
         Ok(values) => values,
         Err(error) => return credential_error_response(error),
     };
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let users = client
-        .database(&state.mongo_db)
-        .collection::<Document>("users");
-
-    // Email is a login identifier, so a collision would lock somebody out of their account.
-    match users
-        .find_one(doc! { "email": &email, "_id": { "$ne": staff.id } })
-        .projection(doc! { "_id": 1 })
-        .await
-    {
-        Ok(Some(_)) => return bad_request("Email sudah digunakan akun lain"),
-        Ok(None) => {}
+    let updated = sqlx::query_as::<_,crate::sql_auth::User>("UPDATE users SET name=$1,email=$2,updated_at=now() WHERE id=$3 AND role IN ('owner','admin','cs') RETURNING *")
+        .bind(name).bind(email).bind(staff.id).fetch_optional(&state.pg_pool).await;
+    let updated = match updated {
+        Ok(Some(user)) => user,
+        Ok(None) => return not_found("Akun staff tidak ditemukan"),
+        Err(error) if error.as_database_error().and_then(|db| db.code()).as_deref()==Some("23505") => return bad_request("Email sudah digunakan akun lain"),
         Err(_) => return internal_error(),
-    }
-
-    if users
-        .update_one(
-            doc! { "_id": staff.id, "role": { "$in": STAFF_ROLES.to_vec() } },
-            doc! { "$set": { "name": &name, "email": &email, "updatedAt": DateTime::now() } },
-        )
-        .await
-        .is_err()
-    {
-        return internal_error();
-    }
-
-    match users
-        .find_one(doc! { "_id": staff.id })
-        .projection(doc! { "_id": 1, "name": 1, "email": 1, "role": 1, "twoFactorEnabled": 1, "avatarUrl": 1 })
-        .await
-    {
-        Ok(Some(doc)) => Json(serde_json::json!({
-            "message": "Profil berhasil diperbarui",
-            "profile": staff_profile_json(&doc),
-        }))
-        .into_response(),
-        Ok(None) => not_found("Akun staff tidak ditemukan"),
-        Err(_) => internal_error(),
-    }
+    };
+    Json(serde_json::json!({"message":"Profil berhasil diperbarui","profile":staff_profile_json(&updated)})).into_response()
 }
+
 
 pub async fn change_staff_me_password(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<ChangeMyPasswordPayload>,
 ) -> axum::response::Response {
-    let staff = match require_team_user(&headers, &state).await {
-        Ok(user) => user,
-        Err(response) => return response,
+    let staff = match crate::sql_auth::current(&headers, &state).await {
+        Ok(user) if STAFF_ROLES.contains(&user.role.as_str()) => user,
+        Ok(_) => return status_message(axum::http::StatusCode::FORBIDDEN, "Forbidden: No access to admin panel"),
+        Err(error) => return error.into_response(),
     };
-    let current_password = payload.current_password.clone().unwrap_or_default();
-    let new_password = payload.new_password.clone().unwrap_or_default();
-    let confirm_password = payload.confirm_password.clone().unwrap_or_default();
-    if let Err(error) = validate_staff_password(&current_password, &new_password, &confirm_password)
-    {
-        return credential_error_response(error);
-    }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let users = client
-        .database(&state.mongo_db)
-        .collection::<Document>("users");
-    let user = match users
-        .find_one(doc! { "_id": staff.id, "role": { "$in": STAFF_ROLES.to_vec() } })
-        .projection(doc! { "password": 1, "active": 1 })
-        .await
-    {
-        Ok(Some(user)) => user,
-        Ok(None) => return not_found("Akun staff tidak ditemukan"),
-        Err(_) => return internal_error(),
-    };
-    if user.get_bool("active") == Ok(false) {
-        return status_message(axum::http::StatusCode::FORBIDDEN, "Akun tidak aktif");
-    }
-    let password_hash = read_string(&user, "password");
-    if password_hash.is_empty() {
-        return bad_request("Akun ini belum memiliki password lokal");
-    }
-    if !verify(&current_password, &password_hash).unwrap_or(false) {
-        return bad_request("Password saat ini tidak sesuai");
-    }
-    let hashed = match hash(&new_password, DEFAULT_COST) {
-        Ok(value) => value,
-        Err(_) => return internal_error(),
-    };
-    // Bumping sessionVersion revokes every other session, which is the point: a password
-    // change should evict whoever might already be holding the old one.
-    if users
-        .update_one(
-            doc! { "_id": staff.id },
-            doc! {
-                "$set": { "password": hashed, "updatedAt": DateTime::now() },
-                "$inc": { "sessionVersion": 1 },
-            },
-        )
-        .await
-        .is_err()
-    {
-        return internal_error();
-    }
-    Json(serde_json::json!({
-        "message": "Password berhasil diubah. Semua sesi telah dicabut."
-    }))
-    .into_response()
+    let current_password = payload.current_password.unwrap_or_default();
+    let new_password = payload.new_password.unwrap_or_default();
+    let confirm_password = payload.confirm_password.unwrap_or_default();
+    if let Err(error) = validate_staff_password(&current_password,&new_password,&confirm_password) { return credential_error_response(error); }
+    if !staff.active { return status_message(axum::http::StatusCode::FORBIDDEN,"Akun tidak aktif"); }
+    if staff.password_hash.is_empty() { return bad_request("Akun ini belum memiliki password lokal"); }
+    if !crate::sql_auth::verify_password(current_password,staff.password_hash).await { return bad_request("Password saat ini tidak sesuai"); }
+    let hashed = match crate::sql_auth::hash_password(new_password).await { Ok(value)=>value,Err(error)=>return error.into_response() };
+    let mut tx=match state.pg_pool.begin().await {Ok(tx)=>tx,Err(_)=>return internal_error()};
+    if sqlx::query("UPDATE users SET password_hash=$1,updated_at=now(),session_version=session_version+1,security_generation=security_generation+1 WHERE id=$2 AND role IN ('owner','admin','cs')")
+        .bind(hashed).bind(staff.id).execute(&mut *tx).await.is_err() { return internal_error(); }
+    if sqlx::query("UPDATE auth_sessions SET state='revoked',owns_slot=false WHERE user_id=$1 AND state IN ('active','locked')")
+        .bind(staff.id).execute(&mut *tx).await.is_err() { return internal_error(); }
+    if tx.commit().await.is_err() { return internal_error(); }
+    Json(serde_json::json!({"message":"Password berhasil diubah. Semua sesi telah dicabut."})).into_response()
 }

@@ -2,8 +2,6 @@ use std::{collections::HashMap, env, sync::Arc};
 
 use anyhow::Context;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use mongodb::{options::ClientOptions, Client};
-
 pub type RecoveryEncryptionKeyRing = RotationKeyRing;
 
 #[derive(Clone, Debug)]
@@ -77,26 +75,19 @@ fn bounded_key_id(value: &str) -> anyhow::Result<String> {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub mongo_client: Option<Client>,
-    pub mongo_db: String,
-    pub mongo_transactions_enabled: bool,
+    pub pg_pool: sqlx::PgPool,
     pub proxy_secret: String,
     pub jwt_secret: String,
     pub session_token_hash_secret: String,
     pub rotation_keys: RotationKeyRing,
     pub recovery_encryption_keys: RecoveryEncryptionKeyRing,
-    /// Readiness is false closed until startup proves exact indexes, registry integrity, and
-    /// transaction capability. Task 9/11 can inspect this without enabling writes in Task 7.
     pub slider_mutation_readiness: crate::services::slider_readiness::SliderMutationReadiness,
-    pub rollout_config: crate::routes::auth::security_audit::RolloutConfig,
 }
 
 impl AppState {
     pub async fn from_env() -> anyhow::Result<Arc<Self>> {
         Ok(Arc::new(Self {
-            mongo_client: connect_mongo().await?,
-            mongo_db: env::var("MONGO_DB").unwrap_or_else(|_| "POBB".to_string()),
-            mongo_transactions_enabled: mongo_transactions_enabled(),
+            pg_pool: connect_postgres().await?,
             proxy_secret: proxy_secret_from_env()?,
             jwt_secret: jwt_secret_from_env()?,
             session_token_hash_secret: session_token_hash_secret_from_env()?,
@@ -106,10 +97,6 @@ impl AppState {
                 &env::var("SESSION_ROTATION_KEYS")
                     .context("SESSION_ROTATION_KEYS must be configured")?,
             )?,
-            rollout_config: crate::routes::auth::security_audit::load_rollout_config_from_env()
-                .map_err(|error| {
-                    anyhow::anyhow!("invalid session rollout configuration: {error:?}")
-                })?,
             recovery_encryption_keys: RecoveryEncryptionKeyRing::parse(
                 &env::var("SESSION_RECOVERY_ENCRYPTION_ACTIVE_KEY_ID")
                     .context("SESSION_RECOVERY_ENCRYPTION_ACTIVE_KEY_ID must be configured")?,
@@ -121,15 +108,27 @@ impl AppState {
     }
 }
 
-fn mongo_transactions_enabled() -> bool {
-    env::var("MONGO_TRANSACTIONS_ENABLED")
-        .map(|value| {
-            !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        })
-        .unwrap_or(true)
+async fn connect_postgres() -> anyhow::Result<sqlx::PgPool> {
+    let database_url = env::var("DATABASE_URL").context("DATABASE_URL must be configured")?;
+    let expected = env::var("SQL_DATABASE").context("SQL_DATABASE must identify the target database")?;
+    let url = url::Url::parse(&database_url).context("DATABASE_URL must be a PostgreSQL URL")?;
+    if !matches!(url.scheme(), "postgres" | "postgresql")
+        || url.path().trim_start_matches('/') != expected
+        || !expected.starts_with("webtopup_ci_")
+    {
+        anyhow::bail!("SQL candidate database target rejected");
+    }
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(10)
+        .min_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(2))
+        .connect(&database_url)
+        .await
+        .context("PostgreSQL pool unavailable")?;
+    let actual: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&pool).await.context("PostgreSQL target verification failed")?;
+    if actual != expected { anyhow::bail!("PostgreSQL connected target mismatch"); }
+    Ok(pool)
 }
 
 fn proxy_secret_from_env() -> anyhow::Result<String> {
@@ -201,19 +200,4 @@ mod tests {
         assert_eq!(ring.active(), ("enc-new", &[4; 32]));
         assert_eq!(ring.get("enc-old"), Some(&[3; 32]));
     }
-}
-
-async fn connect_mongo() -> anyhow::Result<Option<Client>> {
-    let mongo_uri = match env::var("MONGO_URI") {
-        Ok(value) if !value.trim().is_empty() => value,
-        _ => return Ok(None),
-    };
-
-    let mut client_options = ClientOptions::parse(&mongo_uri)
-        .await
-        .context("failed to parse MONGO_URI")?;
-    client_options.app_name = Some("webtopup-api-v2".to_string());
-
-    let client = Client::with_options(client_options).context("failed to create MongoDB client")?;
-    Ok(Some(client))
 }

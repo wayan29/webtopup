@@ -1,5 +1,4 @@
 use axum::response::Response;
-use mongodb::bson::{Bson, Document};
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -24,14 +23,6 @@ pub(super) fn round_percent(amount: i64, percent: f64) -> i64 {
     ((amount as f64 * percent) / 100.0).round() as i64
 }
 
-pub(super) fn read_number_f64(document: &Document, key: &str) -> f64 {
-    match document.get(key) {
-        Some(Bson::Int32(value)) => f64::from(*value),
-        Some(Bson::Int64(value)) => *value as f64,
-        Some(Bson::Double(value)) => *value,
-        _ => 0.0,
-    }
-}
 
 pub(super) fn generate_unique_code() -> i64 {
     (rand::random::<u32>() % 999 + 1) as i64

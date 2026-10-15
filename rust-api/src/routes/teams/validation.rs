@@ -1,40 +1,7 @@
-use std::collections::HashMap;
-
 use axum::response::Response;
-use mongodb::bson::{doc, oid::ObjectId, Document};
 use serde_json::Value;
 
-use crate::utils::bson::escape_regex;
-
 use super::{responses::status_message, TEAM_PERMISSIONS};
-
-pub(super) fn build_team_filter(query: &HashMap<String, String>) -> Document {
-    let mut filter = doc! { "role": { "$in": ["owner", "admin", "cs"] } };
-    if let Some(search) = query
-        .get("search")
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-    {
-        let pattern = escape_regex(search);
-        filter.insert(
-            "$or",
-            vec![
-                doc! { "name": { "$regex": &pattern, "$options": "i" } },
-                doc! { "email": { "$regex": &pattern, "$options": "i" } },
-            ],
-        );
-    }
-    filter
-}
-
-pub(super) fn parse_team_member_id(id: &str) -> Result<ObjectId, Response> {
-    ObjectId::parse_str(id).map_err(|_| {
-        status_message(
-            axum::http::StatusCode::BAD_REQUEST,
-            "ID anggota tim tidak valid",
-        )
-    })
-}
 
 pub(super) fn normalize_name(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -51,7 +18,7 @@ pub(super) fn is_valid_email(value: &str) -> bool {
     !local.is_empty() && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.')
 }
 
-fn default_permissions(role: &str) -> Document {
+fn default_permissions(role: &str) -> Value {
     let enabled = if role == "admin" {
         [
             "viewDashboard",
@@ -80,74 +47,80 @@ fn default_permissions(role: &str) -> Document {
         ]
         .as_slice()
     };
-    let mut document = Document::new();
+    let mut permissions = serde_json::Map::new();
     for key in TEAM_PERMISSIONS {
-        document.insert(key, enabled.contains(&key));
+        permissions.insert(key.to_string(), Value::Bool(enabled.contains(&key)));
     }
-    document
+    Value::Object(permissions)
 }
 
-pub(super) fn build_permissions(input: Option<&Value>, role: &str) -> Document {
+fn permission_flag(permissions: &Value, key: &str) -> bool {
+    permissions.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn set_permission(permissions: &mut Value, key: &str, value: bool) {
+    if let Some(map) = permissions.as_object_mut() {
+        map.insert(key.to_string(), Value::Bool(value));
+    }
+}
+
+pub(super) fn build_permissions(input: Option<&Value>, role: &str) -> Value {
     let mut permissions = default_permissions(role);
     if let Some(Value::Object(map)) = input {
         for key in TEAM_PERMISSIONS {
             if let Some(Value::Bool(value)) = map.get(key) {
-                permissions.insert(key, *value);
+                set_permission(&mut permissions, key, *value);
             }
         }
     }
-    if permissions.get_bool("manageTeam").unwrap_or(false) {
-        permissions.insert("viewTeam", true);
+    if permission_flag(&permissions, "manageTeam") {
+        set_permission(&mut permissions, "viewTeam", true);
     }
-    if permissions.get_bool("manageProducts").unwrap_or(false) {
-        permissions.insert("viewProducts", true);
-        permissions.insert("manageVouchers", true);
+    if permission_flag(&permissions, "manageProducts") {
+        set_permission(&mut permissions, "viewProducts", true);
+        set_permission(&mut permissions, "manageVouchers", true);
     }
-    if permissions.get_bool("managePayment").unwrap_or(false) {
-        permissions.insert("viewPayment", true);
+    if permission_flag(&permissions, "managePayment") {
+        set_permission(&mut permissions, "viewPayment", true);
     }
-    if permissions.get_bool("manageUsers").unwrap_or(false) {
-        permissions.insert("viewUsers", true);
+    if permission_flag(&permissions, "manageUsers") {
+        set_permission(&mut permissions, "viewUsers", true);
     }
-    if permissions.get_bool("manageSettings").unwrap_or(false) {
-        permissions.insert("viewSettings", true);
+    if permission_flag(&permissions, "manageSettings") {
+        set_permission(&mut permissions, "viewSettings", true);
     }
-    if permissions.get_bool("manageVendors").unwrap_or(false) {
-        permissions.insert("viewVendors", true);
+    if permission_flag(&permissions, "manageVendors") {
+        set_permission(&mut permissions, "viewVendors", true);
     }
-    if permissions.get_bool("approveDeposits").unwrap_or(false) {
-        permissions.insert("viewDeposits", true);
+    if permission_flag(&permissions, "approveDeposits") {
+        set_permission(&mut permissions, "viewDeposits", true);
     }
     permissions
 }
 
 pub(super) fn clamp_permissions_to_actor(
-    mut permissions: Document,
-    actor_permissions: &Document,
-) -> Document {
+    mut permissions: Value,
+    actor_permissions: &Value,
+) -> Value {
     for key in TEAM_PERMISSIONS {
-        if permissions.get_bool(key).unwrap_or(false)
-            && !has_effective_permission(actor_permissions, key)
-        {
-            permissions.insert(key, false);
+        if permission_flag(&permissions, key) && !has_effective_permission(actor_permissions, key) {
+            set_permission(&mut permissions, key, false);
         }
     }
-    permissions.insert("viewDashboard", true);
+    set_permission(&mut permissions, "viewDashboard", true);
     permissions
 }
 
-fn has_effective_permission(permissions: &Document, permission: &str) -> bool {
-    permissions.get_bool(permission).unwrap_or(false)
+fn has_effective_permission(permissions: &Value, permission: &str) -> bool {
+    permission_flag(permissions, permission)
         || match permission {
-            "viewDeposits" => permissions.get_bool("approveDeposits").unwrap_or(false),
-            "viewProducts" | "manageVouchers" => {
-                permissions.get_bool("manageProducts").unwrap_or(false)
-            }
-            "viewPayment" => permissions.get_bool("managePayment").unwrap_or(false),
-            "viewUsers" => permissions.get_bool("manageUsers").unwrap_or(false),
-            "viewTeam" => permissions.get_bool("manageTeam").unwrap_or(false),
-            "viewSettings" => permissions.get_bool("manageSettings").unwrap_or(false),
-            "viewVendors" => permissions.get_bool("manageVendors").unwrap_or(false),
+            "viewDeposits" => permission_flag(permissions, "approveDeposits"),
+            "viewProducts" | "manageVouchers" => permission_flag(permissions, "manageProducts"),
+            "viewPayment" => permission_flag(permissions, "managePayment"),
+            "viewUsers" => permission_flag(permissions, "manageUsers"),
+            "viewTeam" => permission_flag(permissions, "manageTeam"),
+            "viewSettings" => permission_flag(permissions, "manageSettings"),
+            "viewVendors" => permission_flag(permissions, "manageVendors"),
             _ => false,
         }
 }
@@ -196,23 +169,23 @@ mod tests {
             "viewDeposits": false,
         });
         let permissions = build_permissions(Some(&input), "cs");
-        assert_eq!(permissions.get_bool("approveDeposits"), Ok(true));
-        assert_eq!(permissions.get_bool("viewDeposits"), Ok(true));
+        assert_eq!(permissions.get("approveDeposits"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(permissions.get("viewDeposits"), Some(&serde_json::Value::Bool(true)));
     }
 
     #[test]
     fn deposit_permission_clamp_uses_effective_actor() {
-        let target = doc! {
+        let target = serde_json::json!({
             "approveDeposits": true,
             "viewDeposits": true,
-        };
-        let actor = doc! {
+        });
+        let actor = serde_json::json!({
             "approveDeposits": true,
             "viewDeposits": false,
-        };
+        });
 
         let clamped = clamp_permissions_to_actor(target, &actor);
-        assert_eq!(clamped.get_bool("approveDeposits"), Ok(true));
-        assert_eq!(clamped.get_bool("viewDeposits"), Ok(true));
+        assert_eq!(clamped.get("approveDeposits"), Some(&serde_json::Value::Bool(true)));
+        assert_eq!(clamped.get("viewDeposits"), Some(&serde_json::Value::Bool(true)));
     }
 }

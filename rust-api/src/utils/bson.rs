@@ -1,33 +1,26 @@
-use mongodb::bson::{Bson, Document};
+use serde_json::Value;
 
-pub fn read_i64(document: &Document, key: &str) -> i64 {
-    match document.get(key) {
-        Some(Bson::Int32(value)) => i64::from(*value),
-        Some(Bson::Int64(value)) => *value,
-        Some(Bson::Double(value)) => *value as i64,
-        _ => 0,
-    }
+pub fn read_i64(document: &Value, key: &str) -> i64 {
+    optional_i64(document, key).unwrap_or_default()
 }
 
-pub fn optional_i64(document: &Document, key: &str) -> Option<i64> {
+pub fn optional_i64(document: &Value, key: &str) -> Option<i64> {
     match document.get(key) {
-        Some(Bson::Int32(value)) => Some(i64::from(*value)),
-        Some(Bson::Int64(value)) => Some(*value),
-        Some(Bson::Double(value)) => Some(*value as i64),
+        Some(Value::Number(value)) => value.as_i64().or_else(|| value.as_f64().map(|v| v as i64)),
+        Some(Value::String(value)) => value.trim().parse().ok(),
         _ => None,
     }
 }
 
-pub fn read_string(document: &Document, key: &str) -> String {
+pub fn read_string(document: &Value, key: &str) -> String {
     optional_string(document, key).unwrap_or_default()
 }
 
-pub fn optional_string(document: &Document, key: &str) -> Option<String> {
-    document
-        .get_str(key)
-        .ok()
-        .map(ToString::to_string)
-        .filter(|value| !value.is_empty())
+pub fn optional_string(document: &Value, key: &str) -> Option<String> {
+    match document.get(key) {
+        Some(Value::String(value)) if !value.is_empty() => Some(value.clone()),
+        _ => None,
+    }
 }
 
 pub fn escape_regex(value: &str) -> String {

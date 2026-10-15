@@ -3,15 +3,16 @@ use axum::{
     response::IntoResponse,
     response::Response,
 };
-use mongodb::bson::{Bson, DateTime, Document};
+use chrono::Utc;
+use serde_json::Value;
 
 use crate::utils::bson::{optional_i64, read_string};
 
 use crate::services::audit_sanitize::{sanitize_audit_document, AUDIT_REDACTION};
 
-pub fn csv_response(items: &[Document], truncated: bool) -> Response {
+pub fn csv_response(items: &[Value], truncated: bool) -> Response {
     let csv = build_audit_csv(items);
-    let filename = format!("admin-audit-logs-{}.csv", date_key(DateTime::now()));
+    let filename = format!("admin-audit-logs-{}.csv", date_key());
     let mut response_headers = HeaderMap::new();
     response_headers.insert(
         header::CONTENT_TYPE,
@@ -30,7 +31,7 @@ pub fn csv_response(items: &[Document], truncated: bool) -> Response {
     (StatusCode::OK, response_headers, format!("\u{FEFF}{csv}")).into_response()
 }
 
-fn build_audit_csv(items: &[Document]) -> String {
+fn build_audit_csv(items: &[Value]) -> String {
     let mut rows = vec![vec![
         "Tanggal".to_string(),
         "Actor".to_string(),
@@ -48,11 +49,7 @@ fn build_audit_csv(items: &[Document]) -> String {
     ]];
 
     for item in items {
-        let metadata = item
-            .get_document("metadata")
-            .ok()
-            .map(sanitize_audit_document)
-            .map(Bson::Document);
+        let metadata = item.get("metadata").map(sanitize_audit_document);
         rows.push(vec![
             csv_date(item, "createdAt"),
             read_string(item, "actorName"),
@@ -68,10 +65,7 @@ fn build_audit_csv(items: &[Document]) -> String {
             read_string(item, "ip"),
             read_string(item, "userAgent"),
             read_string(item, "summary"),
-            metadata
-                .as_ref()
-                .map(bson_to_json_string)
-                .unwrap_or_default(),
+            metadata.as_ref().map(Value::to_string).unwrap_or_default(),
         ]);
     }
 
@@ -101,38 +95,28 @@ fn neutralize_csv_formula(value: &str) -> String {
     }
 }
 
-fn csv_date(document: &Document, key: &str) -> String {
+fn csv_date(document: &Value, key: &str) -> String {
     document
-        .get_datetime(key)
-        .ok()
-        .and_then(|value| value.try_to_rfc3339_string().ok())
+        .get(key)
+        .and_then(Value::as_str)
         .unwrap_or_default()
+        .to_string()
 }
 
-fn date_key(date: DateTime) -> String {
-    date.try_to_rfc3339_string()
-        .ok()
-        .and_then(|value| value.get(0..10).map(ToString::to_string))
-        .unwrap_or_else(|| "unknown-date".to_string())
-}
-
-fn bson_to_json_string(value: &Bson) -> String {
-    match mongodb::bson::from_bson::<serde_json::Value>(value.clone()) {
-        Ok(value) => value.to_string(),
-        Err(_) => value.to_string(),
-    }
+fn date_key() -> String {
+    Utc::now().format("%Y-%m-%d").to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::to_bytes;
-    use mongodb::bson::doc;
+    use serde_json::json;
 
     #[tokio::test]
     async fn export_sets_truncation_headers_and_redacts_metadata() {
-        let item = doc! {
-            "createdAt": DateTime::now(),
+        let item = json!({
+            "createdAt": "2023-11-14T22:13:20.000Z",
             "actorName": "Audit Fixture",
             "actorEmail": "audit-fixture@task14.invalid",
             "actorRole": "cs",
@@ -148,7 +132,7 @@ mod tests {
                 "pin": "fixture-value",
                 "shipping": "visible",
             },
-        };
+        });
 
         let response = csv_response(std::slice::from_ref(&item), false);
         assert_eq!(

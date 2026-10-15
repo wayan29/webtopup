@@ -22,6 +22,6 @@ pub fn api_error(status: axum::http::StatusCode, message: &'static str) -> Respo
 pub fn unavailable() -> Response {
     status_message(
         axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        "MONGO_URI is not configured",
+        "PostgreSQL unavailable",
     )
 }

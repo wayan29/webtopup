@@ -1,7 +1,6 @@
 use axum::{http::StatusCode, response::IntoResponse, Json};
-use mongodb::bson::{doc, oid::ObjectId, Document};
 
-use crate::{security::ErrorResponse, utils::bson::read_string};
+use crate::security::ErrorResponse;
 
 use super::{GuestStatusPayload, OwnedErrorResponse};
 
@@ -12,84 +11,6 @@ pub(super) struct NormalizedGuestStatusPayload {
     pub(super) sn: Option<Option<String>>,
 }
 
-pub(super) async fn guest_cancel_rejection(
-    collection: &mongodb::Collection<Document>,
-    transaction_id: ObjectId,
-) -> axum::response::Response {
-    let existing = match collection
-        .find_one(doc! { "_id": transaction_id })
-        .projection(doc! { "paymentStatus": 1, "transactionStatus": 1 })
-        .await
-    {
-        Ok(value) => value,
-        Err(_) => return internal_error(),
-    };
-    let Some(existing) = existing else {
-        return status_message(StatusCode::NOT_FOUND, "Transaksi guest tidak ditemukan");
-    };
-    let payment_status = read_string(&existing, "paymentStatus");
-    let transaction_status = read_string(&existing, "transactionStatus");
-
-    if payment_status == "cancelled" {
-        return status_message(StatusCode::BAD_REQUEST, "Transaksi guest sudah dibatalkan");
-    }
-    if payment_status == "expired" {
-        return status_message(StatusCode::BAD_REQUEST, "Transaksi guest sudah expired");
-    }
-    if payment_status == "paid" && transaction_status == "processing" {
-        return status_message(
-            StatusCode::BAD_REQUEST,
-            "Transaksi guest yang sudah diproses vendor tidak bisa langsung dibatalkan. Selesaikan status fulfillment terlebih dahulu.",
-        );
-    }
-    if payment_status == "paid" && transaction_status == "success" {
-        return status_message(
-            StatusCode::BAD_REQUEST,
-            "Transaksi guest yang sukses tidak bisa dibatalkan",
-        );
-    }
-
-    status_message(
-        StatusCode::BAD_REQUEST,
-        "Transaksi guest tidak bisa dibatalkan",
-    )
-}
-
-pub(super) async fn guest_confirm_rejection(
-    collection: &mongodb::Collection<Document>,
-    transaction_id: ObjectId,
-) -> axum::response::Response {
-    let existing = match collection
-        .find_one(doc! { "_id": transaction_id })
-        .projection(doc! { "paymentStatus": 1, "transactionStatus": 1, "expiredAt": 1 })
-        .await
-    {
-        Ok(value) => value,
-        Err(_) => return internal_error(),
-    };
-    let Some(existing) = existing else {
-        return status_message(StatusCode::NOT_FOUND, "Transaksi guest tidak ditemukan");
-    };
-    let payment_status = read_string(&existing, "paymentStatus");
-
-    if payment_status == "paid" {
-        return status_message(
-            StatusCode::BAD_REQUEST,
-            "Pembayaran guest sudah dikonfirmasi sebelumnya",
-        );
-    }
-    if payment_status == "cancelled" {
-        return status_message(StatusCode::BAD_REQUEST, "Transaksi guest sudah dibatalkan");
-    }
-    if payment_status == "expired" {
-        return status_message(StatusCode::BAD_REQUEST, "Transaksi guest sudah expired");
-    }
-
-    status_message(
-        StatusCode::BAD_REQUEST,
-        "Transaksi guest tidak bisa dikonfirmasi",
-    )
-}
 
 pub(super) fn normalize_guest_status_payload(
     payload: GuestStatusPayload,

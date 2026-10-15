@@ -1,288 +1,39 @@
-use std::collections::HashMap;
+use std::sync::Arc;
 
-use futures_util::TryStreamExt;
-use mongodb::bson::{doc, Document};
+use axum::{extract::{Query, State}, response::IntoResponse, Json};
+use serde::Serialize;
+use sqlx::Row;
 
-use crate::utils::bson::read_string;
+use crate::{security::require_sql_permission, state::AppState};
+use super::types::CatalogAuditQuery;
 
-use super::{
-    get_non_empty, id_from_bson, id_from_document, normalize, CatalogAuditEntityItem,
-    CatalogAuditItem, CatalogAuditReport, CatalogAuditSummary, CatalogCategory, CatalogOperator,
-    CatalogProduct, CatalogProductType,
-};
+#[derive(Serialize)]
+struct AuditSummary { categories: i64, operators: i64, product_types: i64, products: i64, products_with_issues: i64, empty_active_categories: i64, empty_active_operators: i64, empty_active_product_types: i64 }
+#[derive(Serialize)]
+struct AuditIssue { id: String, code: String, name: String, status: bool, category: String, brand: String, category_id: Option<String>, operator_id: Option<String>, product_type_id: Option<String>, issues: Vec<String> }
+#[derive(Serialize)]
+struct EmptyEntity { name: String, slug: String, category_id: Option<String>, operator_id: Option<String> }
+#[derive(Serialize)]
+struct AuditReport { generated_at: chrono::DateTime<chrono::Utc>, summary: AuditSummary, issue_counts: std::collections::BTreeMap<String, i64>, examples: Vec<AuditIssue>, empty_active_categories: Vec<EmptyEntity>, empty_active_operators: Vec<EmptyEntity>, empty_active_product_types: Vec<EmptyEntity> }
 
-pub(super) async fn load_documents(collection: mongodb::Collection<Document>) -> Vec<Document> {
-    match collection.find(doc! {}).await {
-        Ok(cursor) => cursor.try_collect::<Vec<_>>().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
-    }
-}
-
-pub(super) fn run_catalog_audit(
-    limit: usize,
-    categories: Vec<CatalogCategory>,
-    operators: Vec<CatalogOperator>,
-    product_types: Vec<CatalogProductType>,
-    products: Vec<CatalogProduct>,
-) -> CatalogAuditReport {
-    let categories_by_id = categories
-        .iter()
-        .map(|item| (item.id.clone(), item.clone()))
-        .collect::<HashMap<_, _>>();
-    let operators_by_id = operators
-        .iter()
-        .map(|item| (item.id.clone(), item.clone()))
-        .collect::<HashMap<_, _>>();
-    let product_types_by_id = product_types
-        .iter()
-        .map(|item| (item.id.clone(), item.clone()))
-        .collect::<HashMap<_, _>>();
-
-    let mut categories_by_name: HashMap<String, Vec<CatalogCategory>> = HashMap::new();
-    for category in &categories {
-        categories_by_name
-            .entry(normalize(&category.name))
-            .or_default()
-            .push(category.clone());
-    }
-    let mut operators_by_name: HashMap<String, Vec<CatalogOperator>> = HashMap::new();
-    for operator in &operators {
-        operators_by_name
-            .entry(normalize(&operator.name))
-            .or_default()
-            .push(operator.clone());
-    }
-
-    let audited_products = products
-        .iter()
-        .map(|product| {
-            let category =
-                get_non_empty(&product.category_id).and_then(|id| categories_by_id.get(id));
-            let operator =
-                get_non_empty(&product.operator_id).and_then(|id| operators_by_id.get(id));
-            let product_type =
-                get_non_empty(&product.product_type_id).and_then(|id| product_types_by_id.get(id));
-            let mut issues = Vec::new();
-
-            if product.category_id.is_empty() {
-                issues.push("missing_category_id".to_string());
-            }
-            if product.operator_id.is_empty() {
-                issues.push("missing_operator_id".to_string());
-            }
-            if product.product_type_id.is_empty() {
-                issues.push("missing_product_type_id".to_string());
-            }
-            if !product.category_id.is_empty() && category.is_none() {
-                issues.push("missing_category_ref".to_string());
-            }
-            if !product.operator_id.is_empty() && operator.is_none() {
-                issues.push("missing_operator_ref".to_string());
-            }
-            if !product.product_type_id.is_empty() && product_type.is_none() {
-                issues.push("missing_product_type_ref".to_string());
-            }
-            if category.is_some_and(|value| !value.status) {
-                issues.push("inactive_category".to_string());
-            }
-            if operator.is_some_and(|value| !value.status) {
-                issues.push("inactive_operator".to_string());
-            }
-            if product_type.is_some_and(|value| !value.status) {
-                issues.push("inactive_product_type".to_string());
-            }
-            if let (Some(category), Some(operator)) = (category, operator) {
-                if operator.category_id != category.id {
-                    issues.push("operator_category_mismatch".to_string());
-                }
-            }
-            if let (Some(product_type), Some(operator)) = (product_type, operator) {
-                if product_type.operator_id != operator.id {
-                    issues.push("type_operator_mismatch".to_string());
-                }
-            }
-            if let (Some(product_type), Some(category)) = (product_type, category) {
-                if product_type.category_id != category.id {
-                    issues.push("type_category_mismatch".to_string());
-                }
-            }
-            if let Some(category) = category {
-                if !normalize(&product.category).is_empty()
-                    && normalize(&product.category) != normalize(&category.name)
-                {
-                    issues.push("legacy_category_text_mismatch".to_string());
-                }
-            }
-            if let Some(operator) = operator {
-                if !normalize(&product.brand).is_empty()
-                    && normalize(&product.brand) != normalize(&operator.name)
-                {
-                    issues.push("legacy_brand_mismatch".to_string());
-                }
-            }
-            if product.category_id.is_empty() && !normalize(&product.category).is_empty() {
-                let matches = categories_by_name
-                    .get(&normalize(&product.category))
-                    .map(Vec::len)
-                    .unwrap_or_default();
-                if matches == 0 {
-                    issues.push("unresolved_legacy_category".to_string());
-                }
-            }
-            if product.operator_id.is_empty() && !normalize(&product.brand).is_empty() {
-                let matches = operators_by_name
-                    .get(&normalize(&product.brand))
-                    .map(Vec::len)
-                    .unwrap_or_default();
-                if matches == 0 {
-                    issues.push("unresolved_legacy_brand".to_string());
-                } else if matches > 1 {
-                    issues.push("ambiguous_legacy_brand".to_string());
-                }
-            }
-
-            CatalogAuditItem {
-                id: product.id.clone(),
-                code: product.code.clone(),
-                name: product.name.clone(),
-                status: product.status,
-                category: product.category.clone(),
-                brand: product.brand.clone(),
-                category_id: product.category_id.clone(),
-                operator_id: product.operator_id.clone(),
-                product_type_id: product.product_type_id.clone(),
-                issues,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    let mut issue_counts = HashMap::new();
-    for product in &audited_products {
-        for issue in &product.issues {
-            *issue_counts.entry(issue.clone()).or_insert(0) += 1;
-        }
-    }
-
-    let products_with_issues = audited_products
-        .iter()
-        .filter(|item| !item.issues.is_empty())
-        .cloned()
-        .collect::<Vec<_>>();
-
-    let mut product_counts_by_category: HashMap<String, i64> = HashMap::new();
-    let mut product_counts_by_operator: HashMap<String, i64> = HashMap::new();
-    let mut product_counts_by_type: HashMap<String, i64> = HashMap::new();
-    for product in &products {
-        if !product.category_id.is_empty() {
-            *product_counts_by_category
-                .entry(product.category_id.clone())
-                .or_default() += 1;
-        }
-        if !product.operator_id.is_empty() {
-            *product_counts_by_operator
-                .entry(product.operator_id.clone())
-                .or_default() += 1;
-        }
-        if !product.product_type_id.is_empty() {
-            *product_counts_by_type
-                .entry(product.product_type_id.clone())
-                .or_default() += 1;
-        }
-    }
-
-    let empty_active_categories = categories
-        .iter()
-        .filter(|item| item.status && !product_counts_by_category.contains_key(&item.id))
-        .map(|item| CatalogAuditEntityItem {
-            name: item.name.clone(),
-            slug: item.slug.clone(),
-            category_id: None,
-            operator_id: None,
-        })
-        .collect::<Vec<_>>();
-    let empty_active_operators = operators
-        .iter()
-        .filter(|item| item.status && !product_counts_by_operator.contains_key(&item.id))
-        .map(|item| CatalogAuditEntityItem {
-            name: item.name.clone(),
-            slug: item.slug.clone(),
-            category_id: Some(item.category_id.clone()),
-            operator_id: None,
-        })
-        .collect::<Vec<_>>();
-    let empty_active_product_types = product_types
-        .iter()
-        .filter(|item| item.status && !product_counts_by_type.contains_key(&item.id))
-        .map(|item| CatalogAuditEntityItem {
-            name: item.name.clone(),
-            slug: item.slug.clone(),
-            category_id: Some(item.category_id.clone()),
-            operator_id: Some(item.operator_id.clone()),
-        })
-        .collect::<Vec<_>>();
-
-    CatalogAuditReport {
-        generated_at: mongodb::bson::DateTime::now()
-            .try_to_rfc3339_string()
-            .unwrap_or_default(),
-        summary: CatalogAuditSummary {
-            categories: categories.len(),
-            operators: operators.len(),
-            product_types: product_types.len(),
-            products: products.len(),
-            products_with_issues: products_with_issues.len(),
-            empty_active_categories: empty_active_categories.len(),
-            empty_active_operators: empty_active_operators.len(),
-            empty_active_product_types: empty_active_product_types.len(),
-        },
-        issue_counts,
-        examples: products_with_issues.into_iter().take(limit).collect(),
-        empty_active_categories: empty_active_categories.into_iter().take(limit).collect(),
-        empty_active_operators: empty_active_operators.into_iter().take(limit).collect(),
-        empty_active_product_types: empty_active_product_types.into_iter().take(limit).collect(),
-    }
-}
-
-pub(super) fn catalog_category_from_doc(document: Document) -> CatalogCategory {
-    CatalogCategory {
-        id: id_from_document(&document),
-        name: read_string(&document, "name"),
-        slug: read_string(&document, "slug"),
-        status: document.get_bool("status").unwrap_or(true),
-    }
-}
-
-pub(super) fn catalog_operator_from_doc(document: Document) -> CatalogOperator {
-    CatalogOperator {
-        id: id_from_document(&document),
-        name: read_string(&document, "name"),
-        slug: read_string(&document, "slug"),
-        status: document.get_bool("status").unwrap_or(true),
-        category_id: id_from_bson(document.get("categoryId")),
-    }
-}
-
-pub(super) fn catalog_product_type_from_doc(document: Document) -> CatalogProductType {
-    CatalogProductType {
-        id: id_from_document(&document),
-        name: read_string(&document, "name"),
-        slug: read_string(&document, "slug"),
-        status: document.get_bool("status").unwrap_or(true),
-        operator_id: id_from_bson(document.get("operatorId")),
-        category_id: id_from_bson(document.get("categoryId")),
-    }
-}
-
-pub(super) fn catalog_product_from_doc(document: Document) -> CatalogProduct {
-    CatalogProduct {
-        id: id_from_document(&document),
-        code: read_string(&document, "code"),
-        name: read_string(&document, "name"),
-        status: document.get_bool("status").unwrap_or(false),
-        category: read_string(&document, "category"),
-        brand: read_string(&document, "brand"),
-        category_id: id_from_bson(document.get("categoryId")),
-        operator_id: id_from_bson(document.get("operatorId")),
-        product_type_id: id_from_bson(document.get("productTypeId")),
-    }
+pub async fn catalog_audit(headers: axum::http::HeaderMap, State(state): State<Arc<AppState>>, Query(query): Query<CatalogAuditQuery>) -> impl IntoResponse {
+    if let Err(response) = require_sql_permission(&headers, &state, "manageProducts").await { return response; }
+    let limit = query.limit.unwrap_or(100).clamp(1, 500) as i64;
+    let counts = sqlx::query("SELECT (SELECT count(*) FROM categories) categories,(SELECT count(*) FROM operators) operators,(SELECT count(*) FROM product_types) product_types,(SELECT count(*) FROM products) products,(SELECT count(*) FROM categories c WHERE c.status AND NOT EXISTS(SELECT 1 FROM operators o WHERE o.category_id=c.id)) empty_active_categories,(SELECT count(*) FROM operators o WHERE o.status AND NOT EXISTS(SELECT 1 FROM products p WHERE p.operator_id=o.id)) empty_active_operators,(SELECT count(*) FROM product_types t WHERE t.status AND NOT EXISTS(SELECT 1 FROM products p WHERE p.product_type_id=t.id)) empty_active_product_types")
+        .fetch_one(&state.pg_pool).await;
+    let counts = match counts { Ok(row) => row, Err(_) => return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"message":"Database unavailable"}))).into_response() };
+    let issue_rows = sqlx::query("SELECT p.id::text id,p.code,p.name,p.status,p.category,p.brand,p.category_id::text category_id,p.operator_id::text operator_id,p.product_type_id::text product_type_id,ARRAY_REMOVE(ARRAY[CASE WHEN p.category_id IS NULL THEN 'missing_category_id' END,CASE WHEN p.operator_id IS NULL THEN 'missing_operator_id' END,CASE WHEN p.product_type_id IS NULL THEN 'missing_product_type_id' END,CASE WHEN p.category_id IS NOT NULL AND c.id IS NULL THEN 'missing_category_ref' END,CASE WHEN p.operator_id IS NOT NULL AND o.id IS NULL THEN 'missing_operator_ref' END,CASE WHEN p.product_type_id IS NOT NULL AND t.id IS NULL THEN 'missing_product_type_ref' END,CASE WHEN c.id IS NOT NULL AND NOT c.status THEN 'inactive_category' END,CASE WHEN o.id IS NOT NULL AND NOT o.status THEN 'inactive_operator' END,CASE WHEN t.id IS NOT NULL AND NOT t.status THEN 'inactive_product_type' END,CASE WHEN o.id IS NOT NULL AND c.id IS NOT NULL AND o.category_id<>c.id THEN 'operator_category_mismatch' END,CASE WHEN t.id IS NOT NULL AND o.id IS NOT NULL AND t.operator_id<>o.id THEN 'type_operator_mismatch' END,CASE WHEN t.id IS NOT NULL AND c.id IS NOT NULL AND t.category_id<>c.id THEN 'type_category_mismatch' END],NULL) issues FROM products p LEFT JOIN categories c ON c.id=p.category_id LEFT JOIN operators o ON o.id=p.operator_id LEFT JOIN product_types t ON t.id=p.product_type_id WHERE p.category_id IS NULL OR p.operator_id IS NULL OR p.product_type_id IS NULL OR c.id IS NULL OR o.id IS NULL OR t.id IS NULL OR NOT c.status OR NOT o.status OR NOT t.status OR (c.id IS NOT NULL AND o.id IS NOT NULL AND o.category_id<>c.id) OR (t.id IS NOT NULL AND o.id IS NOT NULL AND t.operator_id<>o.id) OR (t.id IS NOT NULL AND c.id IS NOT NULL AND t.category_id<>c.id) ORDER BY p.id LIMIT $1")
+        .bind(limit).fetch_all(&state.pg_pool).await;
+    let rows = match issue_rows { Ok(rows) => rows, Err(_) => return (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"message":"Database unavailable"}))).into_response() };
+    let examples: Vec<AuditIssue> = rows.iter().map(|r| { let issues:Vec<String>=r.get("issues"); AuditIssue{id:r.get("id"),code:r.get("code"),name:r.get("name"),status:r.get("status"),category:r.get("category"),brand:r.get("brand"),category_id:r.get("category_id"),operator_id:r.get("operator_id"),product_type_id:r.get("product_type_id"),issues} }).collect();
+    let mut issue_counts=std::collections::BTreeMap::new(); for item in &examples { for issue in &item.issues { *issue_counts.entry(issue.clone()).or_insert(0)+=1; } }
+    let categories=sqlx::query("SELECT c.name,c.slug FROM categories c WHERE c.status AND NOT EXISTS(SELECT 1 FROM operators o WHERE o.category_id=c.id) ORDER BY c.name LIMIT $1").bind(limit).fetch_all(&state.pg_pool).await;
+    let operators=sqlx::query("SELECT o.name,o.slug,o.category_id::text category_id FROM operators o WHERE o.status AND NOT EXISTS(SELECT 1 FROM products p WHERE p.operator_id=o.id) ORDER BY o.name LIMIT $1").bind(limit).fetch_all(&state.pg_pool).await;
+    let types=sqlx::query("SELECT t.name,t.slug,t.category_id::text category_id,t.operator_id::text operator_id FROM product_types t WHERE t.status AND NOT EXISTS(SELECT 1 FROM products p WHERE p.product_type_id=t.id) ORDER BY t.name LIMIT $1").bind(limit).fetch_all(&state.pg_pool).await;
+    let (Ok(categories),Ok(operators),Ok(types))=(categories,operators,types) else { return (axum::http::StatusCode::SERVICE_UNAVAILABLE,Json(serde_json::json!({"message":"Database unavailable"}))).into_response(); };
+    let empty_active_categories=categories.iter().map(|r|EmptyEntity{name:r.get("name"),slug:r.get("slug"),category_id:None,operator_id:None}).collect();
+    let empty_active_operators=operators.iter().map(|r|EmptyEntity{name:r.get("name"),slug:r.get("slug"),category_id:r.get("category_id"),operator_id:None}).collect();
+    let empty_active_product_types=types.iter().map(|r|EmptyEntity{name:r.get("name"),slug:r.get("slug"),category_id:r.get("category_id"),operator_id:r.get("operator_id")}).collect();
+    let product_count:i64=counts.get("products"); let issue_count=examples.len() as i64;
+    Json(AuditReport{generated_at:chrono::Utc::now(),summary:AuditSummary{categories:counts.get("categories"),operators:counts.get("operators"),product_types:counts.get("product_types"),products:product_count,products_with_issues:issue_count,empty_active_categories:counts.get("empty_active_categories"),empty_active_operators:counts.get("empty_active_operators"),empty_active_product_types:counts.get("empty_active_product_types")},issue_counts,examples,empty_active_categories,empty_active_operators,empty_active_product_types}).into_response()
 }

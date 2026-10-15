@@ -1,24 +1,11 @@
-mod audit;
 mod log_handlers;
-mod logs;
-mod mappers;
-mod member_create;
-mod member_reads;
-mod member_status;
-mod member_update;
-mod queries;
 mod responses;
-mod security;
-mod session;
+mod sql_members;
 mod types;
 mod validation;
 
 pub use log_handlers::{all_login_logs, audit_logs, login_logs};
-pub use member_create::create_member;
-pub use member_reads::{admin_detail, admin_list};
-pub use member_status::{archive_member, toggle_member};
-pub use member_update::update_member;
-pub use security::reset_member_two_factor;
+pub use sql_members::{admin_detail, admin_list, archive_member, create_member, reset_member_two_factor, toggle_member, update_member};
 
 const TEAM_PERMISSIONS: [&str; 19] = [
     "viewDashboard",

@@ -1,18 +1,12 @@
 use axum::response::Response;
-use mongodb::bson::Document;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::utils::bson::read_string;
-
-use super::{
-    responses::status_message,
-    types::{ArticlePayload, NormalizedArticlePayload},
-};
+use super::{responses::status_message, types::{ArticlePayload, NormalizedArticlePayload}};
 
 pub fn build_article_payload(
     payload: ArticlePayload,
-    current: Option<&Document>,
+    current: Option<&Value>,
 ) -> Result<NormalizedArticlePayload, Response> {
     let title = text_value_or_current(payload.title, current, "title", "");
     if title.is_empty() {
@@ -91,7 +85,7 @@ pub fn build_article_payload(
 
 fn text_value_or_current(
     value: Option<Value>,
-    current: Option<&Document>,
+    current: Option<&Value>,
     key: &str,
     default: &str,
 ) -> String {
@@ -112,13 +106,8 @@ fn text_value(value: Option<Value>) -> Option<String> {
     }
 }
 
-fn read_string_default(document: &Document, key: &str, default: &str) -> String {
-    let value = read_string(document, key);
-    if value.is_empty() {
-        default.to_string()
-    } else {
-        value
-    }
+fn read_string_default(document: &Value, key: &str, default: &str) -> String {
+    document.get(key).and_then(Value::as_str).filter(|value| !value.is_empty()).unwrap_or(default).to_string()
 }
 
 fn slugify_title(value: &str) -> String {

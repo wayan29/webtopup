@@ -1,10 +1,8 @@
 mod categories;
-mod mappers;
 mod methods;
-mod queries;
 mod responses;
-mod types;
 mod utils;
+mod types;
 mod validation;
 
 pub use categories::*;

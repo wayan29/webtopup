@@ -21,10 +21,10 @@ pub struct OpsSnapshotResponse {
 pub struct PromoOpsSummary {
     /// Active balance vouchers idle >30 days (not redeemed, not archived).
     pub idle_vouchers: i64,
-    /// Completed balance giveaways (all-time count).
-    pub giveaways_total: i64,
-    /// Total amount credited via balance giveaways.
-    pub giveaways_amount_total: i64,
+    /// Unavailable until a SQL balance-giveaway entity and credit-event contract exist.
+    pub giveaways_total: Option<i64>,
+    pub giveaways_amount_total: Option<i64>,
+    pub giveaways_available: bool,
     /// Live flash sales currently in window.
     pub flash_sales_live: i64,
     /// Discount vouchers with remaining slots.

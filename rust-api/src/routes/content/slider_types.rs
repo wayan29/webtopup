@@ -1,8 +1,6 @@
-use mongodb::bson::{oid::ObjectId, Document};
 use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
-
-pub(super) use super::types::{SliderItem, SliderPayload};
+use uuid::Uuid;
 
 /// The canonical data accepted by a slider create request.
 #[derive(Debug, Clone, Deserialize)]
@@ -80,7 +78,7 @@ pub struct NormalizedSliderChanges {
 /// The small internal state needed to evaluate effective public impact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SliderSnapshotItem {
-    pub id: ObjectId,
+    pub id: Uuid,
     pub name: String,
     pub image: String,
     pub link: String,
@@ -104,23 +102,6 @@ pub struct PublicSliderItem {
     pub name: String,
     pub image: String,
     pub link: String,
-}
-
-/// A BSON-backed public item is useful at the snapshot boundary, where legacy documents must be
-/// readable without being rewritten.
-impl From<&Document> for PublicSliderItem {
-    fn from(document: &Document) -> Self {
-        let id = document
-            .get_object_id("_id")
-            .map(|value| value.to_hex())
-            .unwrap_or_default();
-        Self {
-            id,
-            name: document.get_str("name").unwrap_or_default().to_string(),
-            image: document.get_str("image").unwrap_or_default().to_string(),
-            link: document.get_str("link").unwrap_or_default().to_string(),
-        }
-    }
 }
 
 /// Legacy handlers still consume these names until the revisioned route migration. Keeping the
@@ -158,7 +139,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mongodb::bson::doc;
 
     #[test]
     fn request_types_reject_unknown_fields() {
@@ -202,18 +182,12 @@ mod tests {
 
     #[test]
     fn public_dto_has_only_compatibility_fields() {
-        let document = doc! {
-            "_id": ObjectId::new(),
-            "name": "Promo",
-            "image": "/uploads/covers/example.webp",
-            "link": "/promo",
-            "sortOrder": 0_i64,
-            "status": true,
-            "lifecycle": "active",
-            "createdAt": "hidden",
-            "updatedAt": "hidden",
-        };
-        let json = serde_json::to_value(PublicSliderItem::from(&document)).unwrap();
+        let json = serde_json::to_value(PublicSliderItem {
+            id: Uuid::new_v4().to_string(),
+            name: "Promo".into(),
+            image: "/uploads/covers/example.webp".into(),
+            link: "/promo".into(),
+        }).unwrap();
         assert_eq!(
             json.as_object().unwrap().keys().cloned().collect::<std::collections::BTreeSet<_>>(),
             std::collections::BTreeSet::from([

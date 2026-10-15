@@ -1,15 +1,25 @@
 use std::sync::Arc;
 
 use axum::{response::IntoResponse, response::Response, Json};
-use mongodb::bson::{doc, oid::ObjectId, Document};
+use sqlx::Row;
+use uuid::Uuid;
 
-use crate::{security::require_proxy_context, state::AppState, utils::bson::read_string};
+use crate::{security::require_proxy_context, state::AppState};
 
 use super::{
     responses::{status_message, unavailable},
     types::{ApiKeyResponse, GenerateApiKeyResponse, MessageResponse},
-    utils::{generate_api_key, generate_api_secret, member_code_from_id},
+    utils::member_code_from_uuid,
 };
+
+fn internal_error() -> Response {
+    status_message(axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+}
+
+fn trusted_user_id(context: &crate::security::ProxyContext) -> Result<Uuid, Response> {
+    context.user_id.as_deref().and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or_else(|| status_message(axum::http::StatusCode::UNAUTHORIZED, "Unauthorized"))
+}
 
 pub async fn get_key(
     headers: axum::http::HeaderMap,
@@ -20,51 +30,31 @@ pub async fn get_key(
         Ok(context) => context,
         Err(response) => return response,
     };
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
+    let user_id = match trusted_user_id(&context) {
+        Ok(id) => id,
+        Err(response) => return response,
     };
-    let user_id = match context
-        .user_id
-        .as_deref()
-        .and_then(|id| ObjectId::parse_str(id).ok())
-    {
-        Some(user_id) => user_id,
-        None => return status_message(axum::http::StatusCode::UNAUTHORIZED, "Unauthorized"),
-    };
-    let user = client
-        .database(&state.mongo_db)
-        .collection::<Document>("users")
-        .find_one(doc! { "_id": user_id })
-        .projection(doc! { "apiKey": 1, "apiSecret": 1, "memberCode": 1 })
-        .await
-        .ok()
-        .flatten();
-    let Some(user) = user else {
-        return status_message(axum::http::StatusCode::NOT_FOUND, "User not found");
-    };
-    // Secret is returned only from generate_key. Reloading settings must not re-expose it.
-    Json(api_key_status_response(&user, &user_id)).into_response()
-}
-
-/// Build the non-secret status envelope for GET /api/key.
-pub(super) fn api_key_status_response(user: &Document, user_id: &ObjectId) -> ApiKeyResponse {
-    let api_key = read_string(user, "apiKey");
-    let secret = read_string(user, "apiSecret");
-    let member_id = read_string(user, "memberCode");
-    let member_id = if member_id.is_empty() {
-        member_code_from_id(user_id)
-    } else {
-        member_id
-    };
-    let has_api_key = !api_key.is_empty();
-    let has_secret = !secret.is_empty();
-    ApiKeyResponse {
-        member_id,
-        api_key: if has_api_key { Some(api_key) } else { None },
-        // Always None on status reads — secret is one-time at generate.
-        secret: None,
-        has_api_key,
-        has_secret,
+    let row = sqlx::query("SELECT member_code, api_key, active, secret_nonce IS NOT NULL AND secret_ciphertext IS NOT NULL AS has_secret FROM open_api_credentials WHERE user_id=$1")
+        .bind(user_id).fetch_optional(&state.pg_pool).await;
+    match row {
+        Ok(Some(row)) => {
+            let active: bool = row.get("active");
+            let api_key: String = row.get("api_key");
+            Json(ApiKeyResponse {
+                member_id: row.get("member_code"),
+                has_api_key: active,
+                api_key: active.then_some(api_key),
+                secret: None,
+                has_secret: active && row.get::<bool, _>("has_secret"),
+            }).into_response()
+        }
+        Ok(None) => match sqlx::query("SELECT role, member_code FROM users WHERE id=$1").bind(user_id).fetch_optional(&state.pg_pool).await {
+            Ok(Some(user)) if user.get::<String, _>("role") == "member" => Json(ApiKeyResponse { member_id: user.get::<Option<String>, _>("member_code").unwrap_or_else(|| member_code_from_uuid(user_id)), api_key: None, secret: None, has_api_key: false, has_secret: false }).into_response(),
+            Ok(Some(_)) => status_message(axum::http::StatusCode::FORBIDDEN, "Only members can manage API keys"),
+            Ok(None) => status_message(axum::http::StatusCode::NOT_FOUND, "User not found"),
+            Err(_) => internal_error(),
+        },
+        Err(_) => internal_error(),
     }
 }
 
@@ -77,63 +67,30 @@ pub async fn generate_key(
         Ok(context) => context,
         Err(response) => return response,
     };
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
+    let user_id = match trusted_user_id(&context) {
+        Ok(id) => id,
+        Err(response) => return response,
     };
-    let user_id = match context
-        .user_id
-        .as_deref()
-        .and_then(|id| ObjectId::parse_str(id).ok())
-    {
-        Some(user_id) => user_id,
-        None => return status_message(axum::http::StatusCode::UNAUTHORIZED, "Unauthorized"),
+    let user = sqlx::query("SELECT role, member_code FROM users WHERE id=$1").bind(user_id).fetch_optional(&state.pg_pool).await;
+    let user = match user {
+        Ok(Some(user)) => user,
+        Ok(None) => return status_message(axum::http::StatusCode::NOT_FOUND, "User not found"),
+        Err(_) => return internal_error(),
     };
-    let users = client
-        .database(&state.mongo_db)
-        .collection::<Document>("users");
-    let user = users
-        .find_one(doc! { "_id": user_id })
-        .projection(doc! { "role": 1, "memberCode": 1 })
-        .await
-        .ok()
-        .flatten();
-    let Some(user) = user else {
-        return status_message(axum::http::StatusCode::NOT_FOUND, "User not found");
-    };
-    if read_string(&user, "role") != "member" {
-        return status_message(
-            axum::http::StatusCode::FORBIDDEN,
-            "Only members can generate API keys",
-        );
+    if user.get::<String, _>("role") != "member" {
+        return status_message(axum::http::StatusCode::FORBIDDEN, "Only members can generate API keys");
     }
-    let api_key = generate_api_key();
-    let secret = generate_api_secret();
-    let existing_member_code = read_string(&user, "memberCode");
-    let member_id = if existing_member_code.is_empty() {
-        member_code_from_id(&user_id)
-    } else {
-        existing_member_code
-    };
-    if users
-        .update_one(
-            doc! { "_id": user_id },
-            doc! { "$set": { "apiKey": &api_key, "apiSecret": &secret, "memberCode": &member_id } },
-        )
-        .await
-        .is_err()
-    {
-        return status_message(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal Server Error",
-        );
+    let member_id: Option<String> = user.get("member_code");
+    let member_id = member_id.unwrap_or_else(|| member_code_from_uuid(user_id));
+    if let Err(_) = sqlx::query("UPDATE users SET member_code=$2 WHERE id=$1 AND member_code IS NULL")
+        .bind(user_id).bind(&member_id).execute(&state.pg_pool).await { return internal_error(); }
+    let store = crate::wallet_store::WalletStore::from_pool(state.pg_pool.clone());
+    match store.issue_open_api_credential(user_id, &member_id).await {
+        Ok((api_key, secret)) => Json(GenerateApiKeyResponse {
+            message: "API key generated successfully", member_id, api_key, secret,
+        }).into_response(),
+        Err(_) => unavailable(),
     }
-    Json(GenerateApiKeyResponse {
-        message: "API key generated successfully",
-        member_id,
-        api_key,
-        secret,
-    })
-    .into_response()
 }
 
 pub async fn revoke_key(
@@ -145,79 +102,13 @@ pub async fn revoke_key(
         Ok(context) => context,
         Err(response) => return response,
     };
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
+    let user_id = match trusted_user_id(&context) {
+        Ok(id) => id,
+        Err(response) => return response,
     };
-    let user_id = match context
-        .user_id
-        .as_deref()
-        .and_then(|id| ObjectId::parse_str(id).ok())
-    {
-        Some(user_id) => user_id,
-        None => return status_message(axum::http::StatusCode::UNAUTHORIZED, "Unauthorized"),
-    };
-    let users = client
-        .database(&state.mongo_db)
-        .collection::<Document>("users");
-    let user_exists = users
-        .find_one(doc! { "_id": user_id })
-        .projection(doc! { "_id": 1 })
-        .await
-        .ok()
-        .flatten()
-        .is_some();
-    if !user_exists {
-        return status_message(axum::http::StatusCode::NOT_FOUND, "User not found");
-    }
-    if users
-        .update_one(doc! { "_id": user_id }, open_api_credentials_clear_update())
-        .await
-        .is_err()
-    {
-        return status_message(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal Server Error",
-        );
-    }
-    Json(MessageResponse {
-        message: "API key revoked successfully",
-    })
-    .into_response()
-}
-
-/// Shared Mongo update that fully disables Open API access without deleting memberCode identity.
-pub(crate) fn open_api_credentials_clear_update() -> Document {
-    doc! { "$unset": { "apiKey": "", "apiSecret": "" } }
-}
-
-#[cfg(test)]
-mod tests {
-    use mongodb::bson::{doc, oid::ObjectId};
-
-    use super::{api_key_status_response, open_api_credentials_clear_update};
-
-    #[test]
-    fn status_response_never_includes_secret_even_when_stored() {
-        let user_id = ObjectId::new();
-        let user = doc! {
-            "apiKey": "tv_live_key",
-            "apiSecret": "super-secret-value",
-            "memberCode": "MBRTEST01",
-        };
-        let response = api_key_status_response(&user, &user_id);
-        assert_eq!(response.member_id, "MBRTEST01");
-        assert_eq!(response.api_key.as_deref(), Some("tv_live_key"));
-        assert!(response.has_api_key);
-        assert!(response.has_secret);
-        assert_eq!(response.secret, None);
-    }
-
-    #[test]
-    fn clear_update_unsets_key_and_secret() {
-        let update = open_api_credentials_clear_update();
-        let unset = update.get_document("$unset").expect("unset");
-        assert!(unset.contains_key("apiKey"));
-        assert!(unset.contains_key("apiSecret"));
-        assert!(!unset.contains_key("memberCode"));
+    match sqlx::query("UPDATE open_api_credentials SET active=false, secret_nonce=NULL, secret_ciphertext=NULL WHERE user_id=$1 AND active=true")
+        .bind(user_id).execute(&state.pg_pool).await {
+        Ok(_) => Json(MessageResponse { message: "API key revoked successfully" }).into_response(),
+        Err(_) => internal_error(),
     }
 }

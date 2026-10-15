@@ -16,6 +16,6 @@ pub fn internal_error() -> Response {
 pub fn unavailable() -> Response {
     status_message(
         axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        "MONGO_URI is not configured",
+        "PostgreSQL unavailable",
     )
 }

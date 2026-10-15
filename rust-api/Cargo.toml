@@ -24,6 +24,15 @@ path = "src/bin/slider_managed_asset_readiness.rs"
 [[bin]]
 name = "seller_order_readiness"
 path = "src/bin/seller_order_readiness.rs"
+[[bin]]
+name = "postgres_auth_smoke"
+path = "src/bin/postgres_auth_smoke.rs"
+[[bin]]
+name = "catalog_smoke"
+path = "src/bin/catalog_smoke.rs"
+[[bin]]
+name = "wallet_smoke"
+path = "src/bin/wallet_smoke.rs"
 
 [dependencies]
 ammonia = "=4.1.2"
@@ -33,22 +42,25 @@ zeroize = "=1.8.1"
 anyhow = "1.0"
 axum = { version = "0.8", features = ["multipart"] }
 bcrypt = "0.16"
-chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "chrono", "derive"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4.44", default-features = false, features = ["clock", "serde"] }
+hmac = "0.12"
+sha1 = "0.10"
 url = "2.5.4"
 unicode-normalization = "=0.1.24"
 dotenvy = "0.15"
 futures-util = "0.3"
 jsonwebtoken = "9.3"
 md5 = "0.7"
-hmac = "0.12"
+redis = { version = "0.27", features = ["tokio-comp"] }
 image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
-mongodb = "3.4"
 rand = "0.8"
+rand_chacha = "0.3"
 regex = "1.11"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha1 = "0.10"
 sha2 = "=0.10.9"
 subtle = "=2.6.1"
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "net", "signal"] }

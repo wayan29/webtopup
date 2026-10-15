@@ -1,243 +1,74 @@
-use std::collections::HashMap;
+use sqlx::{PgPool, Postgres, Transaction};
 
-use futures_util::TryStreamExt;
-use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime, Document};
+use super::validation::number_value;
 
-use super::{mappers::*, types::*, validation::number_from_bson};
-use crate::utils::bson::{read_i64, read_string};
+pub(super) const POINTS_PER_TRANSACTION_KEY: &str = "points_per_transaction";
+pub(super) const POINT_VALUE_RATE_KEY: &str = "point_value_rate";
 
-pub(super) async fn upsert_setting(
-    settings: &mongodb::Collection<Document>,
+/// Reads a numeric site setting without requiring client-side JSONB decoding:
+/// `value #>> '{}'` renders the stored JSON scalar as text.
+pub(super) async fn site_setting_i64(
+    pool: &PgPool,
+    key: &str,
+    fallback: i64,
+) -> Result<i64, sqlx::Error> {
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT value #>> '{}' FROM site_settings WHERE key = $1")
+            .bind(key)
+            .fetch_optional(pool)
+            .await?;
+    Ok(stored
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .and_then(|value| number_value(value))
+        .unwrap_or(fallback))
+}
+
+/// Last-write-wins numeric upsert; the site_settings row revision advances on update.
+pub(super) async fn upsert_points_setting(
+    tx: &mut Transaction<'_, Postgres>,
     key: &str,
     value: i64,
-    description: &str,
-) -> Result<(), ()> {
-    let now = DateTime::now();
-    settings
-        .update_one(
-            doc! { "key": key },
-            doc! {
-                "$set": { "value": value, "description": description, "updatedAt": now },
-                "$setOnInsert": { "key": key, "createdAt": now, "__v": 0 },
-            },
-        )
-        .upsert(true)
-        .await
-        .map(|_| ())
-        .map_err(|_| ())
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO site_settings (key, value, revision, updated_at) \
+         VALUES ($1, to_jsonb($2::bigint), 1, now()) \
+         ON CONFLICT (key) DO UPDATE \
+         SET value = EXCLUDED.value, revision = site_settings.revision + 1, updated_at = now()",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
-pub(super) async fn user_briefs(
-    db: &mongodb::Database,
-    transactions: &[Document],
-) -> HashMap<String, UserBrief> {
-    let ids = object_ids_from_docs(transactions, "user");
-    if ids.is_empty() {
-        return HashMap::new();
-    }
-    match db
-        .collection::<Document>("users")
-        .find(doc! { "_id": { "$in": ids } })
-        .await
-    {
-        Ok(cursor) => cursor
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|doc| {
-                let id = id_from_doc(&doc);
-                (
-                    id.clone(),
-                    UserBrief {
-                        id,
-                        name: read_string(&doc, "name"),
-                        email: read_string(&doc, "email"),
-                    },
-                )
-            })
-            .collect(),
-        Err(_) => HashMap::new(),
-    }
+/// `users.points` is the authoritative balance; missing rows read as zero.
+pub(super) async fn user_points(pool: &PgPool, user_id: uuid::Uuid) -> Result<i64, sqlx::Error> {
+    let points: Option<i64> = sqlx::query_scalar("SELECT points FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(points.unwrap_or_default())
 }
 
-pub(super) async fn reward_briefs(
-    db: &mongodb::Database,
-    transactions: &[Document],
-) -> HashMap<String, RewardBrief> {
-    let ids = object_ids_from_docs(transactions, "relatedReward");
-    if ids.is_empty() {
-        return HashMap::new();
-    }
-    match db
-        .collection::<Document>("rewards")
-        .find(doc! { "_id": { "$in": ids } })
-        .await
-    {
-        Ok(cursor) => cursor
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|doc| {
-                let id = id_from_doc(&doc);
-                (
-                    id.clone(),
-                    RewardBrief {
-                        id,
-                        name: read_string(&doc, "name"),
-                    },
-                )
-            })
-            .collect(),
-        Err(_) => HashMap::new(),
-    }
-}
-
-pub(super) async fn transaction_briefs(
-    db: &mongodb::Database,
-    point_transactions: &[Document],
-) -> HashMap<String, RelatedTransactionBrief> {
-    let ids = object_ids_from_docs(point_transactions, "relatedTransaction");
-    if ids.is_empty() {
-        return HashMap::new();
-    }
-
-    let transactions = match db
-        .collection::<Document>("transactions")
-        .find(doc! { "_id": { "$in": ids } })
-        .await
-    {
-        Ok(cursor) => cursor.try_collect::<Vec<_>>().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
-    };
-    let product_ids = transactions
-        .iter()
-        .filter_map(|doc| object_id_from_bson(doc.get("product")))
-        .collect::<Vec<_>>();
-    let product_map = product_briefs(db, product_ids).await;
-
-    transactions
-        .into_iter()
-        .map(|doc| {
-            let id = id_from_doc(&doc);
-            let product_id = id_from_bson(doc.get("product"));
-            (
-                id.clone(),
-                RelatedTransactionBrief {
-                    id,
-                    amount: read_i64(&doc, "amount"),
-                    target: read_string(&doc, "target"),
-                    status: read_string(&doc, "status"),
-                    product: product_map.get(&product_id).cloned(),
-                },
-            )
-        })
-        .collect()
-}
-
-pub(super) async fn user_points(
-    db: &mongodb::Database,
-    object_id: Option<ObjectId>,
-    user_id: &str,
-) -> i64 {
-    let filter = object_id
-        .map(|id| doc! { "_id": id })
-        .unwrap_or_else(|| doc! { "_id": user_id });
-    db.collection::<Document>("users")
-        .find_one(filter)
-        .await
-        .ok()
-        .flatten()
-        .map(|doc| read_i64(&doc, "points"))
-        .unwrap_or_default()
-}
-
-pub(super) async fn rollback_user_points(
-    users: &mongodb::Collection<Document>,
-    user_id: ObjectId,
-    points_delta: i64,
-) {
-    if let Err(error) = users
-        .update_one(
-            doc! { "_id": user_id },
-            doc! { "$inc": { "points": -points_delta }, "$set": { "updatedAt": DateTime::now() } },
-        )
-        .await
-    {
-        eprintln!("Failed to roll back user points mutation: {error}");
-    }
-}
-
-pub(super) async fn setting_value(db: &mongodb::Database, key: &str, fallback: i64) -> i64 {
-    db.collection::<Document>("settings")
-        .find_one(doc! { "key": key })
-        .await
-        .ok()
-        .flatten()
-        .and_then(|doc| number_from_bson(doc.get("value")))
-        .unwrap_or(fallback)
-}
-
+/// Ledger sum for one transaction type, optionally scoped to a user_ref.
+/// `absolute` mirrors the Mongo `$sum: { $abs: "$points" }` redemption totals.
 pub(super) async fn sum_points(
-    collection: &mongodb::Collection<Document>,
-    filter: Document,
+    pool: &PgPool,
+    user_ref: Option<&str>,
+    transaction_type: &str,
     absolute: bool,
-) -> i64 {
-    let group_sum = if absolute {
-        doc! { "$sum": { "$abs": "$points" } }
-    } else {
-        doc! { "$sum": "$points" }
-    };
-    match collection
-        .aggregate(vec![
-            doc! { "$match": filter },
-            doc! { "$group": { "_id": Bson::Null, "total": group_sum } },
-        ])
-        .await
-    {
-        Ok(cursor) => cursor
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap_or_default()
-            .first()
-            .and_then(|doc| number_from_bson(doc.get("total")))
-            .unwrap_or_default(),
-        Err(_) => 0,
-    }
-}
-
-async fn product_briefs(
-    db: &mongodb::Database,
-    mut ids: Vec<ObjectId>,
-) -> HashMap<String, ProductBrief> {
-    ids.sort_by_key(|id| id.to_hex());
-    ids.dedup();
-    if ids.is_empty() {
-        return HashMap::new();
-    }
-
-    match db
-        .collection::<Document>("products")
-        .find(doc! { "_id": { "$in": ids } })
-        .await
-    {
-        Ok(cursor) => cursor
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|doc| {
-                let id = id_from_doc(&doc);
-                (
-                    id.clone(),
-                    ProductBrief {
-                        id,
-                        name: read_string(&doc, "name"),
-                    },
-                )
-            })
-            .collect(),
-        Err(_) => HashMap::new(),
-    }
+) -> Result<i64, sqlx::Error> {
+    let expression = if absolute { "ABS(points)" } else { "points" };
+    let sql = format!(
+        "SELECT COALESCE(SUM({expression}), 0) FROM point_ledger \
+         WHERE transaction_type = $1::text AND ($2::text IS NULL OR user_ref = $2::text)"
+    );
+    let total: i64 = sqlx::query_scalar(&sql)
+        .bind(transaction_type)
+        .bind(user_ref)
+        .fetch_one(pool)
+        .await?;
+    Ok(total)
 }

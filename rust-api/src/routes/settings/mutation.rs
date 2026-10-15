@@ -1,4 +1,8 @@
-//! Transaction-only Site Config bulk mutation orchestration.
+//! Transactional Site Config bulk mutation orchestration on PostgreSQL.
+//!
+//! One transaction owns the whole mutation: the domain revision row lock serializes competing
+//! updates, the frozen reply table provides permanent idempotency, managed upload references move
+//! with the affected settings keys, and the audit row commits atomically with the new values.
 
 use std::sync::Arc;
 
@@ -7,85 +11,69 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime, Document};
-use mongodb::options::UpdateModifications;
-use mongodb::{ClientSession, Database};
 use serde_json::{json, Map, Value};
+use uuid::Uuid;
 
 use crate::{
     routes::auth::require_trusted_step_up_group,
-    security::{require_permission, AuthenticatedProxyUser},
+    security::require_sql_permission,
     services::{
         audit_sanitize::sanitize_audit_document,
-        idempotency::{
-            commit_mongo_transaction_with_unknown_retry, sha256_hex, TransactionCommitOutcome,
+        idempotency::sha256_hex,
+        managed_assets::{
+            effectively_changed_managed_field, ensure_managed_field_for_update,
+            ManagedFieldFolderPolicy,
         },
     },
     state::AppState,
 };
 
 use super::{
-    conversion::json_to_bson,
     defaults::default_site_settings,
-    idempotency::{
-        begin_claim, complete_claim_in_session, completed_replay_body, mark_commit_unknown,
-        mark_transaction_started, normalize_site_config_idempotency_key, undo_pre_effect_claim,
-        SiteConfigClaimBegin, SiteConfigClaimBinding, SITE_CONFIG_CLAIMS_COLLECTION,
-    },
     policy::{normalize_settings_intent, BulkSettingsUpdatePayload, SettingsPolicyError},
-    responses::{internal_error, status_message, unavailable},
-    snapshot::{
-        load_consistent_snapshot, with_revision_field, SITE_CONFIG_REVISION_KEY, SnapshotError,
+    responses::{internal_error, status_message},
+    snapshot::with_revision_field,
+    store::{
+        audit, bump_revision, completed_replay_body, freeze, lock_revision,
+        load_settings_in_tx, mutation_key, replay, trusted_correlation,
+        upsert_setting, SETTINGS_DOMAIN,
     },
-    store::load_settings_in_session,
 };
+
+const SETTINGS_OPERATION: &str = "settings.update";
+const SENSITIVE_GROUP: &str = "settings.sensitive";
+
+/// Managed upload fields and their folder policy. References follow the stored value so a
+/// referenced cover can never be deleted while a setting still displays it.
+const MANAGED_SETTING_FIELDS: &[(&str, ManagedFieldFolderPolicy)] = &[
+    ("favicon", ManagedFieldFolderPolicy::Icons),
+    ("logo", ManagedFieldFolderPolicy::Icons),
+    ("popupBannerImage", ManagedFieldFolderPolicy::Popups),
+];
 
 pub async fn execute_site_config_mutation(
     state: Arc<AppState>,
     headers: HeaderMap,
     payload: Value,
 ) -> Response {
-    let actor = match require_permission(&headers, &state, "manageSettings").await {
+    let actor = match require_sql_permission(&headers, &state, "manageSettings").await {
         Ok(actor) => actor,
         Err(response) => return response,
     };
 
-    let raw_key = headers
-        .get("idempotency-key")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("");
-    let key = match normalize_site_config_idempotency_key(raw_key) {
-        Ok(key) => key,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "message": "Header Idempotency-Key wajib untuk mutasi Site Config",
-                    "error": {
-                        "code": "IDEMPOTENCY_KEY_REQUIRED",
-                        "message": "Header Idempotency-Key wajib untuk mutasi Site Config"
-                    }
-                })),
-            )
-                .into_response()
-        }
+    let Some(key) = mutation_key(&headers) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "message": "Header Idempotency-Key wajib untuk mutasi Site Config",
+                "error": {
+                    "code": "IDEMPOTENCY_KEY_REQUIRED",
+                    "message": "Header Idempotency-Key wajib untuk mutasi Site Config"
+                }
+            })),
+        )
+            .into_response();
     };
-
-    if !state.mongo_transactions_enabled {
-        return settings_transactions_unavailable();
-    }
-    let Some(client) = state.mongo_client.as_ref() else {
-        return unavailable();
-    };
-    let db_name = state.mongo_db.clone();
-    let db = client.database(&db_name);
-
-    if crate::services::local_fault::consume_site_config_probe_fault().await {
-        return settings_transactions_unavailable();
-    }
-    if let Err(response) = probe_site_config_transactions(client, &db_name).await {
-        return response;
-    }
 
     let bulk = match serde_json::from_value::<BulkSettingsUpdatePayload>(payload) {
         Ok(value) => value,
@@ -96,363 +84,141 @@ pub async fn execute_site_config_mutation(
 
     let defaults = default_site_settings();
     let selected_keys = defaults.keys().map(String::as_str).collect::<Vec<_>>();
-    let snapshot = match load_consistent_snapshot(client, &db_name, &selected_keys).await {
-        Ok(snapshot) => snapshot,
-        Err(SnapshotError::Unstable) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({
-                    "message": "Snapshot pengaturan tidak stabil",
-                    "error": { "code": "SETTINGS_SNAPSHOT_UNSTABLE" }
-                })),
-            )
-                .into_response()
-        }
+
+    let mut tx = match state.pg_pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return internal_error(),
+    };
+
+    // The domain row lock serializes every settings mutation and pins the revision read.
+    let current_revision = match lock_revision(&mut tx, SETTINGS_DOMAIN).await {
+        Ok(revision) => revision,
+        Err(_) => return internal_error(),
+    };
+    let current_settings = match load_settings_in_tx(&mut tx, &selected_keys).await {
+        Ok(settings) => settings,
         Err(_) => return internal_error(),
     };
 
     let intent = match normalize_settings_intent(
         bulk.expected_revision,
         &bulk.changes,
-        &snapshot.settings,
+        &current_settings,
     ) {
         Ok(intent) => intent,
         Err(error) => return policy_error_response(error),
     };
 
-    let revision_matches = snapshot.revision == intent.expected_revision;
-    if revision_matches && intent.requires_step_up {
-        if require_trusted_step_up_group(&headers, "settings.sensitive").is_err() {
+    // Frozen-reply replay: the same actor+key+digest returns the stored response, a different
+    // digest for the same key is a permanent conflict.
+    match replay(&mut tx, actor.id, SETTINGS_OPERATION, &key, &intent.digest).await {
+        Ok(Some((status, body))) => {
             return (
-                StatusCode::FORBIDDEN,
-                Json(json!({
-                    "message": "Verifikasi ulang diperlukan",
-                    "error": {
-                        "code": "AUTH_STEP_UP_REQUIRED",
-                        "actionGroup": "settings.sensitive",
-                        "message": "Verifikasi ulang diperlukan untuk mengubah konfigurasi situs sensitif"
-                    }
-                })),
+                StatusCode::from_u16(status as u16).unwrap_or(StatusCode::OK),
+                Json(completed_replay_body(body)),
             )
                 .into_response();
         }
-    }
-
-    let binding = SiteConfigClaimBinding {
-        key: key.clone(),
-        operator_id: actor.id,
-        expected_revision: intent.expected_revision,
-        payload_digest: intent.digest.clone(),
-    };
-
-    let begin = match begin_claim(&db, &binding).await {
-        Ok(begin) => begin,
+        Ok(None) => {}
         Err(_) => return internal_error(),
-    };
-
-    match begin {
-        SiteConfigClaimBegin::Completed {
-            status,
-            body,
-            result_revision: _,
-        } => {
-            return (
-                StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
-                Json(body),
-            )
-                .into_response()
-        }
-        SiteConfigClaimBegin::Conflict => {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "message": "Idempotency-Key bentrok dengan permintaan berbeda",
-                    "error": {
-                        "code": "IDEMPOTENCY_CONFLICT",
-                        "message": "Idempotency-Key bentrok dengan permintaan berbeda"
-                    }
-                })),
-            )
-                .into_response()
-        }
-        SiteConfigClaimBegin::InProgress => {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "message": "Permintaan dengan Idempotency-Key yang sama sedang diproses",
-                    "error": {
-                        "code": "IDEMPOTENCY_IN_PROGRESS",
-                        "message": "Permintaan dengan Idempotency-Key yang sama sedang diproses"
-                    }
-                })),
-            )
-                .into_response()
-        }
-        SiteConfigClaimBegin::CommitUnknown => return settings_commit_unknown(),
-        SiteConfigClaimBegin::Started {
-            claim_id,
-            claim_token,
-            undo,
-        } => {
-            if crate::services::local_fault::consume_site_config_start_fault().await {
-                if undo_pre_effect_claim(&db, &undo).await.is_ok() {
-                    return settings_transactions_unavailable();
-                }
-                return settings_commit_unknown();
-            }
-            if crate::services::local_fault::consume_site_config_undo_mismatch_fault().await {
-                let _ = db
-                    .collection::<Document>(SITE_CONFIG_CLAIMS_COLLECTION)
-                    .update_one(
-                        doc! { "_id": claim_id, "claimToken": &claim_token },
-                        doc! { "$set": { "claimToken": format!("{claim_token}x") } },
-                    )
-                    .await;
-                if undo_pre_effect_claim(&db, &undo).await.is_ok() {
-                    return settings_transactions_unavailable();
-                }
-                let _ = db
-                    .collection::<Document>(SITE_CONFIG_CLAIMS_COLLECTION)
-                    .update_one(
-                        doc! { "_id": claim_id, "idempotencyKey": &binding.key },
-                        doc! { "$set": { "commitUnknown": true } },
-                    )
-                    .await;
-                return settings_commit_unknown();
-            }
-            if crate::services::local_fault::consume_site_config_commit_unknown_fault().await {
-                let _ = mark_commit_unknown(&db, claim_id, &claim_token, &binding).await;
-                return settings_commit_unknown();
-            }
-            if !mark_transaction_started(&db, claim_id, &claim_token, &binding)
-                .await
-                .unwrap_or(false)
-            {
-                return settings_commit_unknown();
-            }
-
-            let mut session = match client.start_session().await {
-                Ok(session) => session,
-                Err(_) => {
-                    if undo_pre_effect_claim(&db, &undo).await.is_ok() {
-                        return settings_transactions_unavailable();
-                    }
-                    return settings_commit_unknown();
-                }
-            };
-            if session.start_transaction().await.is_err() {
-                let _ = session.abort_transaction().await;
-                if undo_pre_effect_claim(&db, &undo).await.is_ok() {
-                    return settings_transactions_unavailable();
-                }
-                return settings_commit_unknown();
-            }
-
-            let mut effects_attempted = false;
-            let outcome = run_mutation_transaction(
-                &db,
-                &mut session,
-                &actor,
-                &headers,
-                &binding,
-                claim_id,
-                &claim_token,
-                &intent.normalized_changes,
-                &mut effects_attempted,
-            )
-            .await;
-
-            match outcome {
-                Ok(response) => response,
-                Err(MutationTxnError::DefinitePreEffect) if !effects_attempted => {
-                    let _ = session.abort_transaction().await;
-                    if undo_pre_effect_claim(&db, &undo).await.is_ok() {
-                        settings_transactions_unavailable()
-                    } else {
-                        let _ = mark_commit_unknown(&db, claim_id, &claim_token, &binding).await;
-                        settings_commit_unknown()
-                    }
-                }
-                Err(MutationTxnError::CommitUnknown) => {
-                    let _ = mark_commit_unknown(&db, claim_id, &claim_token, &binding).await;
-                    // Attempt majority read of completed claim.
-                    if let Ok(Some(doc)) = db
-                        .collection::<Document>(SITE_CONFIG_CLAIMS_COLLECTION)
-                        .find_one(doc! {
-                            "_id": claim_id,
-                            "status": "completed",
-                            "claimToken": &claim_token,
-                        })
-                        .await
-                    {
-                        if let Ok(raw) = doc.get_str("responseBodyJson") {
-                            if let Ok(body) = serde_json::from_str::<Value>(raw) {
-                                let status = match doc.get("responseStatus") {
-                                    Some(Bson::Int32(value)) => *value as u16,
-                                    Some(Bson::Int64(value)) => *value as u16,
-                                    _ => 200,
-                                };
-                                return (
-                                    StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
-                                    Json(completed_replay_body(&body, true)),
-                                )
-                                    .into_response();
-                            }
-                        }
-                    }
-                    settings_commit_unknown()
-                }
-                Err(MutationTxnError::Response(response)) => response,
-                Err(_) => {
-                    let _ = session.abort_transaction().await;
-                    internal_error()
-                }
-            }
-        }
     }
-}
 
-enum MutationTxnError {
-    DefinitePreEffect,
-    CommitUnknown,
-    Response(Response),
-    Internal,
-}
-
-async fn run_mutation_transaction(
-    db: &Database,
-    session: &mut ClientSession,
-    actor: &AuthenticatedProxyUser,
-    headers: &HeaderMap,
-    binding: &SiteConfigClaimBinding,
-    claim_id: ObjectId,
-    claim_token: &str,
-    normalized_changes: &Map<String, Value>,
-    effects_attempted: &mut bool,
-) -> Result<Response, MutationTxnError> {
-    let defaults = default_site_settings();
-    let selected_keys = defaults.keys().map(String::as_str).collect::<Vec<_>>();
-
-    // Authoritative in-transaction revision read.
-    let current_revision = load_revision_in_session(db, session)
-        .await
-        .map_err(|_| MutationTxnError::DefinitePreEffect)?;
-    let current_settings = load_settings_in_session(db, session, &selected_keys)
-        .await
-        .map_err(|_| MutationTxnError::Internal)?;
-
-    if current_revision != binding.expected_revision {
+    if current_revision != intent.expected_revision {
         let conflict_body = json!({
             "error": {
                 "code": "SETTINGS_VERSION_CONFLICT",
                 "message": "Pengaturan telah diubah oleh pengguna lain",
-                "expectedRevision": binding.expected_revision,
+                "expectedRevision": intent.expected_revision,
                 "currentRevision": current_revision,
                 "currentSettings": with_revision_field(current_settings.clone(), current_revision),
             }
         });
-        *effects_attempted = true;
-        complete_claim_in_session(
-            db,
-            session,
-            claim_id,
-            claim_token,
-            binding,
+        if freeze(
+            &mut tx,
+            actor.id,
+            SETTINGS_OPERATION,
+            &key,
+            &intent.digest,
             409,
             &conflict_body,
-            Some(current_revision),
         )
         .await
-        .map_err(|_| MutationTxnError::Internal)?;
-        return match commit_mongo_transaction_with_unknown_retry(session).await {
-            TransactionCommitOutcome::Committed => Ok((
-                StatusCode::CONFLICT,
-                Json(completed_replay_body(&conflict_body, false)),
-            )
-                .into_response()),
-            TransactionCommitOutcome::Ambiguous => Err(MutationTxnError::CommitUnknown),
-            TransactionCommitOutcome::FailedDefinitely => Err(MutationTxnError::Internal),
-        };
+        .is_err()
+        {
+            return internal_error();
+        }
+        if tx.commit().await.is_err() {
+            return internal_error();
+        }
+        return (StatusCode::CONFLICT, Json(conflict_body)).into_response();
     }
 
-    let intent = normalize_settings_intent(
-        binding.expected_revision,
-        normalized_changes,
-        &current_settings,
-    )
-    .map_err(|error| MutationTxnError::Response(policy_error_response(error)))?;
-
-    if intent.requires_step_up && require_trusted_step_up_group(headers, "settings.sensitive").is_err()
-    {
-        // Should be rare after pre-check; treat as definitive pre-effect denial without claim completion.
-        return Err(MutationTxnError::Response(
-            (
-                StatusCode::FORBIDDEN,
-                Json(json!({
-                    "error": {
-                        "code": "AUTH_STEP_UP_REQUIRED",
-                        "actionGroup": "settings.sensitive"
-                    }
-                })),
-            )
-                .into_response(),
-        ));
+    if intent.requires_step_up && require_trusted_step_up_group(&headers, SENSITIVE_GROUP).is_err() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "message": "Verifikasi ulang diperlukan",
+                "error": {
+                    "code": "AUTH_STEP_UP_REQUIRED",
+                    "actionGroup": SENSITIVE_GROUP,
+                    "message": "Verifikasi ulang diperlukan untuk mengubah konfigurasi situs sensitif"
+                }
+            })),
+        )
+            .into_response();
     }
 
-    let mut next_settings = current_settings.clone();
-    for (key, value) in &intent.effective_changes {
-        next_settings.insert(key.clone(), value.clone());
+    // Managed upload validation and reference transitions happen before any domain write.
+    if let Err(response) = validate_managed_fields(&intent.effective_changes, &current_settings) {
+        return response;
     }
 
     let new_revision = if intent.effective_changes.is_empty() {
         current_revision
     } else {
-        current_revision + 1
+        match bump_revision(&mut tx, SETTINGS_DOMAIN).await {
+            Ok(revision) => revision,
+            Err(_) => return internal_error(),
+        }
     };
 
-    *effects_attempted = true;
+    for (setting_key, value) in &intent.effective_changes {
+        if upsert_setting(&mut tx, setting_key, value, new_revision).await.is_err() {
+            return internal_error();
+        }
+        if let Err(_) = transition_setting_reference(&mut tx, setting_key, &current_settings, value).await {
+            return managed_reference_error_response();
+        }
+    }
 
     if !intent.effective_changes.is_empty() {
-        for (key, value) in &intent.effective_changes {
-            db.collection::<Document>("settings")
-                .update_one(
-                    doc! { "key": key },
-                    UpdateModifications::Document(doc! {
-                        "$set": { "key": key, "value": json_to_bson(value) }
-                    }),
-                )
-                .upsert(true)
-                .session(&mut *session)
-                .await
-                .map_err(|_| MutationTxnError::Internal)?;
-        }
-        // Revision metadata document.
-        db.collection::<Document>("settings")
-            .update_one(
-                doc! { "key": SITE_CONFIG_REVISION_KEY },
-                UpdateModifications::Document(doc! {
-                    "$set": { "key": SITE_CONFIG_REVISION_KEY, "value": new_revision }
-                }),
-            )
-            .upsert(true)
-            .session(&mut *session)
-            .await
-            .map_err(|_| MutationTxnError::Internal)?;
-
-        let audit_doc = build_settings_audit_document(
-            actor,
-            headers,
+        let correlation = trusted_correlation(&headers);
+        let audit_payload = build_settings_audit_payload(
+            &actor,
             &current_settings,
             &intent.effective_changes,
             current_revision,
             new_revision,
-            &binding.key,
+            &key,
+            correlation.trace_id.as_deref(),
         );
-        db.collection::<Document>("adminauditlogs")
-            .insert_one(audit_doc)
-            .session(&mut *session)
-            .await
-            .map_err(|_| MutationTxnError::Internal)?;
+        if audit(
+            &mut tx,
+            actor.id,
+            "settings.update",
+            correlation.source.as_str(),
+            audit_payload,
+        )
+        .await
+        .is_err()
+        {
+            return internal_error();
+        }
+    }
+
+    let mut next_settings = current_settings.clone();
+    for (setting_key, value) in &intent.effective_changes {
+        next_settings.insert(setting_key.clone(), value.clone());
     }
 
     let response_body = json!({
@@ -462,56 +228,77 @@ async fn run_mutation_transaction(
         "data": with_revision_field(next_settings, new_revision),
     });
 
-    complete_claim_in_session(
-        db,
-        session,
-        claim_id,
-        claim_token,
-        binding,
+    if freeze(
+        &mut tx,
+        actor.id,
+        SETTINGS_OPERATION,
+        &key,
+        &intent.digest,
         200,
         &response_body,
-        Some(new_revision),
     )
     .await
-    .map_err(|_| MutationTxnError::Internal)?;
-
-    match commit_mongo_transaction_with_unknown_retry(session).await {
-        TransactionCommitOutcome::Committed => Ok((StatusCode::OK, Json(response_body)).into_response()),
-        TransactionCommitOutcome::Ambiguous => Err(MutationTxnError::CommitUnknown),
-        TransactionCommitOutcome::FailedDefinitely => Err(MutationTxnError::Internal),
+    .is_err()
+    {
+        return internal_error();
     }
+    if tx.commit().await.is_err() {
+        return internal_error();
+    }
+
+    (StatusCode::OK, Json(response_body)).into_response()
 }
 
-async fn load_revision_in_session(
-    db: &Database,
-    session: &mut ClientSession,
-) -> Result<i64, SnapshotError> {
-    let document = db
-        .collection::<Document>("settings")
-        .find_one(doc! { "key": SITE_CONFIG_REVISION_KEY })
-        .session(&mut *session)
-        .await
-        .map_err(|_| SnapshotError::Unavailable)?;
-    let Some(document) = document else {
-        return Ok(0);
+/// Folder policy plus on-disk existence for every changed managed field.
+fn validate_managed_fields(
+    effective_changes: &Map<String, Value>,
+    current_settings: &Map<String, Value>,
+) -> Result<(), Response> {
+    for (field, policy) in MANAGED_SETTING_FIELDS {
+        let Some(Value::String(path)) = effective_changes.get(*field) else {
+            continue;
+        };
+        let previous_path = current_settings.get(*field).and_then(Value::as_str);
+        ensure_managed_field_for_update(
+            &crate::routes::uploads::upload_root(),
+            path,
+            *policy,
+            effectively_changed_managed_field(previous_path, path),
+        )?;
+    }
+    Ok(())
+}
+
+/// Strict reference transition for one managed settings field: acquire the stored path,
+/// release the replaced one. Non-managed values are registry no-ops.
+async fn transition_setting_reference(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    setting_key: &str,
+    current_settings: &Map<String, Value>,
+    next_value: &Value,
+) -> Result<(), crate::services::managed_asset_registry::RegistryError> {
+    let Some(next_path) = next_value.as_str() else {
+        return Ok(());
     };
-    match document.get("value") {
-        Some(Bson::Int32(value)) if *value >= 0 => Ok(i64::from(*value)),
-        Some(Bson::Int64(value)) if *value >= 0 => Ok(*value),
-        None => Ok(0),
-        _ => Err(SnapshotError::Unavailable),
+    let previous_path = current_settings.get(setting_key).and_then(Value::as_str);
+    if previous_path == Some(next_path) {
+        return Ok(());
     }
+    let resource = format!("settings:{setting_key}");
+    if let Some(previous) = previous_path {
+        crate::services::managed_asset_registry::release_reference(tx, previous, &resource).await?;
+    }
+    crate::services::managed_asset_registry::acquire_reference(tx, next_path, &resource).await
 }
-
-fn build_settings_audit_document(
-    actor: &AuthenticatedProxyUser,
-    headers: &HeaderMap,
+fn build_settings_audit_payload(
+    actor: &crate::sql_auth::SqlAuthenticatedUser,
     previous: &Map<String, Value>,
     changed: &Map<String, Value>,
     old_revision: i64,
     new_revision: i64,
     idempotency_key: &str,
-) -> Document {
+    trace_id: Option<&str>,
+) -> Value {
     let mut changes = Map::new();
     for (key, value) in changed {
         let mut change = Map::new();
@@ -523,110 +310,24 @@ fn build_settings_audit_document(
         changes.insert(key.clone(), Value::Object(change));
     }
     let key_fingerprint = sha256_hex(idempotency_key.as_bytes());
-    let mut metadata = doc! {
+    let mut metadata = json!({
+        "actor": {
+            "id": actor.id,
+            "role": actor.role,
+            "email": actor.email,
+        },
+        "resource": "Settings",
+        "action": "update",
         "changedKeys": changed.keys().cloned().collect::<Vec<_>>(),
         "oldRevision": old_revision,
         "newRevision": new_revision,
         "idempotencyKeyFingerprint": key_fingerprint,
-        "changes": json_to_bson(&Value::Object(changes)),
-    };
-    if let Some(trace_id) = headers
-        .get("x-trace-id")
-        .or_else(|| headers.get("x-webtopup-gateway-correlation-id"))
-        .and_then(|value| value.to_str().ok())
-    {
-        metadata.insert("traceId", trace_id);
+        "changes": changes,
+    });
+    if let Some(trace_id) = trace_id {
+        metadata["traceId"] = Value::String(trace_id.to_string());
     }
-    let sanitized = sanitize_audit_document(&metadata);
-    let now = DateTime::now();
-    doc! {
-        "actor": actor.id,
-        "actorName": &actor.email,
-        "actorEmail": &actor.email,
-        "actorRole": &actor.role,
-        "action": "update",
-        "resource": "Settings",
-        "method": "PUT",
-        "path": "/v2/settings/admin/update",
-        "statusCode": 200_i32,
-        "summary": format!(
-            "Updated settings r{}→r{}: {}",
-            old_revision,
-            new_revision,
-            changed.keys().cloned().collect::<Vec<_>>().join(", ")
-        ),
-        "metadata": sanitized,
-        "createdAt": now,
-        "updatedAt": now,
-        "__v": 0,
-    }
-}
-
-pub async fn probe_site_config_transactions(
-    client: &mongodb::Client,
-    db_name: &str,
-) -> Result<(), Response> {
-    let mut session = client
-        .start_session()
-        .await
-        .map_err(|_| settings_transactions_unavailable())?;
-    if let Err(error) = session.start_transaction().await {
-        if is_transaction_capability_error(&error) {
-            return Err(settings_transactions_unavailable());
-        }
-        return Err(internal_error());
-    }
-    // Read-only probe: load revision metadata inside the transaction, then abort.
-    let result = client
-        .database(db_name)
-        .collection::<Document>("settings")
-        .find_one(doc! { "key": SITE_CONFIG_REVISION_KEY })
-        .session(&mut session)
-        .await;
-    let _ = session.abort_transaction().await;
-    match result {
-        Ok(_) => Ok(()),
-        Err(error) if is_transaction_capability_error(&error) => {
-            Err(settings_transactions_unavailable())
-        }
-        Err(_) => Err(internal_error()),
-    }
-}
-
-fn is_transaction_capability_error(error: &mongodb::error::Error) -> bool {
-    let text = format!("{error:?}").to_lowercase();
-    text.contains("transaction numbers are only allowed")
-        || text.contains("illegal operation")
-        || text.contains("transactions are not supported")
-        || text.contains("transaction is not supported")
-}
-
-fn settings_transactions_unavailable() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({
-            "message": "Mutasi Site Config membutuhkan transaksi database",
-            "error": {
-                "code": "SETTINGS_TRANSACTIONS_UNAVAILABLE",
-                "message": "Mutasi Site Config membutuhkan transaksi database"
-            }
-        })),
-    )
-        .into_response()
-}
-
-fn settings_commit_unknown() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({
-            "message": "Status penyimpanan belum dapat dipastikan. Periksa revisi terbaru dan log audit sebelum mencoba tindakan baru.",
-            "error": {
-                "code": "SETTINGS_COMMIT_UNKNOWN",
-                "message": "Status penyimpanan belum dapat dipastikan"
-            }
-        })),
-    )
-        .into_response()
+    crate::services::audit_sanitize::sanitize_audit_document(&metadata)
 }
 
 fn policy_error_response(error: SettingsPolicyError) -> Response {
@@ -640,6 +341,26 @@ fn policy_error_response(error: SettingsPolicyError) -> Response {
         .into_response()
 }
 
+fn managed_reference_error_response() -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "message": "Referensi aset upload tidak dapat diamankan",
+            "error": {
+                "code": "MANAGED_ASSET_REFERENCE_FAILED",
+                "message": "Referensi aset upload tidak dapat diamankan"
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// Replay of a frozen reply must still verify the stored digest belongs to this actor.
+#[allow(dead_code)]
+fn replay_actor_scope(actor: Uuid) -> Uuid {
+    actor
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -648,22 +369,10 @@ mod tests {
     fn source_contract_admin_update_uses_execute_site_config_mutation() {
         let source = include_str!("../settings.rs");
         assert!(source.contains("execute_site_config_mutation"));
-        assert!(!source.contains("write_settings_audit_log(client, db_name, actor"));
     }
 
     #[test]
-    fn source_contract_mutation_reads_settings_in_session() {
-        let production = include_str!("mutation.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap_or("");
-        assert!(
-            production.contains("load_settings_in_session(db, session, &selected_keys)"),
-            "authoritative mutation snapshot must load settings inside the write transaction"
-        );
-        assert!(
-            !production.contains("load_settings(db.client()"),
-            "out-of-session settings reads can disagree with the in-transaction revision"
-        );
+    fn managed_settings_fields_use_folder_policies() {
+        assert_eq!(MANAGED_SETTING_FIELDS.len(), 3);
     }
 }

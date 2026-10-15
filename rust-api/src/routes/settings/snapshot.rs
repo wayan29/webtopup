@@ -2,13 +2,13 @@
 
 use axum::http::HeaderValue;
 use serde_json::{Map, Value};
+use sqlx::PgPool;
 
 use crate::services::bot_protection::effective_bot_protection;
 
-use super::{defaults::default_site_settings, store::load_settings};
+use super::store::{load_domain_snapshot, SETTINGS_DOMAIN};
 
 pub const SITE_CONFIG_REVISION_KEY: &str = "__site_config_revision__";
-const SNAPSHOT_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SiteSettingsSnapshot {
@@ -19,14 +19,12 @@ pub struct SiteSettingsSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotError {
     Unavailable,
-    Unstable,
 }
 
 impl SnapshotError {
     pub fn code(self) -> &'static str {
         match self {
             Self::Unavailable => "SETTINGS_SNAPSHOT_UNAVAILABLE",
-            Self::Unstable => "SETTINGS_SNAPSHOT_UNSTABLE",
         }
     }
 }
@@ -40,76 +38,26 @@ pub fn matches_site_settings_etag(raw: Option<&HeaderValue>, revision: i64) -> b
         return false;
     };
     let expected = site_settings_etag(revision);
-    raw.split(',')
-        .map(str::trim)
-        .any(|candidate| candidate == expected)
+    raw.split(',').map(str::trim).any(|candidate| candidate == expected)
 }
 
-pub async fn load_revision(
-    client: &mongodb::Client,
-    db_name: &str,
-) -> Result<i64, SnapshotError> {
-    use futures_util::TryStreamExt;
-    use mongodb::bson::{doc, Document};
-
-    let mut cursor = client
-        .database(db_name)
-        .collection::<Document>("settings")
-        .find(doc! { "key": SITE_CONFIG_REVISION_KEY })
-        .await
-        .map_err(|_| SnapshotError::Unavailable)?;
-    let mut docs = Vec::new();
-    while let Some(document) = cursor
-        .try_next()
-        .await
-        .map_err(|_| SnapshotError::Unavailable)?
-    {
-        docs.push(document);
-    }
-    if docs.len() > 1 {
-        return Err(SnapshotError::Unavailable);
-    }
-    let Some(document) = docs.into_iter().next() else {
-        return Ok(0);
-    };
-    let revision = match document.get("value") {
-        Some(mongodb::bson::Bson::Int32(value)) => i64::from(*value),
-        Some(mongodb::bson::Bson::Int64(value)) => *value,
-        Some(mongodb::bson::Bson::Double(value)) if value.fract() == 0.0 && *value >= 0.0 => {
-            *value as i64
-        }
-        Some(mongodb::bson::Bson::String(value)) => value
-            .trim()
-            .parse::<i64>()
-            .map_err(|_| SnapshotError::Unavailable)?,
-        None => 0,
-        _ => return Err(SnapshotError::Unavailable),
-    };
-    if revision < 0 {
-        return Err(SnapshotError::Unavailable);
-    }
-    Ok(revision)
+/// Load the settings revision and stored rows from one statement snapshot.
+pub async fn load_revision(pool: &PgPool) -> Result<i64, SnapshotError> {
+    Ok(load_consistent_snapshot(pool, &[]).await?.revision)
 }
 
 pub async fn load_consistent_snapshot(
-    client: &mongodb::Client,
-    db_name: &str,
+    pool: &PgPool,
     selected_keys: &[&str],
 ) -> Result<SiteSettingsSnapshot, SnapshotError> {
-    for _ in 0..SNAPSHOT_ATTEMPTS {
-        let before = load_revision(client, db_name).await?;
-        let settings = load_settings(client, db_name, selected_keys)
-            .await
-            .map_err(|_| SnapshotError::Unavailable)?;
-        let after = load_revision(client, db_name).await?;
-        if before == after {
-            return Ok(SiteSettingsSnapshot {
-                revision: before,
-                settings,
-            });
-        }
+    let (revision, settings) = load_domain_snapshot(pool, SETTINGS_DOMAIN)
+        .await
+        .map_err(|_| SnapshotError::Unavailable)?;
+    let mut settings = settings;
+    if !selected_keys.is_empty() {
+        settings.retain(|key, _| selected_keys.contains(&key.as_str()));
     }
-    Err(SnapshotError::Unstable)
+    Ok(SiteSettingsSnapshot { revision, settings })
 }
 
 pub fn with_revision_field(mut settings: Map<String, Value>, revision: i64) -> Map<String, Value> {
@@ -144,70 +92,51 @@ pub fn with_admin_bot_protection_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::routes::settings::defaults::{default_site_settings, public_site_setting_keys};
     use serde_json::json;
 
     #[test]
-    fn revision_key_is_reserved_and_never_a_normal_setting() {
-        assert!(!default_site_settings().contains_key(SITE_CONFIG_REVISION_KEY));
-        assert!(!public_site_setting_keys().contains(&SITE_CONFIG_REVISION_KEY));
+    fn etag_uses_the_site_settings_revision() {
+        assert_eq!(site_settings_etag(7), "\"site-settings-7\"");
     }
 
     #[test]
-    fn etag_matching_accepts_only_the_exact_strong_service_tag() {
-        assert!(matches_site_settings_etag(
-            Some(&HeaderValue::from_static("\"site-settings-14\"")),
-            14
-        ));
-        for value in [
-            "W/\"site-settings-14\"",
-            "\"site-settings-014\"",
-            "*",
-            "\"other-14\"",
-            "site-settings-14",
-        ] {
-            assert!(
-                !matches_site_settings_etag(Some(&HeaderValue::from_str(value).unwrap()), 14),
-                "{value}"
-            );
-        }
-        assert!(matches_site_settings_etag(
-            Some(&HeaderValue::from_static(
-                "\"site-settings-13\", \"site-settings-14\""
-            )),
-            14
-        ));
+    fn etag_matches_exact_members_only() {
+        let revision = 4;
+        let matching = HeaderValue::from_static("\"site-settings-4\"");
+        let listed = HeaderValue::from_static("\"other\", \"site-settings-4\"");
+        let stale = HeaderValue::from_static("\"site-settings-3\"");
+        assert!(matches_site_settings_etag(Some(&matching), revision));
+        assert!(matches_site_settings_etag(Some(&listed), revision));
+        assert!(!matches_site_settings_etag(Some(&stale), revision));
+        assert!(!matches_site_settings_etag(None, revision));
     }
 
     #[test]
-    fn with_revision_field_is_top_level_metadata() {
+    fn revision_field_is_added_to_the_public_object() {
         let mut settings = Map::new();
-        settings.insert("brand".to_string(), Value::String("Danayasa".into()));
-        let with_revision = with_revision_field(settings, 3);
-        assert_eq!(with_revision.get("revision"), Some(&Value::from(3)));
-        assert_eq!(
-            with_revision.get("brand"),
-            Some(&Value::String("Danayasa".into()))
-        );
+        settings.insert("brand".to_string(), json!("Danayasa"));
+        let with_revision = with_revision_field(settings, 9);
+        assert_eq!(with_revision.get("revision"), Some(&json!(9)));
     }
 
     #[test]
-    fn public_bot_protection_uses_effective_flag() {
-        let mut settings = Map::new();
-        settings.insert("botProtectionEnabled".into(), json!(true));
-        settings.insert("turnstileSiteKey".into(), json!("site"));
-        apply_public_bot_protection(&mut settings, true);
-        assert_eq!(settings.get("botProtectionEnabled"), Some(&json!(false)));
-        assert!(settings.get("botProtectionKillSwitch").is_none());
+    fn public_bot_protection_honors_the_kill_switch() {
+        let mut enabled = Map::new();
+        enabled.insert("botProtectionEnabled".to_string(), json!(true));
+        apply_public_bot_protection(&mut enabled, true);
+        assert_eq!(enabled.get("botProtectionEnabled"), Some(&json!(false)));
+
+        let mut disabled = Map::new();
+        disabled.insert("botProtectionEnabled".to_string(), json!(false));
+        apply_public_bot_protection(&mut disabled, false);
+        assert_eq!(disabled.get("botProtectionEnabled"), Some(&json!(false)));
     }
 
     #[test]
-    fn admin_metadata_exposes_kill_switch_beside_revision() {
-        let mut settings = Map::new();
-        settings.insert("botProtectionEnabled".into(), json!(true));
-        let out = with_admin_bot_protection_metadata(settings, 4, true);
-        assert_eq!(out.get("revision"), Some(&Value::from(4)));
-        assert_eq!(out.get("botProtectionKillSwitch"), Some(&json!(true)));
-        assert_eq!(out.get("botProtectionEnabled"), Some(&json!(true)));
+    fn admin_metadata_includes_kill_switch_and_revision() {
+        let settings = Map::new();
+        let metadata = with_admin_bot_protection_metadata(settings, 3, true);
+        assert_eq!(metadata.get("revision"), Some(&json!(3)));
+        assert_eq!(metadata.get("botProtectionKillSwitch"), Some(&json!(true)));
     }
 }

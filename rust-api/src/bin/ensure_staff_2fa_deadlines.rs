@@ -1,74 +1,41 @@
-use anyhow::{Context, Result};
-use mongodb::{
-    bson::{doc, DateTime, Document},
-    Client,
-};
+use std::env;
+use std::process::ExitCode;
 
-const HELP: &str = "Assign missing or null seven-day UTC 2FA enrollment deadlines to active owner/admin/CS users.\n\nUsage: ensure_staff_2fa_deadlines [--dry-run]\n\n--dry-run  Count matching users without writing.\n\nOutput always reports matched, modified, and dry-run counts. Safe and idempotent: only missing/null deadlines are selected. This operator command is never run at application startup.";
+use sqlx::postgres::PgPoolOptions;
 
-fn migration_filter() -> Document {
-    doc! {
-        "active": true,
-        "role": { "$in": ["owner", "admin", "cs"] },
-        "twoFactorEnabled": { "$ne": true },
-        "$or": [
-            { "twoFactorEnrollmentRequiredAt": { "$exists": false } },
-            { "twoFactorEnrollmentRequiredAt": null },
-        ],
-    }
-}
+const DISPOSABLE_DATABASE: &str = "webtopup_task14_dev";
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        println!("{HELP}");
-        return Ok(());
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("staff 2FA readiness failed: {error:#}");
+            ExitCode::from(2)
+        }
     }
-    if args.iter().any(|arg| arg != "--dry-run") {
-        anyhow::bail!("unknown argument; run with --help");
-    }
-    let dry_run = args.iter().any(|arg| arg == "--dry-run");
-    let uri = std::env::var("MONGO_URI").context("MONGO_URI is required")?;
-    let database = std::env::var("MONGO_DB").unwrap_or_else(|_| "webtopup".to_string());
-    let client = Client::with_uri_str(uri).await?;
-    let users = client.database(&database).collection::<Document>("users");
-    let filter = migration_filter();
-    let matched = users.count_documents(filter.clone()).await?;
-    if dry_run {
-        println!("matched={matched} modified=0 dry_run={matched}");
-        return Ok(());
-    }
-    let assigned_at = DateTime::now();
-    let deadline = DateTime::from_millis(assigned_at.timestamp_millis() + 7 * 24 * 60 * 60 * 1_000);
-    let result = users.update_many(filter, doc! { "$set": { "twoFactorEnrollmentRequiredAt": deadline, "updatedAt": assigned_at } }).await?;
-    // No account identifiers or secrets are emitted.
-    println!(
-        "matched={} modified={} dry_run=0",
-        result.matched_count, result.modified_count
-    );
-    Ok(())
 }
 
-#[cfg(test)]
-mod auth_2fa_enrollment_migration_tests {
-    use super::*;
-
-    #[test]
-    fn migration_selects_exact_active_staff_with_missing_or_null_deadline() {
-        let filter = migration_filter();
-        assert_eq!(filter.get_bool("active"), Ok(true));
-        assert!(filter.get_document("role").is_ok());
-        let alternatives = filter.get_array("$or").unwrap();
-        assert_eq!(alternatives.len(), 2);
-        assert!(format!("{filter:?}").contains("Null"));
+async fn run() -> anyhow::Result<ExitCode> {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--help") {
+        eprintln!("Usage: ensure_staff_2fa_deadlines [--apply]\nDefault: dry-run count.\n--apply: assign seven-day deadlines only for webtopup_task14_dev.");
+        return Ok(ExitCode::SUCCESS);
     }
-
-    #[test]
-    fn migration_filter_remains_idempotent_after_assignment() {
-        let filter = migration_filter();
-        assert!(!format!("{filter:?}").contains("DateTime"));
-        assert!(filter.get("twoFactorEnrollmentRequiredAt").is_none());
+    if args.iter().any(|arg| arg != "--apply") { anyhow::bail!("unknown argument"); }
+    let apply = args.iter().any(|arg| arg == "--apply");
+    let url = env::var("DATABASE_URL").map_err(|_| anyhow::anyhow!("DATABASE_URL is required"))?;
+    let database = url.split('?').next().unwrap_or(&url).rsplit('/').next().filter(|name| !name.is_empty()).ok_or_else(|| anyhow::anyhow!("database name missing"))?;
+    if matches!(database, "pobb" | "ppob" | "webtopup") { anyhow::bail!("refusing protected database {database}"); }
+    let pool = PgPoolOptions::new().connect(&url).await?;
+    let matched: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE role IN ('owner', 'admin', 'cs') AND active = TRUE AND two_factor_enabled = FALSE AND two_factor_enrollment_required_at IS NULL").fetch_one(&pool).await?;
+    if !apply {
+        println!("database={database} matched={matched} modified=0 dry_run=true");
+        return Ok(ExitCode::SUCCESS);
     }
+    if database != DISPOSABLE_DATABASE { anyhow::bail!("--apply is allowed only for {DISPOSABLE_DATABASE}"); }
+    if env::var("STAFF_2FA_BACKUP_CONFIRMED").ok().as_deref() != Some("yes") { anyhow::bail!("backup confirmation STAFF_2FA_BACKUP_CONFIRMED=yes is required"); }
+    let modified = sqlx::query("UPDATE users SET two_factor_enrollment_required_at = now() + interval '7 days', updated_at = now() WHERE role IN ('owner', 'admin', 'cs') AND active = TRUE AND two_factor_enabled = FALSE AND two_factor_enrollment_required_at IS NULL").execute(&pool).await?.rows_affected();
+    println!("database={database} matched={matched} modified={modified} dry_run=false");
+    Ok(ExitCode::SUCCESS)
 }

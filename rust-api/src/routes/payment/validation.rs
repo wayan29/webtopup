@@ -1,53 +1,49 @@
 use axum::response::Response;
-use mongodb::bson::oid::ObjectId;
-use mongodb::bson::{doc, Bson, Document};
 use serde_json::Value;
+use sqlx::{postgres::PgRow, PgPool, Row};
 
 use super::{
     responses::{status_message, string_message},
     types::{PaymentMethodPayload, ValidPaymentMethodPayload},
-    utils::{is_valid_time_string, read_f64_default, read_string_default},
+    utils::is_valid_time_string,
 };
 
 pub(super) async fn validate_payment_method_payload(
-    db: &mongodb::Database,
+    pool: &PgPool,
     payload: PaymentMethodPayload,
-    current: &Document,
+    current: &PgRow,
 ) -> Result<ValidPaymentMethodPayload, Response> {
-    validate_payment_method_payload_inner(db, payload, Some(current)).await
+    validate_payment_method_payload_inner(pool, payload, Some(current)).await
 }
 
 pub(super) async fn validate_payment_method_create_payload(
-    db: &mongodb::Database,
+    pool: &PgPool,
     payload: PaymentMethodPayload,
 ) -> Result<ValidPaymentMethodPayload, Response> {
-    validate_payment_method_payload_inner(db, payload, None).await
+    validate_payment_method_payload_inner(pool, payload, None).await
 }
 
 async fn validate_payment_method_payload_inner(
-    db: &mongodb::Database,
+    pool: &PgPool,
     payload: PaymentMethodPayload,
-    current: Option<&Document>,
+    current: Option<&PgRow>,
 ) -> Result<ValidPaymentMethodPayload, Response> {
-    let existing = current;
-    let empty = Document::new();
-    let current = existing.unwrap_or(&empty);
     let name = text_value_or_current(payload.name, current, "name", "");
     let category = match payload.category {
-        Some(value) => text_value_or_current(Some(value), current, "category", ""),
-        None => read_string_default(current, "category", ""),
+        Some(value) => text_value_or_current(Some(value), current, "category_id", ""),
+        None => text_value_or_current(None, current, "category_id", ""),
     };
     let account_number =
-        text_value_or_current(payload.account_number, current, "accountNumber", "");
-    let account_name = text_value_or_current(payload.account_name, current, "accountName", "");
+        text_value_or_current(payload.account_number, current, "account_number", "");
+    let account_name = text_value_or_current(payload.account_name, current, "account_name", "");
     let icon = text_value_or_current(payload.icon, current, "icon", "");
-    let previous_icon = read_string_default(current, "icon", "");
+    let previous_icon = text_value_or_current(None, current, "icon", "");
     if let Err(response) = crate::services::managed_assets::ensure_managed_field_for_update(
         &crate::routes::uploads::upload_root(),
         &icon,
         crate::services::managed_assets::ManagedFieldFolderPolicy::Icons,
         crate::services::managed_assets::effectively_changed_managed_field(
-            existing.map(|_| previous_icon.as_str()),
+            current.map(|_| previous_icon.as_str()),
             &icon,
         ),
     ) {
@@ -56,11 +52,11 @@ async fn validate_payment_method_payload_inner(
     let operational_start = text_value_or_current(
         payload.operational_start,
         current,
-        "operationalStart",
+        "operational_start",
         "00:00",
     );
     let operational_end =
-        text_value_or_current(payload.operational_end, current, "operationalEnd", "23:59");
+        text_value_or_current(payload.operational_end, current, "operational_end", "23:59");
     let status = text_value_or_current(payload.status, current, "status", "active");
     let use_unique_code = match payload.use_unique_code {
         Some(Value::Bool(value)) => value,
@@ -70,16 +66,17 @@ async fn validate_payment_method_payload_inner(
                 "Format kode unik tidak valid",
             ))
         }
-        None => current.get_bool("useUniqueCode").unwrap_or(true),
+        None => current
+            .and_then(|row| row.try_get::<bool, _>("use_unique_code").ok())
+            .unwrap_or(true),
     };
-
     if name.is_empty() {
         return Err(status_message(
             axum::http::StatusCode::BAD_REQUEST,
             "Nama metode pembayaran wajib diisi",
         ));
     }
-    let category_id = match ObjectId::parse_str(&category) {
+    let category_id = match uuid::Uuid::parse_str(&category) {
         Ok(id) => id,
         Err(_) => {
             return Err(status_message(
@@ -112,17 +109,16 @@ async fn validate_payment_method_payload_inner(
             "Jam operasional harus berformat HH:mm",
         ));
     }
-
-    let min_amount = number_value_or_current(payload.min_amount, current, "minAmount", 10_000.0)
-        .map_err(|message| string_message(axum::http::StatusCode::BAD_REQUEST, message))?;
-    let max_amount = number_value_or_current(payload.max_amount, current, "maxAmount", 5_000_000.0)
-        .map_err(|message| string_message(axum::http::StatusCode::BAD_REQUEST, message))?;
-    let admin_fee = number_value_or_current(payload.admin_fee, current, "adminFee", 0.0)
-        .map_err(|message| string_message(axum::http::StatusCode::BAD_REQUEST, message))?;
+    let min_amount = number_value_or_current(payload.min_amount, current, "min_amount", 10_000.0)
+        .map_err(|m| string_message(axum::http::StatusCode::BAD_REQUEST, m))?;
+    let max_amount =
+        number_value_or_current(payload.max_amount, current, "max_amount", 5_000_000.0)
+            .map_err(|m| string_message(axum::http::StatusCode::BAD_REQUEST, m))?;
+    let admin_fee = number_value_or_current(payload.admin_fee, current, "admin_fee", 0.0)
+        .map_err(|m| string_message(axum::http::StatusCode::BAD_REQUEST, m))?;
     let admin_percent =
-        number_value_or_current(payload.admin_percent, current, "adminPercent", 0.0)
-            .map_err(|message| string_message(axum::http::StatusCode::BAD_REQUEST, message))?;
-
+        number_value_or_current(payload.admin_percent, current, "admin_percent", 0.0)
+            .map_err(|m| string_message(axum::http::StatusCode::BAD_REQUEST, m))?;
     if min_amount < 0.0 {
         return Err(status_message(
             axum::http::StatusCode::BAD_REQUEST,
@@ -153,20 +149,19 @@ async fn validate_payment_method_payload_inner(
             "Biaya admin persen harus di antara 0 sampai 100",
         ));
     }
-    let category_exists = db
-        .collection::<Document>("paymentcategories")
-        .find_one(doc! { "_id": category_id })
-        .await
-        .ok()
-        .flatten()
-        .is_some();
+    let category_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM payment_categories WHERE id = $1)",
+    )
+    .bind(category_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false);
     if !category_exists {
         return Err(status_message(
             axum::http::StatusCode::BAD_REQUEST,
             "Kategori pembayaran tidak ditemukan",
         ));
     }
-
     Ok(ValidPaymentMethodPayload {
         name,
         category: category_id,
@@ -186,7 +181,7 @@ async fn validate_payment_method_payload_inner(
 
 fn text_value_or_current(
     value: Option<Value>,
-    current: &Document,
+    current: Option<&PgRow>,
     key: &str,
     default: &str,
 ) -> String {
@@ -195,16 +190,24 @@ fn text_value_or_current(
         Some(Value::Number(value)) => value.to_string().trim().to_string(),
         Some(Value::Bool(value)) => value.to_string(),
         Some(Value::Null) | Some(Value::Array(_)) | Some(Value::Object(_)) => String::new(),
-        None => match current.get(key) {
-            Some(Bson::ObjectId(value)) => value.to_hex(),
-            _ => read_string_default(current, key, default),
-        },
+        None => {
+            if key == "category_id" {
+                current
+                    .and_then(|row| row.try_get::<uuid::Uuid, _>(key).ok())
+                    .map(|id| id.to_string())
+                    .unwrap_or_default()
+            } else {
+                current
+                    .and_then(|row| row.try_get::<String, _>(key).ok())
+                    .unwrap_or_else(|| default.to_string())
+            }
+        }
     }
 }
 
 fn number_value_or_current(
     value: Option<Value>,
-    current: &Document,
+    current: Option<&PgRow>,
     key: &str,
     default: f64,
 ) -> Result<f64, String> {
@@ -217,16 +220,18 @@ fn number_value_or_current(
             .parse::<f64>()
             .map_err(|_| number_error_message(key).to_string()),
         Some(_) => Err(number_error_message(key).to_string()),
-        None => Ok(read_f64_default(current, key, default)),
+        None => Ok(current
+            .and_then(|row| row.try_get::<f64, _>(key).ok())
+            .unwrap_or(default)),
     }
 }
 
 fn number_error_message(key: &str) -> &'static str {
     match key {
-        "minAmount" => "Minimum amount tidak valid",
-        "maxAmount" => "Maximum amount tidak valid",
-        "adminFee" => "Biaya admin tetap tidak valid",
-        "adminPercent" => "Biaya admin persen tidak valid",
+        "min_amount" => "Minimum amount tidak valid",
+        "max_amount" => "Maximum amount tidak valid",
+        "admin_fee" => "Biaya admin tetap tidak valid",
+        "admin_percent" => "Biaya admin persen tidak valid",
         _ => "Nilai tidak valid",
     }
 }

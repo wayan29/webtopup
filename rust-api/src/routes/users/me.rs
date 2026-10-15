@@ -1,23 +1,14 @@
 use std::sync::Arc;
 
 use axum::{extract::State, response::IntoResponse, Json};
-use bcrypt::{hash, verify, DEFAULT_COST};
-use futures_util::TryStreamExt;
-use mongodb::bson::{doc, DateTime, Document};
-
-use crate::{security::require_member_user, state::AppState, utils::bson::read_string};
+use crate::state::AppState;
 
 use super::{
-    mappers::{
-        login_activity_from_doc, my_profile_from_doc, preferences_doc_from_doc,
-        preferences_from_doc,
-    },
-    responses::{internal_error, not_found, status_message, unavailable},
-    session::{current_authenticated_user, current_member_user},
+    mappers::{my_profile_from_sql, preferences_from_sql},
+    responses::{internal_error, not_found, status_message},
     types::{
-        ChangeMyPasswordPayload, LoginActivityResponse, MyPreferencesResponse, MyProfileResponse,
-        UpdateMyPreferencesPayload, UpdateMyPreferencesResponse, UpdateMyProfilePayload,
-        UpdateMyProfileResponse,
+        ChangeMyPasswordPayload, LoginActivityItem, LoginActivityResponse, MyPreferencesResponse, MyProfileResponse,
+        UpdateMyPreferencesPayload, UpdateMyPreferencesResponse, UpdateMyProfilePayload, UpdateMyProfileResponse,
     },
     validation::COMMON_PASSWORDS,
     validation::{
@@ -29,12 +20,21 @@ pub async fn me_profile(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> axum::response::Response {
-    let user = match current_member_user(headers, &state).await {
+    let user = match crate::sql_auth::current(&headers, &state).await {
         Ok(user) => user,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
+    if user.role != "member" {
+        return status_message(
+            axum::http::StatusCode::FORBIDDEN,
+            "Hanya member yang dapat mengakses data ini",
+        );
+    }
+    if !user.active {
+        return status_message(axum::http::StatusCode::FORBIDDEN, "Akun tidak aktif");
+    }
     Json(MyProfileResponse {
-        profile: my_profile_from_doc(&user),
+        profile: my_profile_from_sql(&user),
     })
     .into_response()
 }
@@ -44,134 +44,109 @@ pub async fn update_me_profile(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<UpdateMyProfilePayload>,
 ) -> axum::response::Response {
-    let user = match current_member_user(headers, &state).await {
+    let user = match crate::sql_auth::current(&headers, &state).await {
         Ok(user) => user,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
+    if user.role != "member" {
+        return status_message(
+            axum::http::StatusCode::FORBIDDEN,
+            "Hanya member yang dapat mengakses data ini",
+        );
+    }
+    if !user.active {
+        return status_message(axum::http::StatusCode::FORBIDDEN, "Akun tidak aktif");
+    }
+
+    let name = match payload.name {
+        Some(value) => {
+            let value = value.trim().to_string();
+            if !(2..=80).contains(&value.len()) {
+                return status_message(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "Nama harus 2-80 karakter",
+                );
+            }
+            Some(value)
+        }
+        None => None,
     };
-    let Ok(user_id) = user.get_object_id("_id") else {
-        return not_found("User member tidak ditemukan");
+    let email = match payload.email {
+        Some(value) => {
+            let value = normalize_email(&value);
+            if !is_valid_email(&value) {
+                return status_message(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "Format email tidak valid",
+                );
+            }
+            Some(value)
+        }
+        None => None,
     };
-    let db = client.database(&state.mongo_db);
-    let users = db.collection::<Document>("users");
-    let mut set_doc = Document::new();
-    let mut unset_doc = Document::new();
-
-    if let Some(value) = payload.name {
-        let name = value.trim().to_string();
-        if name.len() < 2 || name.len() > 80 {
-            return status_message(
-                axum::http::StatusCode::BAD_REQUEST,
-                "Nama harus 2-80 karakter",
-            );
+    let phone = match payload.phone {
+        Some(value) => {
+            let value = normalize_phone(&value);
+            if !value.is_empty() && !is_valid_phone(&value) {
+                return status_message(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "Nomor telepon harus 8-20 digit",
+                );
+            }
+            Some(value)
         }
-        set_doc.insert("name", name);
-    }
-
-    if let Some(value) = payload.email {
-        let email = normalize_email(&value);
-        if !is_valid_email(&email) {
-            return status_message(
-                axum::http::StatusCode::BAD_REQUEST,
-                "Format email tidak valid",
-            );
+        None => None,
+    };
+    let address = match payload.address {
+        Some(value) => {
+            let value = value.trim().to_string();
+            if value.len() > 200 {
+                return status_message(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "Alamat maksimal 200 karakter",
+                );
+            }
+            Some(value)
         }
-        let existing = users
-            .find_one(doc! { "email": &email, "_id": { "$ne": user_id } })
-            .projection(doc! { "_id": 1 })
-            .await
-            .ok()
-            .flatten();
-        if existing.is_some() {
-            return status_message(
-                axum::http::StatusCode::BAD_REQUEST,
-                "Email sudah dipakai akun lain",
-            );
-        }
-        set_doc.insert("email", email);
-    }
-
-    if let Some(value) = payload.phone {
-        let phone = normalize_phone(&value);
-        if !phone.is_empty() && !is_valid_phone(&phone) {
-            return status_message(
-                axum::http::StatusCode::BAD_REQUEST,
-                "Nomor telepon harus 8-20 digit",
-            );
-        }
-        if phone.is_empty() {
-            unset_doc.insert("phone", "");
-        } else {
-            set_doc.insert("phone", phone);
-        }
-    }
-
-    if let Some(value) = payload.address {
-        let address = value.trim().to_string();
-        if address.len() > 200 {
-            return status_message(
-                axum::http::StatusCode::BAD_REQUEST,
-                "Alamat maksimal 200 karakter",
-            );
-        }
-        if address.is_empty() {
-            unset_doc.insert("address", "");
-        } else {
-            set_doc.insert("address", address);
-        }
-    }
-
-    if set_doc.is_empty() && unset_doc.is_empty() {
+        None => None,
+    };
+    if name.is_none() && email.is_none() && phone.is_none() && address.is_none() {
         return status_message(
             axum::http::StatusCode::BAD_REQUEST,
             "Tidak ada perubahan yang bisa disimpan",
         );
     }
 
-    set_doc.insert("updatedAt", DateTime::now());
-    let mut update = doc! { "$set": set_doc };
-    if !unset_doc.is_empty() {
-        update.insert("$unset", unset_doc);
-    }
-    if users
-        .update_one(doc! { "_id": user_id }, update)
-        .await
-        .is_err()
-    {
-        return status_message(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal Server Error",
-        );
-    }
-
-    let updated_user = users
-        .find_one(doc! { "_id": user_id, "role": "member" })
-        .projection(doc! {
-            "name": 1,
-            "email": 1,
-            "phone": 1,
-            "address": 1,
-            "role": 1,
-            "level": 1,
-            "balance": 1,
-            "points": 1,
-            "active": 1,
-            "createdAt": 1,
-            "updatedAt": 1,
-            "preferences": 1,
-        })
-        .await
-        .ok()
-        .flatten();
-    let Some(updated_user) = updated_user else {
-        return not_found("User member tidak ditemukan");
+    let updated = sqlx::query_as::<_, crate::sql_auth::User>(
+        "UPDATE users SET name=COALESCE($1,name), email=COALESCE($2,email), phone=COALESCE($3,phone), address=COALESCE($4,address), updated_at=now() WHERE id=$5 AND role='member' AND active=TRUE RETURNING *",
+    )
+    .bind(name)
+    .bind(email)
+    .bind(phone)
+    .bind(address)
+    .bind(user.id)
+    .fetch_optional(&state.pg_pool)
+    .await;
+    let updated = match updated {
+        Ok(Some(user)) => user,
+        Ok(None) => return not_found("User member tidak ditemukan"),
+        Err(error)
+            if error
+                .as_database_error()
+                .and_then(|database_error| database_error.code())
+                .as_deref()
+                == Some("23505") =>
+        {
+            return status_message(
+                axum::http::StatusCode::BAD_REQUEST,
+                "Email sudah dipakai akun lain",
+            );
+        }
+        Err(_) => return internal_error(),
     };
-
     Json(UpdateMyProfileResponse {
         message: "Profil berhasil diperbarui",
-        profile: my_profile_from_doc(&updated_user),
+        profile: my_profile_from_sql(&updated),
     })
     .into_response()
 }
@@ -181,134 +156,73 @@ pub async fn change_me_password(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<ChangeMyPasswordPayload>,
 ) -> axum::response::Response {
-    let proxy_user = match require_member_user(&headers, &state).await {
-        Ok(user) => user,
-        Err(response) => return response,
+    let user = match crate::sql_auth::current(&headers, &state).await {
+        Ok(user) if user.role == "member" => user,
+        Ok(_) => return status_message(axum::http::StatusCode::FORBIDDEN, "Hanya member yang dapat mengakses data ini"),
+        Err(error) => return error.into_response(),
     };
-    let user_id = proxy_user.id;
     let current_password = payload.current_password.unwrap_or_default();
     let new_password = payload.new_password.unwrap_or_default();
     let confirm_password = payload.confirm_password.unwrap_or_default();
     if current_password.is_empty() || new_password.is_empty() || confirm_password.is_empty() {
-        return status_message(
-            axum::http::StatusCode::BAD_REQUEST,
-            "Semua field password wajib diisi",
-        );
+        return status_message(axum::http::StatusCode::BAD_REQUEST, "Semua field password wajib diisi");
     }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
+    if !user.active { return status_message(axum::http::StatusCode::FORBIDDEN, "Akun tidak aktif"); }
+    if user.password_hash.is_empty() { return status_message(axum::http::StatusCode::BAD_REQUEST, "Akun ini belum memiliki password lokal"); }
+    if !crate::sql_auth::verify_password(current_password.clone(), user.password_hash.clone()).await { return status_message(axum::http::StatusCode::BAD_REQUEST, "Password saat ini tidak sesuai"); }
+    if new_password.len() < 12 { return status_message(axum::http::StatusCode::BAD_REQUEST, "Password baru minimal 12 karakter"); }
+    if COMMON_PASSWORDS.contains(&new_password.to_lowercase().as_str()) { return status_message(axum::http::StatusCode::BAD_REQUEST, "Password baru terlalu umum"); }
+    if new_password != confirm_password { return status_message(axum::http::StatusCode::BAD_REQUEST, "Konfirmasi password baru tidak cocok"); }
+    if new_password == current_password { return status_message(axum::http::StatusCode::BAD_REQUEST, "Password baru harus berbeda dari password saat ini"); }
+    let hashed = match crate::sql_auth::hash_password(new_password).await {
+        Ok(hash) => hash,
+        Err(error) => return error.into_response(),
     };
-    let object_id = user_id;
-    let users = client
-        .database(&state.mongo_db)
-        .collection::<Document>("users");
-    let user = match users
-        .find_one(doc! { "_id": object_id, "role": "member" })
-        .projection(doc! { "password": 1, "active": 1 })
-        .await
-    {
-        Ok(Some(user)) => user,
-        _ => return not_found("User member tidak ditemukan"),
-    };
-    if user.get_bool("active") == Ok(false) {
-        return status_message(axum::http::StatusCode::FORBIDDEN, "Akun tidak aktif");
-    }
-    let password_hash = read_string(&user, "password");
-    if password_hash.is_empty() {
-        return status_message(
-            axum::http::StatusCode::BAD_REQUEST,
-            "Akun ini belum memiliki password lokal",
-        );
-    }
-    if !verify(&current_password, &password_hash).unwrap_or(false) {
-        return status_message(
-            axum::http::StatusCode::BAD_REQUEST,
-            "Password saat ini tidak sesuai",
-        );
-    }
-    if new_password.len() < 12 {
-        return status_message(
-            axum::http::StatusCode::BAD_REQUEST,
-            "Password baru minimal 12 karakter",
-        );
-    }
-    if COMMON_PASSWORDS.contains(&new_password.to_lowercase().as_str()) {
-        return status_message(
-            axum::http::StatusCode::BAD_REQUEST,
-            "Password baru terlalu umum digunakan",
-        );
-    }
-    if new_password != confirm_password {
-        return status_message(
-            axum::http::StatusCode::BAD_REQUEST,
-            "Konfirmasi password baru tidak cocok",
-        );
-    }
-    if new_password == current_password {
-        return status_message(
-            axum::http::StatusCode::BAD_REQUEST,
-            "Password baru harus berbeda dari password saat ini",
-        );
-    }
-    let hashed = match hash(new_password, DEFAULT_COST) {
-        Ok(value) => value,
+    let mut tx = match state.pg_pool.begin().await {
+        Ok(tx) => tx,
         Err(_) => return internal_error(),
     };
-    if users
-        .update_one(
-            doc! { "_id": object_id },
-            doc! { "$set": { "password": hashed, "updatedAt": DateTime::now() }, "$inc": { "sessionVersion": 1 } },
-        )
-        .await
-        .is_err()
-    {
-        return internal_error();
-    }
+    if sqlx::query("UPDATE users SET password_hash=$1,updated_at=now(),session_version=session_version+1,security_generation=security_generation+1 WHERE id=$2 AND role='member'")
+        .bind(hashed).bind(user.id).execute(&mut *tx).await.is_err() { return internal_error(); }
+    if sqlx::query("UPDATE auth_sessions SET state='revoked',owns_slot=false WHERE user_id=$1 AND state IN ('active','locked')")
+        .bind(user.id).execute(&mut *tx).await.is_err() { return internal_error(); }
+    if tx.commit().await.is_err() { return internal_error(); }
     Json(serde_json::json!({ "message": "Password berhasil diubah" })).into_response()
+
 }
 
 pub async fn me_login_activity(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> axum::response::Response {
-    let user = match current_member_user(headers, &state).await {
-        Ok(user) => user,
-        Err(response) => return response,
+    let user = match crate::sql_auth::current(&headers, &state).await {
+        Ok(user) if user.role == "member" => user,
+        Ok(_) => return status_message(axum::http::StatusCode::FORBIDDEN, "Hanya member yang dapat mengakses data ini"),
+        Err(error) => return error.into_response(),
     };
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
+    let rows = match sqlx::query("SELECT id,created_at,payload FROM audit_events WHERE actor=$1 AND action='login_success' ORDER BY created_at DESC,id DESC LIMIT 10")
+        .bind(user.id.to_string()).fetch_all(&state.pg_pool).await {
+        Ok(rows) => rows,
+        Err(_) => return internal_error(),
     };
-    let Ok(user_id) = user.get_object_id("_id") else {
-        return not_found("User member tidak ditemukan");
-    };
-    let docs = match client
-        .database(&state.mongo_db)
-        .collection::<Document>("loginlogs")
-        .find(doc! { "user": user_id, "status": "success" })
-        .projection(doc! { "_id": 1, "ip": 1, "userAgent": 1, "createdAt": 1 })
-        .sort(doc! { "createdAt": -1 })
-        .limit(10)
-        .await
-    {
-        Ok(cursor) => cursor.try_collect::<Vec<_>>().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
-    };
-    Json(LoginActivityResponse {
-        items: docs.into_iter().map(login_activity_from_doc).collect(),
-    })
-    .into_response()
+    use sqlx::Row;
+    let items = rows.into_iter().map(|row| {
+        use sqlx::Row;
+        LoginActivityItem { id: row.get::<i64,_>("id").to_string(), ip: None, user_agent: None, created_at: row.get::<chrono::DateTime<chrono::Utc>,_>("created_at").to_rfc3339() }
+    }).collect();
+    Json(LoginActivityResponse { items }).into_response()
 }
 
 pub async fn me_preferences(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> axum::response::Response {
-    let user = match current_authenticated_user(headers, &state).await {
+    let user = match crate::sql_auth::current(&headers, &state).await {
         Ok(user) => user,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     Json(MyPreferencesResponse {
-        preferences: preferences_from_doc(user.get_document("preferences").ok()),
+        preferences: preferences_from_sql(&user.preferences),
     })
     .into_response()
 }
@@ -318,68 +232,46 @@ pub async fn update_me_preferences(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<UpdateMyPreferencesPayload>,
 ) -> axum::response::Response {
-    let user = match current_authenticated_user(headers, &state).await {
+    let user = match crate::sql_auth::current(&headers, &state).await {
         Ok(user) => user,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let Ok(user_id) = user.get_object_id("_id") else {
-        return not_found("User tidak ditemukan");
-    };
-    let mut next_preferences = preferences_doc_from_doc(user.get_document("preferences").ok());
+    let mut preferences = user.preferences.clone();
     let mut has_changes = false;
-
     if let Some(value) = payload.email_notifications {
-        next_preferences.insert("emailNotifications", value);
+        preferences["emailNotifications"] = serde_json::json!(value);
         has_changes = true;
     }
-
     if let Some(value) = payload.sms_notifications {
-        next_preferences.insert("smsNotifications", value);
+        preferences["smsNotifications"] = serde_json::json!(value);
         has_changes = true;
     }
-
     if let Some(value) = payload.show_balance {
-        next_preferences.insert("showBalance", value);
+        preferences["showBalance"] = serde_json::json!(value);
         has_changes = true;
     }
-
     if let Some(value) = payload.ui_theme {
         if !is_valid_ui_theme(&value) {
             return status_message(axum::http::StatusCode::BAD_REQUEST, "Tema UI tidak valid");
         }
-        next_preferences.insert("uiTheme", value);
+        preferences["uiTheme"] = serde_json::json!(value);
         has_changes = true;
     }
-
     if !has_changes {
-        return status_message(
-            axum::http::StatusCode::BAD_REQUEST,
-            "Tidak ada preferensi yang bisa disimpan",
-        );
+        return status_message(axum::http::StatusCode::BAD_REQUEST, "Tidak ada preferensi yang bisa disimpan");
     }
-
-    let update_result = client
-        .database(&state.mongo_db)
-        .collection::<Document>("users")
-        .update_one(
-            doc! { "_id": user_id },
-            doc! { "$set": { "preferences": next_preferences.clone() } },
-        )
-        .await;
-
-    if update_result.is_err() {
-        return status_message(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal Server Error",
-        );
+    if sqlx::query("UPDATE users SET preferences=$1,updated_at=now() WHERE id=$2")
+        .bind(&preferences)
+        .bind(user.id)
+        .execute(&state.pg_pool)
+        .await
+        .is_err()
+    {
+        return status_message(axum::http::StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error");
     }
-
     Json(UpdateMyPreferencesResponse {
         message: "Preferensi berhasil diperbarui",
-        preferences: preferences_from_doc(Some(&next_preferences)),
+        preferences: preferences_from_sql(&preferences),
     })
     .into_response()
 }

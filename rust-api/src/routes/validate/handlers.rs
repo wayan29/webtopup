@@ -3,7 +3,7 @@ use axum::{http::StatusCode, response::IntoResponse, Json};
 use super::{
     cache::{
         get_cached_game_validation, get_cached_validation, set_cached_game_validation_if_allowed,
-        set_cached_validation,
+        set_cached_validation, CACHE_UNAVAILABLE_MESSAGE,
     },
     normalize::{normalize_digit_input, normalize_phone_input},
     operators::operators,
@@ -16,6 +16,32 @@ use super::{
         ValidationResponse,
     },
 };
+
+/// The Redis validation cache is authoritative for endpoint cost control: an
+/// unavailable cache answers 503 instead of silently bypassing caching (which
+/// would expose providers to unthrottled traffic) and instead of faking a
+/// cached success.
+fn validation_cache_unavailable() -> (StatusCode, Json<ValidationResponse>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ValidationResponse {
+            success: false,
+            data: None,
+            message: CACHE_UNAVAILABLE_MESSAGE.to_string(),
+        }),
+    )
+}
+
+fn game_cache_unavailable() -> (StatusCode, Json<GameValidationResponse>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(GameValidationResponse {
+            success: false,
+            data: None,
+            message: CACHE_UNAVAILABLE_MESSAGE.to_string(),
+        }),
+    )
+}
 
 pub async fn operator(Json(payload): Json<OperatorValidationPayload>) -> impl IntoResponse {
     let normalized = normalize_phone_input(payload.phone_number);
@@ -31,8 +57,10 @@ pub async fn operator(Json(payload): Json<OperatorValidationPayload>) -> impl In
     };
     let original_number = normalized.original.unwrap_or_default();
     let cache_key = format!("operator:{phone_number}");
-    if let Some(cached) = get_cached_validation(&cache_key) {
-        return (cached.status, Json(cached.payload));
+    match get_cached_validation(&cache_key).await {
+        Ok(Some(cached)) => return (cached.status, Json(cached.payload)),
+        Ok(None) => {}
+        Err(_) => return validation_cache_unavailable(),
     }
     let prefix = phone_number.chars().take(4).collect::<String>();
     if let Some(operator) = operators()
@@ -44,13 +72,18 @@ pub async fn operator(Json(payload): Json<OperatorValidationPayload>) -> impl In
             data: Some(OperatorValidationData {
                 phone_number,
                 original_number,
-                operator: Some(operator.name),
+                operator: Some(operator.name.to_string()),
                 prefix: Some(prefix),
-                color: Some(operator.color),
+                color: Some(operator.color.to_string()),
             }),
             message: "Operator berhasil dideteksi".to_string(),
         };
-        set_cached_validation(cache_key, StatusCode::OK, response.clone());
+        if set_cached_validation(cache_key, StatusCode::OK, response.clone())
+            .await
+            .is_err()
+        {
+            return validation_cache_unavailable();
+        }
         return (StatusCode::OK, Json(response));
     }
 
@@ -65,7 +98,12 @@ pub async fn operator(Json(payload): Json<OperatorValidationPayload>) -> impl In
         }),
         message: "Operator tidak dapat diidentifikasi. Prefix nomor tidak terdaftar.".to_string(),
     };
-    set_cached_validation(cache_key, StatusCode::BAD_REQUEST, response.clone());
+    if set_cached_validation(cache_key, StatusCode::BAD_REQUEST, response.clone())
+        .await
+        .is_err()
+    {
+        return validation_cache_unavailable();
+    }
     (StatusCode::BAD_REQUEST, Json(response))
 }
 
@@ -82,8 +120,10 @@ pub async fn freefire(Json(payload): Json<FreeFireValidationPayload>) -> impl In
         );
     };
     let cache_key = format!("freefire:{user_id}:");
-    if let Some(cached) = get_cached_game_validation(&cache_key) {
-        return (cached.status, Json(cached.payload));
+    match get_cached_game_validation(&cache_key).await {
+        Ok(Some(cached)) => return (cached.status, Json(cached.payload)),
+        Ok(None) => {}
+        Err(_) => return game_cache_unavailable(),
     }
 
     let result = inquire_freefire_nickname(&user_id).await;
@@ -99,16 +139,22 @@ pub async fn freefire(Json(payload): Json<FreeFireValidationPayload>) -> impl In
                 .message
                 .unwrap_or_else(|| "Nickname berhasil ditemukan".to_string()),
         };
-        set_cached_game_validation_if_allowed(
+        if set_cached_game_validation_if_allowed(
             cache_key,
             NicknameResultKind::Success,
             StatusCode::OK,
             response.clone(),
-        );
+        )
+        .await
+        .is_err()
+        {
+            return game_cache_unavailable();
+        }
         return (StatusCode::OK, Json(response));
     }
 
     if result.kind == NicknameResultKind::ProviderError {
+        // Provider failures are never cached: the next request re-queries the provider.
         let response = GameValidationResponse {
             success: false,
             data: None,
@@ -129,12 +175,17 @@ pub async fn freefire(Json(payload): Json<FreeFireValidationPayload>) -> impl In
             .filter(|message| !message.is_empty())
             .unwrap_or_else(|| "User ID tidak ditemukan".to_string()),
     };
-    set_cached_game_validation_if_allowed(
+    if set_cached_game_validation_if_allowed(
         cache_key,
         NicknameResultKind::NotFound,
         StatusCode::BAD_REQUEST,
         response.clone(),
-    );
+    )
+    .await
+    .is_err()
+    {
+        return game_cache_unavailable();
+    }
     (StatusCode::BAD_REQUEST, Json(response))
 }
 
@@ -164,8 +215,10 @@ pub async fn mobilelegends(
         );
     };
     let cache_key = format!("mobilelegends:{user_id}:{zone_id}");
-    if let Some(cached) = get_cached_game_validation(&cache_key) {
-        return (cached.status, Json(cached.payload));
+    match get_cached_game_validation(&cache_key).await {
+        Ok(Some(cached)) => return (cached.status, Json(cached.payload)),
+        Ok(None) => {}
+        Err(_) => return game_cache_unavailable(),
     }
 
     let result = inquire_mobilelegends_nickname(&user_id, &zone_id).await;
@@ -181,16 +234,22 @@ pub async fn mobilelegends(
                 .message
                 .unwrap_or_else(|| "Nickname berhasil ditemukan".to_string()),
         };
-        set_cached_game_validation_if_allowed(
+        if set_cached_game_validation_if_allowed(
             cache_key,
             NicknameResultKind::Success,
             StatusCode::OK,
             response.clone(),
-        );
+        )
+        .await
+        .is_err()
+        {
+            return game_cache_unavailable();
+        }
         return (StatusCode::OK, Json(response));
     }
 
     if result.kind == NicknameResultKind::ProviderError {
+        // Provider failures are never cached: the next request re-queries the provider.
         let response = GameValidationResponse {
             success: false,
             data: None,
@@ -211,11 +270,16 @@ pub async fn mobilelegends(
             .filter(|message| !message.is_empty())
             .unwrap_or_else(|| "User ID/Zone ID tidak ditemukan".to_string()),
     };
-    set_cached_game_validation_if_allowed(
+    if set_cached_game_validation_if_allowed(
         cache_key,
         NicknameResultKind::NotFound,
         StatusCode::BAD_REQUEST,
         response.clone(),
-    );
+    )
+    .await
+    .is_err()
+    {
+        return game_cache_unavailable();
+    }
     (StatusCode::BAD_REQUEST, Json(response))
 }

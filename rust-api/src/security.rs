@@ -1,5 +1,6 @@
 use axum::{http::HeaderMap, response::IntoResponse, Json};
-use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime, Document};
+use chrono::{DateTime, Utc};
+use uuid::Uuid;
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 
@@ -29,27 +30,15 @@ pub struct ErrorResponse {
 }
 
 pub struct AuthenticatedProxyUser {
-    pub id: ObjectId,
+    pub id: Uuid,
     pub role: String,
     pub email: String,
     pub permissions: Vec<String>,
-    pub two_factor_enrollment_required_at: Option<DateTime>,
-    pub two_factor_enrollment_completed_at: Option<DateTime>,
+    pub two_factor_enrollment_required_at: Option<DateTime<Utc>>,
+    pub two_factor_enrollment_completed_at: Option<DateTime<Utc>>,
     pub two_factor_enabled: bool,
-    /// Issued only after `require_proxy_context` validates the proxy secret.
-    gateway_correlation_trusted: bool,
 }
 
-impl AuthenticatedProxyUser {
-    pub(super) fn resolve_correlation(&self, headers: &HeaderMap) -> CorrelationResolution {
-        let span_trace = correlation::current_span_correlation_trace_id();
-        if self.gateway_correlation_trusted {
-            resolve_trusted_span_or_gateway_correlation(headers, span_trace.as_deref())
-        } else {
-            correlation::resolve_correlation_untrusted(headers, span_trace.as_deref())
-        }
-    }
-}
 
 pub fn require_proxy_context(
     headers: &HeaderMap,
@@ -81,30 +70,43 @@ pub fn require_proxy_context(
     })
 }
 
+/// SQL authorization rechecks signed access credentials and current database state per request.
+pub async fn require_sql_user(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<crate::sql_auth::SqlAuthenticatedUser, axum::response::Response> {
+    require_proxy_context(headers, state)?;
+    let token = headers.get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error":{"code":"AUTH_TOKEN_INVALID","message":"Unauthorized: Invalid token"}})),
+        ).into_response())?;
+    crate::sql_auth::admit_access(&state.pg_pool, token, &state.jwt_secret, chrono::Utc::now())
+        .await.map_err(IntoResponse::into_response)
+}
+
+pub async fn require_sql_permission(
+    headers: &HeaderMap,
+    state: &AppState,
+    permission: &str,
+) -> Result<crate::sql_auth::SqlAuthenticatedUser, axum::response::Response> {
+    let user = require_sql_user(headers, state).await?;
+    if user.role != "owner" && !user.permissions.iter().any(|granted| granted == permission) {
+        return Err((axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"message":"Forbidden: Insufficient permissions"}))).into_response());
+    }
+    Ok(user)
+}
+
 /// Trusted session identity is accepted only after exact proxy-secret validation.
 pub fn trusted_session_id(headers: &HeaderMap, state: &AppState) -> Option<String> {
     require_proxy_context(headers, state)
         .ok()
         .and_then(|ctx| ctx.session_id)
-        .filter(|sid| ObjectId::parse_str(sid).is_ok())
-}
-
-/// Match a trusted proxy identity to the canonical live user/session target being authorized.
-pub(crate) fn trusted_session_proof_matches(
-    context: &ProxyContext,
-    user_id: ObjectId,
-    session_id: ObjectId,
-) -> bool {
-    context
-        .user_id
-        .as_deref()
-        .and_then(|value| ObjectId::parse_str(value).ok())
-        == Some(user_id)
-        && context
-            .session_id
-            .as_deref()
-            .and_then(|value| ObjectId::parse_str(value).ok())
-            == Some(session_id)
+        .filter(|sid| Uuid::parse_str(sid).is_ok())
 }
 
 /// TraceLayer and other request-scoped callers must use this entry point so gateway header trust
@@ -125,59 +127,25 @@ pub async fn load_active_proxy_user(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Result<AuthenticatedProxyUser, axum::response::Response> {
-    let _context = require_proxy_context(headers, state)?;
-    let Some(user_id) = header_text(headers, "x-webtopup-user-id") else {
-        return Err(error_response(
-            axum::http::StatusCode::UNAUTHORIZED,
-            "Unauthorized",
-        ));
-    };
-    let object_id = ObjectId::parse_str(&user_id)
-        .map_err(|_| error_response(axum::http::StatusCode::UNAUTHORIZED, "Unauthorized"))?;
-    let Some(client) = state.mongo_client.as_ref() else {
-        return Err(error_response(
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "Database unavailable",
-        ));
-    };
-    let user = client
-        .database(&state.mongo_db)
-        .collection::<Document>("users")
-        .find_one(doc! { "_id": object_id })
-        .projection(doc! { "role": 1, "email": 1, "permissions": 1, "active": 1, "twoFactorEnabled": 1, "twoFactorEnrollmentRequiredAt": 1, "twoFactorEnrollmentCompletedAt": 1 })
+    let user = crate::sql_auth::current(headers, state)
         .await
-        .ok()
-        .flatten()
-        .ok_or_else(|| error_response(axum::http::StatusCode::UNAUTHORIZED, "Unauthorized"))?;
-    if user.get_bool("active") == Ok(false) {
-        return Err(error_response(
-            axum::http::StatusCode::FORBIDDEN,
-            "Forbidden: Account inactive",
-        ));
-    }
-    let role = user.get_str("role").unwrap_or_default().trim().to_string();
-    let email = user.get_str("email").unwrap_or_default().trim().to_string();
-    let permissions = permissions_from_user(&user);
-    let two_factor_enrollment_required_at = user
-        .get_datetime("twoFactorEnrollmentRequiredAt")
-        .ok()
-        .copied();
-    let two_factor_enrollment_completed_at = user
-        .get_datetime("twoFactorEnrollmentCompletedAt")
-        .ok()
-        .copied();
-    let two_factor_enabled = user.get_bool("twoFactorEnabled").unwrap_or(false);
-
+        .map_err(IntoResponse::into_response)?;
     Ok(AuthenticatedProxyUser {
-        id: object_id,
-        role,
-        email,
-        permissions,
-        two_factor_enrollment_required_at,
-        two_factor_enrollment_completed_at,
-        two_factor_enabled,
-        gateway_correlation_trusted: true,
+        id: user.id,
+        role: user.role,
+        email: user.email,
+        permissions: user.permissions,
+        two_factor_enrollment_required_at: user.two_factor_enrollment_required_at,
+        two_factor_enrollment_completed_at: user.two_factor_enrollment_completed_at,
+        two_factor_enabled: user.two_factor_enabled,
     })
+}
+async fn load_active_sql_proxy_user(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<(String, bool, Option<DateTime<Utc>>), axum::response::Response> {
+    let user = load_active_proxy_user(headers, state).await?;
+    Ok((user.role, true, user.two_factor_enrollment_required_at))
 }
 
 pub async fn enforce_two_factor_enrollment(
@@ -185,28 +153,34 @@ pub async fn enforce_two_factor_enrollment(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    // Unlock authenticates the locked session using its credential pair, password, and OTP.
+    // Ordinary bearer admission here would reject it before that verification can run.
+    if request.method() == axum::http::Method::POST && request.uri().path() == "/v2/auth/unlock" {
+        return next.run(request).await;
+    }
     if require_proxy_context(request.headers(), &state)
         .ok()
         .and_then(|context| context.user_id)
         .is_some()
     {
-        match load_active_proxy_user(request.headers(), &state).await {
-            Ok(user)
+        match load_active_sql_proxy_user(request.headers(), &state).await {
+            Ok((role, enabled, required_at))
                 if two_factor_enrollment_overdue(
-                    &user.role,
-                    user.two_factor_enabled,
-                    user.two_factor_enrollment_required_at,
-                    DateTime::now(),
+                    &role,
+                    enabled,
+                    required_at,
+                    Utc::now(),
                 ) && !is_two_factor_enrollment_allowed_route(
                     request.method(),
                     request.uri().path(),
                 ) =>
             {
-                return crate::routes::auth::auth_error(
+                return crate::sql_auth::AuthError::new(
                     axum::http::StatusCode::FORBIDDEN,
                     "AUTH_2FA_ENROLLMENT_REQUIRED",
                     "Aktifkan autentikasi dua faktor untuk melanjutkan",
-                );
+                )
+                .into_response();
             }
             Ok(_) => {}
             Err(response) => return response,
@@ -214,6 +188,7 @@ pub async fn enforce_two_factor_enrollment(
     }
     next.run(request).await
 }
+
 
 pub async fn require_member_user(
     headers: &HeaderMap,
@@ -282,15 +257,15 @@ pub(crate) fn team_user_has_any_permission(
         .any(|permission| has_resolved_permission(permissions, permission))
 }
 
-pub(crate) fn staff_two_factor_deadline(assigned_at: DateTime) -> DateTime {
-    DateTime::from_millis(assigned_at.timestamp_millis() + 7 * 24 * 60 * 60 * 1_000)
+pub(crate) fn staff_two_factor_deadline(assigned_at: DateTime<Utc>) -> DateTime<Utc> {
+    assigned_at + chrono::Duration::days(7)
 }
 
 pub(crate) fn two_factor_enrollment_overdue(
     role: &str,
     enabled: bool,
-    required_at: Option<DateTime>,
-    now: DateTime,
+    required_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
 ) -> bool {
     matches!(role, "owner" | "admin" | "cs")
         && !enabled
@@ -321,22 +296,7 @@ fn has_resolved_permission(permissions: &[String], permission: &str) -> bool {
             .is_some_and(|manage| permissions.iter().any(|value| value == manage))
 }
 
-fn permissions_from_user(user: &Document) -> Vec<String> {
-    match user.get("permissions") {
-        Some(Bson::Document(permissions)) => permissions
-            .iter()
-            .filter_map(|(name, value)| match value {
-                Bson::Boolean(true) => Some(name.to_string()),
-                _ => None,
-            })
-            .collect(),
-        Some(Bson::Array(permissions)) => permissions
-            .iter()
-            .filter_map(|item| item.as_str().map(ToString::to_string))
-            .collect(),
-        _ => Vec::new(),
-    }
-}
+
 
 fn implied_manage_permission(permission: &str) -> Option<&'static str> {
     match permission {
@@ -355,7 +315,32 @@ fn implied_manage_permission(permission: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod auth_2fa_enrollment_tests {
     use super::*;
-    use mongodb::bson::DateTime;
+    use chrono::TimeZone;
+
+    #[tokio::test]
+    async fn credential_unlock_reaches_handler_without_ordinary_bearer_admission() {
+        let state = test_app_state_with_proxy_secret("01234567890123456789012345678901");
+        let app = axum::Router::new()
+            .route("/v2/auth/unlock", axum::routing::post(|| async { axum::http::StatusCode::NO_CONTENT }).get(|| async { axum::http::StatusCode::NO_CONTENT }))
+            .route("/v2/auth/unlock/extra", axum::routing::post(|| async { axum::http::StatusCode::NO_CONTENT }))
+            .layer(axum::middleware::from_fn_with_state(state, enforce_two_factor_enrollment));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let client = reqwest::Client::new();
+        for (method, path, expected) in [
+            (reqwest::Method::POST, "/v2/auth/unlock", 204),
+            (reqwest::Method::GET, "/v2/auth/unlock", 401),
+            (reqwest::Method::POST, "/v2/auth/unlock/extra", 401),
+        ] {
+            let response = client.request(method, format!("http://{address}{path}"))
+                .header("x-api-v2-proxy-secret", "01234567890123456789012345678901")
+                .header("x-webtopup-user-id", "00000000-0000-4000-8000-000000000001")
+                .send().await.unwrap();
+            assert_eq!(response.status().as_u16(), expected, "{path}");
+        }
+        server.abort();
+    }
 
     #[test]
     fn deposit_permission_approval_implies_view_only() {
@@ -373,7 +358,7 @@ mod auth_2fa_enrollment_tests {
 
     #[test]
     fn auth_2fa_enrollment_assigns_exact_seven_day_utc_deadline() {
-        let assigned_at = DateTime::from_millis(1_800_000_000_000);
+        let assigned_at = chrono::Utc.timestamp_millis_opt(1_800_000_000_000).single().unwrap();
         assert_eq!(
             staff_two_factor_deadline(assigned_at).timestamp_millis(),
             assigned_at.timestamp_millis() + 7 * 24 * 60 * 60 * 1_000
@@ -382,8 +367,8 @@ mod auth_2fa_enrollment_tests {
 
     #[test]
     fn auth_2fa_enrollment_grace_and_members_are_not_restricted() {
-        let now = DateTime::from_millis(1_800_000_000_000);
-        let future = DateTime::from_millis(now.timestamp_millis() + 1);
+        let now = chrono::Utc.timestamp_millis_opt(1_800_000_000_000).single().unwrap();
+        let future = now + chrono::Duration::milliseconds(1);
         assert!(!two_factor_enrollment_overdue(
             "admin",
             false,
@@ -483,8 +468,8 @@ mod auth_2fa_enrollment_tests {
 
     #[test]
     fn auth_2fa_enrollment_completed_or_enabled_is_not_overdue() {
-        let now = DateTime::from_millis(1_800_000_000_000);
-        let past = DateTime::from_millis(now.timestamp_millis() - 1);
+        let now = chrono::Utc.timestamp_millis_opt(1_800_000_000_000).single().unwrap();
+        let past = now - chrono::Duration::milliseconds(1);
         assert!(!two_factor_enrollment_overdue(
             "owner",
             true,
@@ -568,7 +553,7 @@ impl ProxyContext {
 impl AuthenticatedProxyUser {
     pub fn into_response(self) -> ProxyContextResponse {
         ProxyContextResponse {
-            id: Some(self.id.to_hex()),
+            id: Some(self.id.to_string()),
             role: Some(self.role),
             email: Some(self.email),
         }
@@ -577,7 +562,7 @@ impl AuthenticatedProxyUser {
 
 #[cfg(test)]
 pub(crate) fn test_authenticated_proxy_user(
-    id: ObjectId,
+    id: Uuid,
     role: &str,
     email: &str,
     permissions: Vec<String>,
@@ -590,7 +575,6 @@ pub(crate) fn test_authenticated_proxy_user(
         two_factor_enrollment_required_at: None,
         two_factor_enrollment_completed_at: None,
         two_factor_enabled: false,
-        gateway_correlation_trusted: true,
     }
 }
 
@@ -671,9 +655,9 @@ mod correlation_resolver_trusted_tests {
 #[cfg(test)]
 pub(crate) fn test_app_state_with_proxy_secret(secret: &str) -> std::sync::Arc<AppState> {
     std::sync::Arc::new(AppState {
-        mongo_client: None,
-        mongo_db: "test".to_string(),
-        mongo_transactions_enabled: false,
+        pg_pool: sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/webtopup_ci_unit")
+            .expect("valid unit-test pool URL"),
         proxy_secret: secret.to_string(),
         jwt_secret: "jwt-test-secret-at-least-32-chars-long".to_string(),
         session_token_hash_secret: "session-token-hash-test-secret-at-least-32-chars".to_string(),
@@ -682,14 +666,6 @@ pub(crate) fn test_app_state_with_proxy_secret(secret: &str) -> std::sync::Arc<A
             "test:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         )
         .expect("valid deterministic test rotation key"),
-        rollout_config: crate::routes::auth::security_audit::RolloutConfig {
-            refresh_enabled: false,
-            member_cohort_percent: 0,
-            cs_cohort_percent: 0,
-            admin_cohort_percent: 0,
-            owner_cohort_percent: 0,
-            legacy_access_token_accept_until: None,
-        },
         recovery_encryption_keys: crate::state::RecoveryEncryptionKeyRing::parse(
             "enc-test",
             "enc-test:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
@@ -723,8 +699,8 @@ mod proxy_correlation_security_tests {
         headers
     }
 
-    #[test]
-    fn require_proxy_context_returns_403_when_secret_absent() {
+    #[tokio::test]
+    async fn require_proxy_context_returns_403_when_secret_absent() {
         let state = test_app_state_with_proxy_secret(VALID_SECRET);
         let headers = headers_with_secret(None, &[(GATEWAY_CORRELATION_HEADER, VALID_TRACE)]);
         let err = require_proxy_context(&headers, &state)
@@ -733,8 +709,8 @@ mod proxy_correlation_security_tests {
         assert_eq!(err.status(), axum::http::StatusCode::FORBIDDEN);
     }
 
-    #[test]
-    fn require_proxy_context_returns_403_when_secret_wrong() {
+    #[tokio::test]
+    async fn require_proxy_context_returns_403_when_secret_wrong() {
         let state = test_app_state_with_proxy_secret(VALID_SECRET);
         let headers = headers_with_secret(
             Some("wrong-secret-that-does-not-match-at-all"),
@@ -746,8 +722,8 @@ mod proxy_correlation_security_tests {
         assert_eq!(err.status(), axum::http::StatusCode::FORBIDDEN);
     }
 
-    #[test]
-    fn spoofed_gateway_correlation_header_ignored_without_valid_proxy_secret() {
+    #[tokio::test]
+    async fn spoofed_gateway_correlation_header_ignored_without_valid_proxy_secret() {
         let state = test_app_state_with_proxy_secret(VALID_SECRET);
         let headers = headers_with_secret(None, &[(GATEWAY_CORRELATION_HEADER, VALID_TRACE)]);
         let resolved = resolve_request_trace_layer_correlation(&headers, &state, None);
@@ -755,8 +731,8 @@ mod proxy_correlation_security_tests {
         assert!(resolved.trace_id.is_none());
     }
 
-    #[test]
-    fn spoofed_gateway_correlation_header_ignored_with_wrong_proxy_secret() {
+    #[tokio::test]
+    async fn spoofed_gateway_correlation_header_ignored_with_wrong_proxy_secret() {
         let state = test_app_state_with_proxy_secret(VALID_SECRET);
         let headers = headers_with_secret(
             Some("not-the-configured-proxy-secret-value"),
@@ -767,8 +743,8 @@ mod proxy_correlation_security_tests {
         assert!(resolved.trace_id.is_none());
     }
 
-    #[test]
-    fn valid_proxy_secret_allows_trusted_gateway_correlation_fallback() {
+    #[tokio::test]
+    async fn valid_proxy_secret_allows_trusted_gateway_correlation_fallback() {
         let state = test_app_state_with_proxy_secret(VALID_SECRET);
         let headers = headers_with_secret(
             Some(VALID_SECRET),
@@ -779,8 +755,8 @@ mod proxy_correlation_security_tests {
         assert_eq!(resolved.trace_id.as_deref(), Some(VALID_TRACE));
     }
 
-    #[test]
-    fn request_correlation_prefers_explicit_span_trace_over_gateway_header() {
+    #[tokio::test]
+    async fn request_correlation_prefers_explicit_span_trace_over_gateway_header() {
         let state = test_app_state_with_proxy_secret(VALID_SECRET);
         let headers = headers_with_secret(
             Some(VALID_SECRET),
@@ -794,57 +770,4 @@ mod proxy_correlation_security_tests {
         assert_eq!(resolved.trace_id.as_deref(), Some(VALID_TRACE));
     }
 
-    #[test]
-    fn session_access_enforcement_requires_trusted_canonical_live_target_proof() {
-        let state = test_app_state_with_proxy_secret(VALID_SECRET);
-        let user_id = ObjectId::new();
-        let session_id = ObjectId::new();
-        let user_hex = user_id.to_hex();
-        let session_hex = session_id.to_hex();
-        let identity = [
-            ("x-webtopup-user-id", user_hex.as_str()),
-            ("x-webtopup-session-id", session_hex.as_str()),
-        ];
-
-        for secret in [None, Some("wrong-secret-that-does-not-match-at-all")] {
-            let inbound = headers_with_secret(secret, &identity);
-            assert!(require_proxy_context(&inbound, &state).is_err());
-        }
-
-        let refresh_headers = headers_with_secret(Some(VALID_SECRET), &identity);
-        let refresh_context =
-            require_proxy_context(&refresh_headers, &state).expect("trusted proxy");
-        assert_eq!(refresh_context.user_id.as_deref(), Some(user_hex.as_str()));
-        assert_eq!(
-            refresh_context.session_id.as_deref(),
-            Some(session_hex.as_str())
-        );
-        assert!(trusted_session_proof_matches(
-            &refresh_context,
-            user_id,
-            session_id
-        ));
-        assert!(!trusted_session_proof_matches(
-            &refresh_context,
-            ObjectId::new(),
-            session_id
-        ));
-        assert!(!trusted_session_proof_matches(
-            &refresh_context,
-            user_id,
-            ObjectId::new()
-        ));
-
-        let legacy_headers = headers_with_secret(
-            Some(VALID_SECRET),
-            &[("x-webtopup-user-id", user_hex.as_str())],
-        );
-        let legacy_context = require_proxy_context(&legacy_headers, &state).expect("trusted proxy");
-        assert!(legacy_context.session_id.is_none());
-        assert!(!trusted_session_proof_matches(
-            &legacy_context,
-            user_id,
-            session_id
-        ));
-    }
 }

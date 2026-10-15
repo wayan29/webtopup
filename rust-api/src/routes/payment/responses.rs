@@ -21,9 +21,3 @@ pub(super) fn string_message(status: axum::http::StatusCode, message: String) ->
     (status, Json(serde_json::json!({ "message": message }))).into_response()
 }
 
-pub(super) fn unavailable() -> Response {
-    status_message(
-        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        "MONGO_URI is not configured",
-    )
-}

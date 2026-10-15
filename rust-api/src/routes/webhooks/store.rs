@@ -1,55 +1,16 @@
-use mongodb::bson::{doc, Bson, Document};
+use serde_json::Value;
+use sqlx::PgPool;
 
-use super::utils::config_string;
-
-pub async fn setting_string(collection: &mongodb::Collection<Document>, key: &str) -> String {
-    collection
-        .find_one(doc! { "key": key })
-        .await
-        .ok()
-        .flatten()
-        .and_then(|doc| value_string(doc.get("value")))
-        .unwrap_or_default()
+pub async fn setting_string(pool: &PgPool, key: &str) -> Result<String, sqlx::Error> {
+    Ok(sqlx::query_scalar::<_,String>("SELECT value FROM webhook_settings WHERE key=$1").bind(key).fetch_optional(pool).await?.unwrap_or_default())
 }
-
-pub async fn upsert_setting(
-    collection: &mongodb::Collection<Document>,
-    key: &str,
-    value: String,
-) -> mongodb::error::Result<mongodb::results::UpdateResult> {
-    collection
-        .update_one(
-            doc! { "key": key },
-            doc! { "$set": { "key": key, "value": value } },
-        )
-        .upsert(true)
-        .await
+pub async fn upsert_setting(pool: &PgPool,key: &str,value: String)->Result<(),sqlx::Error>{
+    sqlx::query("INSERT INTO webhook_settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value").bind(key).bind(value).execute(pool).await?; Ok(())
 }
-
-pub async fn tokovoucher_credentials_configured(client: &mongodb::Client, db_name: &str) -> bool {
-    let vendor = client
-        .database(db_name)
-        .collection::<Document>("vendors")
-        .find_one(doc! { "name": { "$regex": "tokovoucher", "$options": "i" } })
-        .await
-        .ok()
-        .flatten();
-    let config = vendor
-        .as_ref()
-        .and_then(|doc| doc.get_document("config").ok());
-    let member_code = config
-        .and_then(|doc| config_string(doc, "memberCode").or_else(|| config_string(doc, "apiKey")))
-        .unwrap_or_default();
-    let secret = config
-        .and_then(|doc| config_string(doc, "secret"))
-        .unwrap_or_default();
-    !member_code.is_empty() && !secret.is_empty()
+pub async fn tokovoucher_credentials(pool: &PgPool)->Result<(String,String),sqlx::Error>{
+    let config=sqlx::query_scalar::<_,Value>("SELECT config FROM vendors WHERE lower(name) LIKE '%tokovoucher%' ORDER BY id LIMIT 1").fetch_optional(pool).await?.unwrap_or_default();
+    let member=config.get("memberCode").or_else(||config.get("apiKey")).and_then(Value::as_str).unwrap_or("").trim().to_owned();
+    let secret=config.get("secret").and_then(Value::as_str).unwrap_or("").trim().to_owned();
+    Ok((member,secret))
 }
-
-fn value_string(value: Option<&Bson>) -> Option<String> {
-    match value {
-        Some(Bson::String(value)) => Some(value.trim().to_string()),
-        _ => None,
-    }
-    .filter(|value| !value.is_empty())
-}
+pub async fn tokovoucher_credentials_configured(pool: &PgPool)->Result<bool,sqlx::Error>{let (member,secret)=tokovoucher_credentials(pool).await?;Ok(!member.is_empty()&&!secret.is_empty())}

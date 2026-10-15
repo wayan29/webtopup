@@ -6,43 +6,31 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use mongodb::{
-    bson::{doc, oid::ObjectId, DateTime, Document},
-    ClientSession,
-};
 use rand::Rng;
+use sqlx::Row;
+use uuid::Uuid;
 
 use crate::{
     routes::auth,
     security::ErrorResponse,
-    services::{
-        bot_protection::{
-            cloudflare_turnstile_verifier, enforce_turnstile, kill_switch_enabled,
-            load_bot_protection_settings,
-        },
-        identifier_integrity::{
-            classify_invoice_duplicate, require_identifier_indexes, retry_invoice_candidate,
-            DuplicateConstraint, MAX_INVOICE_CANDIDATES,
-        },
-        idempotency::{
-            self as idempotency_service, commit_mongo_transaction_with_unknown_retry,
-            CompletedSnapshot, DomainMarkerRecovery, DomainRecovery, IdempotencyBegin,
-            IdempotencyStore, MongoIdempotencyStore, TransactionCommitOutcome, ROUTE_GUEST_CHECKOUT,
-        },
+    services::bot_protection::{
+        cloudflare_turnstile_verifier, enforce_turnstile, kill_switch_enabled,
     },
     state::AppState,
-    utils::bson::{read_i64, read_string},
 };
 
 use super::*;
-use super::idempotency::{
-    digest_guest_idempotency_key, execute_after_bounded_response, guest_checkout_digest,
-    GuestCheckoutFingerprint, ANONYMOUS_GUEST_ACTOR,
+use super::checkout::{
+    active_maintenance_message, generate_invoice_number, guest_checkout_enabled,
+    is_bank_transfer_category, is_operational_now, product_price_for_level,
+    product_purchase_issues, resolve_payment_category, resolve_payment_method,
 };
+use super::idempotency::{digest_guest_idempotency_key, guest_checkout_digest, GuestCheckoutFingerprint};
+use super::provider::{load_guest_product_by_code, product_validation_config};
+use super::utils::{normalize_payload_text, normalize_phone};
 
 const GUEST_CREATE_MESSAGE: &str = "Transaction created, please complete payment";
 
-#[derive(Clone)]
 struct NormalizedGuestCreate {
     product_code: String,
     target: String,
@@ -81,36 +69,23 @@ pub async fn create_public(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<GuestCreatePayload>,
 ) -> Response {
-    let raw_key = match idempotency_service::require_idempotency_key(&headers) {
+    let raw_key = match crate::services::idempotency::require_idempotency_key(&headers) {
         Ok(Some(key)) => key,
-        Ok(None) | Err(idempotency_service::IdempotencyError::MissingKey) => {
-            return idempotency_service::IdempotencyError::MissingKey.into_response()
+        Ok(None) | Err(crate::services::idempotency::IdempotencyError::MissingKey) => {
+            return crate::services::idempotency::IdempotencyError::MissingKey.into_response()
         }
         Err(error) => return error.into_response(),
     };
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    if !state.mongo_transactions_enabled {
-        return guest_atomicity_unavailable();
+    if let Some(message) = active_maintenance_message(&state.pg_pool).await {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(OwnedErrorResponse { message })).into_response();
     }
-    let db = client.database(&state.mongo_db);
-    if let Some(message) = active_maintenance_message(&db).await {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(OwnedErrorResponse { message }),
-        )
-            .into_response();
-    }
-    if !guest_checkout_enabled(&db).await {
+    if !guest_checkout_enabled(&state.pg_pool).await {
         return status_message(StatusCode::FORBIDDEN, "Guest checkout sedang dinonaktifkan");
     }
-
     let normalized = NormalizedGuestCreate::from_payload(&payload);
     if !normalized.required_fields_present() {
         return status_message(StatusCode::BAD_REQUEST, "Missing required fields");
     }
-
     let member = auth::resolve_optional_member_access(&headers, &state).await;
     let hmac_key = state.session_token_hash_secret.as_bytes();
     let stored_key = digest_guest_idempotency_key(hmac_key, &raw_key);
@@ -130,744 +105,162 @@ pub async fn create_public(
         },
     );
 
-    let transactions = db.collection::<Document>("guesttransactions");
-    let store = MongoIdempotencyStore::new(&db);
-    let recovery = GuestMarkerRecovery {
-        transactions: &transactions,
-    };
-    let lease_generation = match idempotency_service::begin_with_recovery(
-        &store,
-        &recovery,
-        ANONYMOUS_GUEST_ACTOR,
-        ROUTE_GUEST_CHECKOUT,
-        &stored_key,
-        &request_digest,
-        DateTime::now(),
-    )
-    .await
-    {
-        Ok(IdempotencyBegin::Started { lease_generation }) => lease_generation,
-        Ok(IdempotencyBegin::Completed { status, body }) => {
-            return idempotency_service::completed_response(status, body)
+    if let Some(row) = match sqlx::query("SELECT payload_digest,state,response_status,response_body FROM guest_checkout_idempotency WHERE idempotency_key=$1")
+        .bind(&stored_key).fetch_optional(&state.pg_pool).await { Ok(row) => row, Err(_) => return internal_error() } {
+        if row.get::<String, _>("payload_digest") != request_digest { return crate::services::idempotency::conflict_response(); }
+        if row.get::<String, _>("state") == "completed" {
+            if let (Some(status), Some(body)) = (row.get::<Option<i32>, _>("response_status"), row.get::<Option<serde_json::Value>, _>("response_body")) {
+                return (StatusCode::from_u16(status as u16).unwrap_or(StatusCode::CREATED), Json(body)).into_response();
+            }
         }
-        Ok(IdempotencyBegin::Conflict) => return idempotency_service::conflict_response(),
-        Ok(IdempotencyBegin::InProgress) => return idempotency_service::in_progress_response(),
-        Err(error) => return error.into_response(),
+        if row.get::<String, _>("state") == "started" { return crate::services::idempotency::in_progress_response(); }
+    }
+    let settings = match sqlx::query("SELECT key,value FROM site_settings WHERE key IN ('botProtectionEnabled','turnstileSiteKey')")
+        .fetch_all(&state.pg_pool).await {
+        Ok(rows) => rows,
+        Err(_) => return internal_error(),
     };
-
-    let (stored_enabled, site_key) = load_bot_protection_settings(&db).await;
+    let stored_enabled = settings.iter().find(|row| row.get::<String, _>("key") == "botProtectionEnabled")
+        .and_then(|row| row.get::<serde_json::Value, _>("value").as_bool()).unwrap_or(false);
+    let site_key = settings.iter().find(|row| row.get::<String, _>("key") == "turnstileSiteKey")
+        .and_then(|row| row.get::<serde_json::Value, _>("value").as_str().map(str::to_owned)).unwrap_or_default();
     let secret = std::env::var("TURNSTILE_SECRET_KEY").unwrap_or_default();
     let kill_switch = kill_switch_enabled(std::env::var("TURNSTILE_DISABLED").ok().as_deref());
-    let remote_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("unknown");
+    let remote_ip = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next()).map(str::trim).filter(|v| !v.is_empty()).unwrap_or("unknown");
     if let Err(response) = enforce_turnstile(
-        stored_enabled,
-        &site_key,
-        &secret,
-        kill_switch,
-        payload.turnstile_token.as_deref(),
-        Some(remote_ip),
-        cloudflare_turnstile_verifier(),
-    )
-    .await
-    {
-        release_guest_started(
-            &store,
-            &stored_key,
-            &request_digest,
-            lease_generation,
-        )
-        .await;
-        return response;
-    }
+        stored_enabled, &site_key, &secret, kill_switch, payload.turnstile_token.as_deref(),
+        Some(remote_ip), cloudflare_turnstile_verifier(),
+    ).await { return response; }
 
-    // Guest checkout has no standalone marker that can prove an absent transaction was never
-    // committed. Before any domain work, turn the short execution lease into an indefinite fence.
-    // Known pre-effect failures delete it; success completes it; ambiguous work can only recover
-    // from the durable transaction marker and can never lease-takeover into a second mutation.
-    if let Err(error) = store
-        .retain_uncertain_started(
-            ANONYMOUS_GUEST_ACTOR,
-            ROUTE_GUEST_CHECKOUT,
-            &stored_key,
-            &request_digest,
-            lease_generation,
-        )
-        .await
-    {
-        release_guest_started(
-            &store,
-            &stored_key,
-            &request_digest,
-            lease_generation,
-        )
-        .await;
-        return error.into_response();
-    }
-
-    let prepared = match prepare_guest_checkout(&db, &normalized, member.as_ref()).await {
-        Ok(prepared) => prepared,
-        Err(response) => {
-            release_guest_started(
-            &store,
-            &stored_key,
-            &request_digest,
-            lease_generation,
-        )
-        .await;
-            return response;
-        }
+    let product = match load_guest_product_by_code(&state.pg_pool, &normalized.product_code).await {
+        Some(product) if product.status => product,
+        Some(_) => return status_message(StatusCode::BAD_REQUEST, "Product is unavailable"),
+        None => return status_message(StatusCode::NOT_FOUND, "Product not found"),
     };
-
-    let execution = execute_guest_checkout_transaction(
-        client,
-        &db,
-        &normalized,
-        member.as_ref().map(|access| access.user_id),
-        &prepared,
-        &stored_key,
-        &request_digest,
-    )
-    .await;
-    let (transaction_id, response_body) = match execution {
-        Ok(result) => result,
-        Err(GuestExecutionError::PreEffect(response)) => {
-            release_guest_started(
-            &store,
-            &stored_key,
-            &request_digest,
-            lease_generation,
-        )
-        .await;
-            return response;
-        }
-        Err(GuestExecutionError::Ambiguous(response)) => return response,
-    };
-
-    let snapshot = CompletedSnapshot {
-        status: StatusCode::CREATED.as_u16(),
-        body: response_body.clone(),
-        resource_id: Some(transaction_id.to_hex()),
-    };
-    // Isolated local verification only: transaction and frozen marker are durable, while the
-    // orchestration row intentionally remains started so the retry must execute GuestMarkerRecovery.
-    if crate::services::local_fault::consume_guest_post_commit_fault().await {
-        return guest_ambiguous_response();
+    let issues = product_purchase_issues(&state.pg_pool, &product).await;
+    if !issues.is_empty() {
+        return status_message_owned(StatusCode::BAD_REQUEST, format!("Produk tidak tersedia untuk dibeli: {}", issues.join(", ")));
     }
-    if let Err(error) = store
-        .complete(
-            ANONYMOUS_GUEST_ACTOR,
-            ROUTE_GUEST_CHECKOUT,
-            &stored_key,
-            &request_digest,
-            lease_generation,
-            &snapshot,
-            DateTime::now(),
-        )
-        .await
-    {
-        eprintln!("Failed to finalize guest checkout idempotency record: {error:?}");
-        return error.into_response();
-    }
-    idempotency_service::completed_response(snapshot.status, response_body)
-}
-
-struct PreparedGuestCheckout {
-    product: Document,
-    payment_method: Document,
-    base_price: i64,
-}
-
-async fn prepare_guest_checkout(
-    db: &mongodb::Database,
-    normalized: &NormalizedGuestCreate,
-    member: Option<&auth::access_session::OptionalMemberAccess>,
-) -> Result<PreparedGuestCheckout, Response> {
-    let Some(product) = (match db
-        .collection::<Document>("products")
-        .find_one(doc! { "code": &normalized.product_code })
-        .await
-    {
-        Ok(value) => value,
-        Err(_) => return Err(internal_error()),
-    }) else {
-        return Err(status_message(StatusCode::NOT_FOUND, "Product not found"));
+    let payment_method_id = match Uuid::parse_str(&normalized.payment_method_id) {
+        Ok(id) => id,
+        Err(_) => return status_message(StatusCode::NOT_FOUND, "Payment method not found"),
     };
-    if product.get_bool("status").ok() == Some(false) {
-        return Err(status_message(StatusCode::BAD_REQUEST, "Product is unavailable"));
-    }
-    let purchase_issues = product_purchase_issues(db, &product).await;
-    if !purchase_issues.is_empty() {
-        return Err(status_message_owned(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Produk tidak tersedia untuk dibeli: {}",
-                purchase_issues.join(", ")
-            ),
-        ));
-    }
-
-    let Ok(payment_method_id) = ObjectId::parse_str(&normalized.payment_method_id) else {
-        return Err(status_message(
-            StatusCode::NOT_FOUND,
-            "Payment method not found",
-        ));
+    let Some(payment_method) = resolve_payment_method(&state.pg_pool, payment_method_id).await else {
+        return status_message(StatusCode::NOT_FOUND, "Payment method not found");
     };
-    let Some(payment_method) = (match db
-        .collection::<Document>("paymentmethods")
-        .find_one(doc! { "_id": payment_method_id })
-        .await
-    {
-        Ok(value) => value,
-        Err(_) => return Err(internal_error()),
-    }) else {
-        return Err(status_message(
-            StatusCode::NOT_FOUND,
-            "Payment method not found",
-        ));
-    };
-    if read_string_default(&payment_method, "status", "active") != "active" {
-        return Err(status_message(
-            StatusCode::BAD_REQUEST,
-            "Payment method is not available",
-        ));
+    if payment_method.status != "active" {
+        return status_message(StatusCode::BAD_REQUEST, "Payment method is not available");
     }
-    let Some(category) = resolve_payment_category(db, &payment_method).await else {
-        return Err(status_message(
-            StatusCode::BAD_REQUEST,
-            "Payment category is not available",
-        ));
+    let Some(category) = resolve_payment_category(&state.pg_pool, &payment_method).await else {
+        return status_message(StatusCode::BAD_REQUEST, "Payment category is not available");
     };
-    if read_string_default(&category, "status", "active") != "active" {
-        return Err(status_message(
-            StatusCode::BAD_REQUEST,
-            "Payment category is not available",
-        ));
+    if category.status != "active" {
+        return status_message(StatusCode::BAD_REQUEST, "Payment category is not available");
     }
-    let operational_start = read_string_default(&payment_method, "operationalStart", "00:00");
-    let operational_end = read_string_default(&payment_method, "operationalEnd", "23:59");
-    if !is_operational_now(&operational_start, &operational_end) {
-        return Err(status_message_owned(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Payment method is available only between {operational_start} and {operational_end}"
-            ),
-        ));
+    if !is_operational_now(&payment_method.operational_start, &payment_method.operational_end) {
+        return status_message_owned(StatusCode::BAD_REQUEST, format!("Payment method is available only between {} and {}", payment_method.operational_start, payment_method.operational_end));
     }
     if !is_bank_transfer_category(&category) {
-        return Err(status_message(
-            StatusCode::BAD_REQUEST,
-            "Only bank transfer is allowed for guest checkout",
-        ));
+        return status_message(StatusCode::BAD_REQUEST, "Only bank transfer is allowed for guest checkout");
     }
-    let user_level = member.map(|access| access.level.as_str()).unwrap_or("basic");
-    Ok(PreparedGuestCheckout {
-        base_price: product_price_for_level(&product, user_level),
-        product,
-        payment_method,
-    })
-}
+    let base_price = product_price_for_level(&product, member.as_ref().map(|access| access.level.as_str()).unwrap_or("basic"));
+    if base_price <= 0 { return status_message(StatusCode::BAD_REQUEST, "Product is not available"); }
 
-enum GuestExecutionError {
-    PreEffect(Response),
-    Ambiguous(Response),
-}
-
-enum GuestDomainError {
-    InvoiceDuplicate,
-    PreEffect(Response),
-}
-
-async fn execute_guest_checkout_transaction(
-    client: &mongodb::Client,
-    db: &mongodb::Database,
-    normalized: &NormalizedGuestCreate,
-    member_id: Option<ObjectId>,
-    prepared: &PreparedGuestCheckout,
-    stored_key: &str,
-    request_digest: &str,
-) -> Result<(ObjectId, serde_json::Value), GuestExecutionError> {
-    if require_identifier_indexes(db).await.is_err() {
-        return Err(GuestExecutionError::PreEffect(identifier_index_unavailable()));
-    }
-
-    for attempt in 0..MAX_INVOICE_CANDIDATES {
-        let mut session = client.start_session().await.map_err(|error| {
-            eprintln!("Failed to start guest checkout Mongo session: {error}");
-            GuestExecutionError::PreEffect(internal_error())
-        })?;
-        session.start_transaction().await.map_err(|error| {
-            eprintln!("Failed to start guest checkout Mongo transaction: {error}");
-            GuestExecutionError::PreEffect(guest_atomicity_unavailable())
-        })?;
-
-        let domain_result = build_and_insert_guest_transaction(
-            db,
-            &mut session,
-            normalized,
-            member_id,
-            prepared,
-            stored_key,
-            request_digest,
-        )
-        .await;
-
-        match domain_result {
-            Ok(result) => {
-                return match commit_mongo_transaction_with_unknown_retry(&mut session).await {
-                    TransactionCommitOutcome::Committed => Ok(result),
-                    TransactionCommitOutcome::Ambiguous
-                    | TransactionCommitOutcome::FailedDefinitely => {
-                        eprintln!(
-                            "Guest checkout commit was not positively acknowledged; retaining started"
-                        );
-                        Err(GuestExecutionError::Ambiguous(guest_ambiguous_response()))
-                    }
-                };
-            }
-            Err(GuestDomainError::InvoiceDuplicate) => {
-                if session.abort_transaction().await.is_err() {
-                    eprintln!(
-                        "Guest checkout abort after invoice collision failed; retaining started"
-                    );
-                    return Err(GuestExecutionError::Ambiguous(guest_ambiguous_response()));
-                }
-                if !retry_invoice_candidate(attempt, DuplicateConstraint::InvoiceNumber) {
-                    break;
-                }
-                continue;
-            }
-            Err(GuestDomainError::PreEffect(response)) => {
-                if session.abort_transaction().await.is_ok() {
-                    return Err(GuestExecutionError::PreEffect(response));
-                }
-                eprintln!(
-                    "Guest checkout transaction abort failed; retaining started for recovery"
-                );
-                return Err(GuestExecutionError::Ambiguous(guest_ambiguous_response()));
-            }
-        }
-    }
-
-    Err(GuestExecutionError::PreEffect(invoice_identifier_exhausted()))
-}
-
-async fn build_and_insert_guest_transaction(
-    db: &mongodb::Database,
-    session: &mut ClientSession,
-    normalized: &NormalizedGuestCreate,
-    member_id: Option<ObjectId>,
-    prepared: &PreparedGuestCheckout,
-    stored_key: &str,
-    request_digest: &str,
-) -> Result<(ObjectId, serde_json::Value), GuestDomainError> {
-    // First durable domain write is the invoice reservation so collisions abort before
-    // flash-sale / voucher side effects.
-    let invoice_number = generate_invoice_number(db)
-        .await
-        .map_err(|_| GuestDomainError::PreEffect(internal_error()))?;
-    let transaction_id = ObjectId::new();
-    let now = DateTime::now();
-    let skeleton = doc! {
-        "_id": transaction_id,
-        "invoiceNumber": &invoice_number,
-        "creationState": "invoice_reserved",
-        "idempotencyRoute": ROUTE_GUEST_CHECKOUT,
-        "idempotencyKey": stored_key,
-        "idempotencyRequestDigest": request_digest,
-        "createdAt": now,
-        "updatedAt": now,
-        "__v": 0,
+    let product_ctx = crate::routes::vouchers::DiscountProductContext {
+        product_id: Some(product.id), category_id: product.category_id, operator_id: product.operator_id,
     };
-    if let Err(error) = db
-        .collection::<Document>("guesttransactions")
-        .insert_one(skeleton)
-        .session(&mut *session)
-        .await
-    {
-        if classify_invoice_duplicate(&error) {
-            return Err(GuestDomainError::InvoiceDuplicate);
-        }
-        eprintln!("Failed guest invoice reservation insert: {error}");
-        return Err(GuestDomainError::PreEffect(internal_error()));
+    let mut tx = match state.pg_pool.begin().await { Ok(tx) => tx, Err(_) => return internal_error() };
+    if sqlx::query("INSERT INTO guest_checkout_idempotency(idempotency_key,payload_digest,state) VALUES($1,$2,'started') ON CONFLICT(idempotency_key) DO NOTHING")
+        .bind(&stored_key).bind(&request_digest).execute(&mut *tx).await.is_err() { return internal_error(); }
+    let existing = match sqlx::query("SELECT payload_digest,state,response_status,response_body,transaction_id FROM guest_checkout_idempotency WHERE idempotency_key=$1 FOR UPDATE")
+        .bind(&stored_key).fetch_one(&mut *tx).await {
+        Ok(row) => row,
+        Err(_) => return internal_error(),
+    };
+    if existing.get::<String, _>("payload_digest") != request_digest {
+        return crate::services::idempotency::conflict_response();
     }
+    if existing.get::<String, _>("state") == "completed" {
+        if let (Some(status), Some(body)) = (existing.get::<Option<i32>, _>("response_status"), existing.get::<Option<serde_json::Value>, _>("response_body")) {
+            return (StatusCode::from_u16(status as u16).unwrap_or(StatusCode::CREATED), Json(body)).into_response();
+        }
+    }
+    // Started and domain state commit together, so a row without a transaction is an in-flight request.
+    if existing.get::<Option<Uuid>, _>("transaction_id").is_some() { return crate::services::idempotency::in_progress_response(); }
 
     let preview_flash_price = if normalized.use_flash_sale {
-        preview_flash_sale_price_in_session(
-            db,
-            session,
-            prepared.product.get_object_id("_id").ok(),
-            prepared.base_price,
-        )
-        .await
-        .map_err(|error| {
-            eprintln!("Failed guest flash-sale preview in transaction: {error}");
-            GuestDomainError::PreEffect(internal_error())
-        })?
-    } else {
-        None
-    };
-    let mut price = preview_flash_price.unwrap_or(prepared.base_price);
-    let mut applied_discount = None;
-    if !normalized.voucher_code.is_empty() {
-        let vouchers = db.collection::<Document>("vouchers");
-        let product_ctx = crate::routes::vouchers::DiscountProductContext {
-            product_id: prepared.product.get_object_id("_id").ok(),
-            category_id: prepared.product.get_object_id("categoryId").ok(),
-            operator_id: prepared.product.get_object_id("operatorId").ok(),
-        };
-        match crate::routes::vouchers::consume_discount_voucher(
-            &vouchers,
-            &normalized.voucher_code,
-            price,
-            member_id,
-            &product_ctx,
-        )
-        .await
-        {
-            Ok(applied) => {
-                price = applied.final_price;
-                applied_discount = Some(applied);
-            }
-            Err(response) => return Err(GuestDomainError::PreEffect(response)),
+        match super::checkout::preview_flash_sale_price(&state.pg_pool, &product.code, base_price).await {
+            Ok(price) => price, Err(_) => return internal_error(),
         }
-    }
-    let admin_fee = read_i64(&prepared.payment_method, "adminFee")
-        + ((price as f64 * read_f64(&prepared.payment_method, "adminPercent") / 100.0).ceil()
-            as i64);
-    let unique_code = rand::thread_rng().gen_range(100..=999);
+    } else { None };
+    let mut price = preview_flash_price.unwrap_or(base_price);
+    let flash_reservation = if normalized.use_flash_sale && preview_flash_price.is_some() {
+        match crate::services::flash_sales::reserve_flash_sale_stock(&mut *tx, crate::services::flash_sales::FlashProductKey::Code(&product.code), base_price).await {
+            Ok(value) => value, Err(_) => return internal_error(),
+        }
+    } else { None };
+    if let Some(reservation) = flash_reservation.as_ref() { price = reservation.price; }
+    let voucher = if normalized.voucher_code.is_empty() { None } else {
+        match crate::routes::vouchers::consume_discount_voucher_sql(&mut *tx, &normalized.voucher_code, price, member.as_ref().map(|access| access.user_id), &product_ctx).await {
+            Ok(applied) => { price = applied.final_price; Some(applied) }, Err(response) => return response,
+        }
+    };
+
+    let admin_fee = (payment_method_admin_fee(&state.pg_pool, payment_method_id).await.unwrap_or(0.0) + (price as f64 * payment_method_admin_percent(&state.pg_pool, payment_method_id).await.unwrap_or(0.0) / 100.0).ceil()) as i64;
+    let unique_code = if payment_method_use_unique_code(&state.pg_pool, payment_method_id).await.unwrap_or(true) { rand::thread_rng().gen_range(100..=999) } else { 0 };
     let total_amount = price + admin_fee + unique_code;
-    let min_amount = read_i64_default(&prepared.payment_method, "minAmount", 10_000);
-    let max_amount = read_i64_default(&prepared.payment_method, "maxAmount", 5_000_000);
-    if total_amount < min_amount {
-        if let Some(applied) = applied_discount.as_ref() {
-            let vouchers = db.collection::<Document>("vouchers");
-            crate::routes::vouchers::release_discount_slot(&vouchers, applied, member_id).await;
-        }
-        return Err(GuestDomainError::PreEffect(status_message_owned(
-            StatusCode::BAD_REQUEST,
-            format!("Minimum amount is Rp {}", format_rupiah(min_amount)),
-        )));
-    }
-    if total_amount > max_amount {
-        if let Some(applied) = applied_discount.as_ref() {
-            let vouchers = db.collection::<Document>("vouchers");
-            crate::routes::vouchers::release_discount_slot(&vouchers, applied, member_id).await;
-        }
-        return Err(GuestDomainError::PreEffect(status_message_owned(
-            StatusCode::BAD_REQUEST,
-            format!("Maximum amount is Rp {}", format_rupiah(max_amount)),
-        )));
-    }
-
-    let expired_at = DateTime::from_millis(now.timestamp_millis() + 24 * 60 * 60 * 1000);
-    let product_id = prepared
-        .product
-        .get_object_id("_id")
-        .map_err(|_| GuestDomainError::PreEffect(internal_error()))?;
-    let payment_method_id = prepared
-        .payment_method
-        .get_object_id("_id")
-        .map_err(|_| GuestDomainError::PreEffect(internal_error()))?;
-    let response = guest_response_from_frozen_documents(
-        transaction_id,
-        &invoice_number,
-        product_id,
-        &prepared.product,
-        payment_method_id,
-        &prepared.payment_method,
-        member_id,
-        normalized,
-        price,
-        admin_fee,
-        unique_code,
-        total_amount,
-        now,
-        expired_at,
-    );
-    let body = serde_json::to_value(&response)
-        .map_err(|_| GuestDomainError::PreEffect(internal_error()))?;
-    let encoded_body = execute_after_bounded_response(&body, || {}).map_err(|error| {
-        eprintln!("Guest checkout frozen response exceeds replay bound: {error:?}");
-        GuestDomainError::PreEffect(error.into_response())
-    })?;
-
-    // Snapshot is proven after invoice reservation and before stock mutations.
-    let flash_sale_reservation = if normalized.use_flash_sale && preview_flash_price.is_some() {
-        reserve_flash_sale_stock_in_session(
-            db,
-            session,
-            prepared.product.get_object_id("_id").ok(),
-            prepared.base_price,
-        )
-        .await
-        .map_err(|error| {
-            eprintln!("Failed guest flash-sale reservation in transaction: {error}");
-            GuestDomainError::PreEffect(internal_error())
-        })?
-    } else {
-        None
-    };
-    // Flash sale reservation is for stock; price may be further reduced by discount voucher.
-    if let Some(reservation) = flash_sale_reservation.as_ref() {
-        let expected_pre_discount = preview_flash_price.unwrap_or(prepared.base_price);
-        if reservation.price != expected_pre_discount {
-            if let Some(applied) = applied_discount.as_ref() {
-                let vouchers = db.collection::<Document>("vouchers");
-                crate::routes::vouchers::release_discount_slot(&vouchers, applied, member_id).await;
-            }
-            return Err(GuestDomainError::PreEffect(internal_error()));
-        }
-    }
-
-    let mut document = doc! {
-        "_id": transaction_id,
-        "invoiceNumber": &invoice_number,
-        "creationState": "complete",
-        "product": product_id,
-        "target": &normalized.target,
-        "whatsapp": &normalized.whatsapp,
-        "amount": price,
-        "adminFee": admin_fee,
-        "uniqueCode": unique_code,
-        "totalAmount": total_amount,
-        "paymentMethod": payment_method_id,
-        "paymentStatus": "waiting_payment",
-        "transactionStatus": "pending",
-        "expiredAt": expired_at,
-        "createdAt": now,
-        "updatedAt": now,
-        "__v": 0,
-        "idempotencyRoute": ROUTE_GUEST_CHECKOUT,
-        "idempotencyKey": stored_key,
-        "idempotencyRequestDigest": request_digest,
-        "idempotencyResponseStatus": i32::from(StatusCode::CREATED.as_u16()),
-        "idempotencyResponseBody": encoded_body,
-    };
-    if let Some(member_id) = member_id {
-        document.insert("user", member_id);
-    }
-    if !normalized.server_id.is_empty() {
-        document.insert("serverId", &normalized.server_id);
-    }
-    if !normalized.email.is_empty() {
-        document.insert("email", &normalized.email);
-    }
-    if let Some(reservation) = flash_sale_reservation {
-        document.insert("flashSale", reservation.flash_sale_id);
-    }
-    if let Some(applied) = applied_discount.as_ref() {
-        document.insert("discountVoucherCode", &applied.code);
-        document.insert("discountAmount", applied.discount_amount);
-        document.insert("baseAmount", prepared.base_price);
-    }
-    // Replace the invoice reservation skeleton with the complete frozen document.
-    db.collection::<Document>("guesttransactions")
-        .replace_one(doc! { "_id": transaction_id }, document)
-        .session(&mut *session)
-        .await
-        .map_err(|error| {
-            eprintln!("Failed guest transaction finalize in Mongo transaction: {error}");
-            GuestDomainError::PreEffect(internal_error())
-        })?;
-    Ok((transaction_id, body))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn guest_response_from_frozen_documents(
-    transaction_id: ObjectId,
-    invoice_number: &str,
-    product_id: ObjectId,
-    product: &Document,
-    payment_method_id: ObjectId,
-    payment_method: &Document,
-    member_id: Option<ObjectId>,
-    normalized: &NormalizedGuestCreate,
-    amount: i64,
-    admin_fee: i64,
-    unique_code: i64,
-    total_amount: i64,
-    now: DateTime,
-    expired_at: DateTime,
-) -> GuestCreateResponse {
-    GuestCreateResponse {
+    let min_amount = payment_method_min_amount(&state.pg_pool, payment_method_id).await.unwrap_or(10_000);
+    let max_amount = payment_method_max_amount(&state.pg_pool, payment_method_id).await.unwrap_or(5_000_000);
+    if total_amount < min_amount { return status_message_owned(StatusCode::BAD_REQUEST, format!("Minimum amount is Rp {}", min_amount)); }
+    if total_amount > max_amount { return status_message_owned(StatusCode::BAD_REQUEST, format!("Maximum amount is Rp {}", max_amount)); }
+    let invoice_number = match generate_invoice_number(&state.pg_pool).await { Ok(value) => value, Err(_) => return internal_error() };
+    let transaction_id = Uuid::new_v4();
+    let now = chrono::Utc::now();
+    let expired_at = now + chrono::Duration::hours(24);
+    let response = GuestCreateResponse {
         message: GUEST_CREATE_MESSAGE,
         payment_info: GuestPaymentInfo {
-            bank_name: read_string(payment_method, "name"),
-            account_number: read_string(payment_method, "accountNumber"),
-            account_name: read_string(payment_method, "accountName"),
-            amount,
-            admin_fee,
-            unique_code,
-            total_amount,
-            expired_at: date_time_string(&expired_at),
+            bank_name: payment_method_name(&state.pg_pool, payment_method_id).await.unwrap_or_default(),
+            account_number: payment_method_account_number(&state.pg_pool, payment_method_id).await.unwrap_or_default(),
+            account_name: payment_method_account_name(&state.pg_pool, payment_method_id).await.unwrap_or_default(),
+            amount: price, admin_fee, unique_code, total_amount, expired_at: expired_at.to_rfc3339(),
         },
         transaction: GuestTransactionCheckItem {
-            id: transaction_id.to_hex(),
-            invoice_number: invoice_number.to_string(),
-            user: member_id.map(|id| id.to_hex()),
-            product: ProductCheckBrief {
-                id: product_id.to_hex(),
-                code: read_string(product, "code"),
-                name: read_string(product, "name"),
-            },
-            target: normalized.target.clone(),
-            server_id: (!normalized.server_id.is_empty()).then(|| normalized.server_id.clone()),
-            whatsapp: normalized.whatsapp.clone(),
-            email: (!normalized.email.is_empty()).then(|| normalized.email.clone()),
-            amount,
-            admin_fee,
-            unique_code,
-            total_amount,
-            payment_method: PaymentMethodCheckBrief {
-                id: payment_method_id.to_hex(),
-                name: read_string(payment_method, "name"),
-                category: object_id_string(payment_method, "category"),
-                account_number: optional_string(payment_method, "accountNumber"),
-                account_name: optional_string(payment_method, "accountName"),
-            },
-            payment_status: "waiting_payment".to_string(),
-            transaction_status: "pending".to_string(),
-            expired_at: date_time_string(&expired_at),
-            created_at: date_time_string(&now),
-            updated_at: date_time_string(&now),
-            version: Some(0),
-            paid_at: None,
-            vendor_trx_id: None,
-            sn: None,
-            status_update_note: None,
-            status_updated_at: None,
-            status_updated_by: None,
+            id: transaction_id.to_string(), invoice_number: invoice_number.clone(),
+            user: member.as_ref().map(|access| access.user_id.to_string()),
+            product: ProductCheckBrief { id: product.id.to_string(), code: product.code.clone(), name: product.name.clone() },
+            target: normalized.target.clone(), server_id: (!normalized.server_id.is_empty()).then(|| normalized.server_id.clone()),
+            whatsapp: normalized.whatsapp.clone(), email: (!normalized.email.is_empty()).then(|| normalized.email.clone()),
+            amount: price, admin_fee, unique_code, total_amount,
+            payment_method: PaymentMethodCheckBrief { id: payment_method.id.to_string(), name: payment_method_name(&state.pg_pool, payment_method_id).await.unwrap_or_default(), category: Some(category.id.to_string()), account_number: Some(payment_method_account_number(&state.pg_pool, payment_method_id).await.unwrap_or_default()), account_name: Some(payment_method_account_name(&state.pg_pool, payment_method_id).await.unwrap_or_default()) },
+            payment_status: "waiting_payment".to_string(), transaction_status: "pending".to_string(), expired_at: expired_at.to_rfc3339(), created_at: now.to_rfc3339(), updated_at: now.to_rfc3339(), version: Some(0), paid_at: None, vendor_trx_id: None, sn: None, status_update_note: None, status_updated_at: None, status_updated_by: None,
         },
-    }
+    };
+    let body = match serde_json::to_value(response) { Ok(body) => body, Err(_) => return internal_error() };
+    if crate::services::idempotency::bound_response_body(&body).is_err() { return crate::services::idempotency::IdempotencyError::ResponseTooLarge.into_response(); }
+    let snapshot = serde_json::json!({"product":{"id":product.id,"code":product.code,"name":product.name,"vendorName":product.vendor_name,"vendorSku":product.vendor_sku,"validation":product_validation_config(&product)},"target":normalized.target,"serverId":normalized.server_id,"discountVoucherCode":voucher.as_ref().map(|v|v.code.clone()),"discountAmount":voucher.as_ref().map(|v|v.discount_amount),"baseAmount":voucher.as_ref().map(|_|preview_flash_price.unwrap_or(base_price)),"flashSaleId":flash_reservation.as_ref().map(|r|r.flash_sale_id.to_string())});
+    let insert = sqlx::query("INSERT INTO guest_transactions(id,invoice_number,idempotency_key,payload_digest,user_id,product_id,payment_method_id,target,server_id,whatsapp,email,amount,admin_fee,unique_code,total_amount,payment_status,transaction_status,expired_at,discount_voucher_code,discount_amount,base_amount,flash_sale_id,snapshot,idempotency_response_status,idempotency_response_body) VALUES($1,$2,$3,$4,$5,$6,$7,$8,NULLIF($9,''),NULLIF($10,''),NULLIF($11,''),$12,$13,$14,$15,'waiting_payment','pending',$16,$17,$18,$19,$20,$21,201,$22)")
+        .bind(transaction_id).bind(&invoice_number).bind(&stored_key).bind(&request_digest).bind(member.as_ref().map(|a| a.user_id)).bind(product.id).bind(payment_method.id).bind(&normalized.target).bind(&normalized.server_id).bind(&normalized.whatsapp).bind(&normalized.email).bind(price).bind(admin_fee).bind(unique_code).bind(total_amount).bind(expired_at).bind(voucher.as_ref().map(|v|v.code.as_str())).bind(voucher.as_ref().map(|v|v.discount_amount)).bind(voucher.as_ref().map(|_|preview_flash_price.unwrap_or(base_price))).bind(flash_reservation.as_ref().map(|r|r.flash_sale_id.to_string())).bind(&snapshot).bind(&body).execute(&mut *tx).await;
+    if insert.is_err() { return internal_error(); }
+    if sqlx::query("INSERT INTO guest_transaction_status_events(transaction_id,status,payload) VALUES($1,'pending',$2)")
+        .bind(transaction_id).bind(serde_json::json!({"source":"guest_checkout","invoiceNumber":invoice_number})).execute(&mut *tx).await.is_err() { return internal_error(); }
+    let provider_job = serde_json::json!({"guestTransactionId":transaction_id,"invoiceNumber":invoice_number,"productId":product.id,"productCode":product.code,"sku":product.vendor_sku,"target":normalized.target,"serverId":normalized.server_id,"amount":price,"source":"guest"});
+    if sqlx::query("INSERT INTO provider_outbox(ref_id,payload,state) VALUES($1,$2,'pending')").bind(&invoice_number).bind(&provider_job).execute(&mut *tx).await.is_err() { return internal_error(); }
+    if sqlx::query("UPDATE guest_checkout_idempotency SET state='completed',response_status=201,response_body=$2,transaction_id=$3,updated_at=now() WHERE idempotency_key=$1")
+        .bind(&stored_key).bind(&body).bind(transaction_id).execute(&mut *tx).await.is_err() { return internal_error(); }
+    if tx.commit().await.is_err() { return internal_error(); }
+    (StatusCode::CREATED, Json(body)).into_response()
 }
 
-struct GuestMarkerRecovery<'a> {
-    transactions: &'a mongodb::Collection<Document>,
-}
-
-impl DomainMarkerRecovery for GuestMarkerRecovery<'_> {
-    async fn recover(
-        &self,
-        actor_id: ObjectId,
-        route_key: &str,
-        idempotency_key: &str,
-        request_digest: &str,
-    ) -> DomainRecovery {
-        if actor_id != ANONYMOUS_GUEST_ACTOR || route_key != ROUTE_GUEST_CHECKOUT {
-            return DomainRecovery::None;
-        }
-        let marker = self
-            .transactions
-            .find_one(doc! {
-                "idempotencyRoute": ROUTE_GUEST_CHECKOUT,
-                "idempotencyKey": idempotency_key,
-                "idempotencyRequestDigest": request_digest,
-            })
-            .await
-            .ok()
-            .flatten();
-        let Some(marker) = marker else {
-            return DomainRecovery::None;
-        };
-        let Some(body) = marker
-            .get_str("idempotencyResponseBody")
-            .ok()
-            .and_then(|raw| serde_json::from_str(raw).ok())
-        else {
-            return DomainRecovery::EffectApplied { snapshot: None };
-        };
-        DomainRecovery::EffectApplied {
-            snapshot: Some(CompletedSnapshot {
-                status: marker
-                    .get_i32("idempotencyResponseStatus")
-                    .ok()
-                    .and_then(|status| u16::try_from(status).ok())
-                    .unwrap_or(StatusCode::CREATED.as_u16()),
-                body,
-                resource_id: marker.get_object_id("_id").ok().map(|id| id.to_hex()),
-            }),
-        }
-    }
-}
-
-async fn release_guest_started(
-    store: &MongoIdempotencyStore<'_>,
-    stored_key: &str,
-    request_digest: &str,
-    lease_generation: u64,
-) {
-    let _ = store
-        .release_started(
-            ANONYMOUS_GUEST_ACTOR,
-            ROUTE_GUEST_CHECKOUT,
-            stored_key,
-            request_digest,
-            lease_generation,
-        )
-        .await;
-}
-
-fn guest_atomicity_unavailable() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({
-            "message": "Guest checkout membutuhkan transaksi database",
-            "error": {
-                "code": "GUEST_CHECKOUT_ATOMICITY_UNAVAILABLE",
-                "message": "Guest checkout membutuhkan transaksi database"
-            }
-        })),
-    )
-        .into_response()
-}
-
-fn identifier_index_unavailable() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({
-            "message": "Index identifier belum siap",
-            "error": {
-                "code": "IDENTIFIER_INDEX_UNAVAILABLE",
-                "message": "Index identifier belum siap"
-            }
-        })),
-    )
-        .into_response()
-}
-
-fn invoice_identifier_exhausted() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({
-            "message": "Nomor invoice sementara tidak tersedia",
-            "error": {
-                "code": "INVOICE_IDENTIFIER_EXHAUSTED",
-                "message": "Nomor invoice sementara tidak tersedia"
-            }
-        })),
-    )
-        .into_response()
-}
-
-fn guest_ambiguous_response() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({
-            "message": "Status guest checkout belum dapat dipastikan. Coba ulang dengan Idempotency-Key yang sama.",
-            "error": {
-                "code": "GUEST_CHECKOUT_COMMIT_AMBIGUOUS",
-                "message": "Status guest checkout belum dapat dipastikan. Coba ulang dengan Idempotency-Key yang sama."
-            }
-        })),
-    )
-        .into_response()
-}
+async fn payment_method_admin_fee(pool: &sqlx::PgPool, id: Uuid) -> Option<f64> { sqlx::query_scalar("SELECT admin_fee FROM payment_methods WHERE id=$1").bind(id).fetch_optional(pool).await.ok().flatten() }
+async fn payment_method_admin_percent(pool: &sqlx::PgPool, id: Uuid) -> Option<f64> { sqlx::query_scalar("SELECT admin_percent FROM payment_methods WHERE id=$1").bind(id).fetch_optional(pool).await.ok().flatten() }
+async fn payment_method_min_amount(pool: &sqlx::PgPool, id: Uuid) -> Option<i64> { sqlx::query_scalar::<_,f64>("SELECT min_amount FROM payment_methods WHERE id=$1").bind(id).fetch_optional(pool).await.ok().flatten().map(|v|v as i64) }
+async fn payment_method_max_amount(pool: &sqlx::PgPool, id: Uuid) -> Option<i64> { sqlx::query_scalar::<_,f64>("SELECT max_amount FROM payment_methods WHERE id=$1").bind(id).fetch_optional(pool).await.ok().flatten().map(|v|v as i64) }
+async fn payment_method_use_unique_code(pool: &sqlx::PgPool, id: Uuid) -> Option<bool> { sqlx::query_scalar("SELECT use_unique_code FROM payment_methods WHERE id=$1").bind(id).fetch_optional(pool).await.ok().flatten() }
+async fn payment_method_name(pool: &sqlx::PgPool, id: Uuid) -> Option<String> { sqlx::query_scalar("SELECT name FROM payment_methods WHERE id=$1").bind(id).fetch_optional(pool).await.ok().flatten() }
+async fn payment_method_account_number(pool: &sqlx::PgPool, id: Uuid) -> Option<String> { sqlx::query_scalar("SELECT account_number FROM payment_methods WHERE id=$1").bind(id).fetch_optional(pool).await.ok().flatten() }
+async fn payment_method_account_name(pool: &sqlx::PgPool, id: Uuid) -> Option<String> { sqlx::query_scalar("SELECT account_name FROM payment_methods WHERE id=$1").bind(id).fetch_optional(pool).await.ok().flatten() }
 
 pub async fn check_public(
     State(state): State<Arc<AppState>>,
@@ -876,52 +269,24 @@ pub async fn check_public(
 ) -> Response {
     let normalized_whatsapp = normalize_phone(query.whatsapp.as_deref());
     if normalized_whatsapp.is_empty() {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                message: "Nomor WhatsApp wajib diisi untuk cek transaksi",
-            }),
-        )
-            .into_response();
+        return (StatusCode::BAD_REQUEST, Json(ErrorResponse { message: "Nomor WhatsApp wajib diisi untuk cek transaksi" })).into_response();
     }
-
-    let Some(client) = &state.mongo_client else {
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                message: "MONGO_URI is not configured",
-            }),
-        )
-            .into_response();
+    let row = match sqlx::query("SELECT gt.id,gt.invoice_number,gt.user_id,gt.target,gt.server_id,gt.whatsapp,gt.email,gt.amount,gt.admin_fee,gt.unique_code,gt.total_amount,gt.payment_status,gt.transaction_status,gt.expired_at,gt.created_at,gt.updated_at,gt.paid_at,gt.vendor_trx_id,gt.sn,gt.status_update_note,gt.status_updated_at,gt.status_updated_by,p.id product_id,p.code product_code,p.name product_name,pm.id payment_method_id,pm.name payment_method_name,pm.category_id,pm.account_number,pm.account_name FROM guest_transactions gt JOIN products p ON p.id=gt.product_id JOIN payment_methods pm ON pm.id=gt.payment_method_id WHERE gt.invoice_number=$1 AND gt.whatsapp=$2 LIMIT 1")
+        .bind(&invoice_number).bind(&normalized_whatsapp).fetch_optional(&state.pg_pool).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return transaction_not_found(),
+        Err(_) => return internal_error(),
     };
-
-    let pipeline = vec![
-        doc! { "$match": { "invoiceNumber": invoice_number } },
-        lookup_stage("products", "product", "product"),
-        unwind_stage("$product"),
-        lookup_stage("paymentmethods", "paymentMethod", "paymentMethod"),
-        unwind_stage("$paymentMethod"),
-        doc! { "$limit": 1 },
-    ];
-
-    let Some(document) = first_document(
-        client
-            .database(&state.mongo_db)
-            .collection::<Document>("guesttransactions")
-            .aggregate(pipeline)
-            .await,
-    )
-    .await
-    else {
-        return transaction_not_found();
+    let item = GuestTransactionCheckItem {
+        id: row.get::<Uuid,_>("id").to_string(), invoice_number: row.get("invoice_number"),
+        user: row.get::<Option<Uuid>,_>("user_id").map(|id|id.to_string()),
+        product: ProductCheckBrief { id:row.get::<Uuid,_>("product_id").to_string(),code:row.get("product_code"),name:row.get("product_name") },
+        target:row.get("target"),server_id:row.get("server_id"),whatsapp:row.get("whatsapp"),email:row.get("email"),
+        amount:row.get("amount"),admin_fee:row.get("admin_fee"),unique_code:row.get("unique_code"),total_amount:row.get("total_amount"),
+        payment_method:PaymentMethodCheckBrief{id:row.get::<Uuid,_>("payment_method_id").to_string(),name:row.get("payment_method_name"),category:row.get::<Option<Uuid>,_>("category_id").map(|id|id.to_string()),account_number:row.get("account_number"),account_name:row.get("account_name")},
+        payment_status:row.get("payment_status"),transaction_status:row.get("transaction_status"),
+        expired_at:row.get::<chrono::DateTime<chrono::Utc>,_>("expired_at").to_rfc3339(),created_at:row.get::<chrono::DateTime<chrono::Utc>,_>("created_at").to_rfc3339(),updated_at:row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at").to_rfc3339(),version:None,
+        paid_at:row.get::<Option<chrono::DateTime<chrono::Utc>>,_>("paid_at").map(|v|v.to_rfc3339()),vendor_trx_id:row.get("vendor_trx_id"),sn:row.get("sn"),status_update_note:row.get("status_update_note"),status_updated_at:row.get::<Option<chrono::DateTime<chrono::Utc>>,_>("status_updated_at").map(|v|v.to_rfc3339()),status_updated_by:row.get::<Option<Uuid>,_>("status_updated_by").map(|id|id.to_string()),
     };
-
-    if normalize_phone(Some(&read_string(&document, "whatsapp"))) != normalized_whatsapp {
-        return transaction_not_found();
-    }
-
-    match guest_transaction_check_from_doc(&document) {
-        Some(item) => Json(item).into_response(),
-        None => transaction_not_found(),
-    }
+    Json(item).into_response()
 }

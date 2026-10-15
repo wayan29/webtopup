@@ -1,133 +1,81 @@
-use futures_util::TryStreamExt;
-use mongodb::bson::{doc, oid::ObjectId, Bson, Document};
-
-use crate::utils::bson::{read_i64, read_string};
+use sqlx::{PgPool, Row};
+use uuid::Uuid;
 
 use super::types::{DepositQueueItem, DepositQueueSummary};
 
 pub(super) async fn build_deposit_queue_summary(
-    collection: &mongodb::Collection<Document>,
-    actor_id: Option<ObjectId>,
+    pool: &PgPool,
+    actor_id: Option<Uuid>,
 ) -> DepositQueueSummary {
-    let pending_filter = doc! { "status": "pending" };
-    let unassigned_filter = doc! {
-        "status": "pending",
-        "$or": [
-            { "assignedTo": { "$exists": false } },
-            { "assignedTo": Bson::Null }
-        ]
-    };
-    let mine_filter = actor_id
-        .map(|id| doc! { "status": "pending", "assignedTo": id })
-        .unwrap_or_else(|| doc! { "status": "pending", "_id": { "$exists": false } });
-    let locked_filter = actor_id
-        .map(|id| doc! { "status": "pending", "assignedTo": { "$nin": [Bson::Null, Bson::ObjectId(id)] } })
-        .unwrap_or_else(|| doc! { "status": "pending", "assignedTo": { "$ne": Bson::Null } });
+    let summary = sqlx::query(
+        "SELECT COUNT(*)::bigint AS total, \
+         COUNT(*) FILTER (WHERE status = 'pending')::bigint AS pending, \
+         COUNT(*) FILTER (WHERE status = 'approved')::bigint AS approved, \
+         COUNT(*) FILTER (WHERE status = 'rejected')::bigint AS rejected, \
+         COALESCE(SUM(amount) FILTER (WHERE status = 'pending'), 0)::bigint AS pending_amount_total, \
+         COALESCE(SUM(COALESCE(total_amount, amount)) FILTER (WHERE status = 'pending'), 0)::bigint AS pending_transfer_total, \
+         COUNT(*) FILTER (WHERE status = 'pending' AND assigned_to IS NULL)::bigint AS unassigned, \
+         COUNT(*) FILTER (WHERE status = 'pending' AND assigned_to = $1)::bigint AS mine, \
+         COUNT(*) FILTER (WHERE status = 'pending' AND assigned_to IS NOT NULL AND ($1::uuid IS NULL OR assigned_to <> $1))::bigint AS locked \
+         FROM deposits",
+    )
+    .bind(actor_id)
+    .fetch_one(pool)
+    .await;
 
-    let pipeline = vec![doc! {
-        "$group": {
-            "_id": null,
-            "total": { "$sum": 1 },
-            "pending": { "$sum": { "$cond": [{ "$eq": ["$status", "pending"] }, 1, 0] } },
-            "approved": { "$sum": { "$cond": [{ "$eq": ["$status", "approved"] }, 1, 0] } },
-            "rejected": { "$sum": { "$cond": [{ "$eq": ["$status", "rejected"] }, 1, 0] } },
-            "pendingAmountTotal": { "$sum": { "$cond": [{ "$eq": ["$status", "pending"] }, "$amount", 0] } },
-            "pendingTransferTotal": { "$sum": { "$cond": [{ "$eq": ["$status", "pending"] }, { "$ifNull": ["$totalAmount", "$amount"] }, 0] } }
-        }
-    }];
-
-    let mut base_summary = match collection.aggregate(pipeline).await {
-        Ok(cursor) => cursor
-            .try_collect::<Vec<_>>()
-            .await
-            .ok()
-            .and_then(|mut items| items.pop())
-            .map(|item| DepositQueueSummary {
-                total: read_i64(&item, "total"),
-                pending: read_i64(&item, "pending"),
-                approved: read_i64(&item, "approved"),
-                rejected: read_i64(&item, "rejected"),
-                pending_amount_total: read_i64(&item, "pendingAmountTotal"),
-                pending_transfer_total: read_i64(&item, "pendingTransferTotal"),
-                ..DepositQueueSummary::default()
-            })
-            .unwrap_or_default(),
-        Err(_) => DepositQueueSummary::default(),
-    };
-
-    base_summary.unassigned = collection
-        .count_documents(unassigned_filter)
-        .await
-        .unwrap_or(0) as i64;
-    base_summary.mine = collection.count_documents(mine_filter).await.unwrap_or(0) as i64;
-    base_summary.locked = collection.count_documents(locked_filter).await.unwrap_or(0) as i64;
-    let pending_count = collection
-        .count_documents(pending_filter)
-        .await
-        .unwrap_or(0) as i64;
-    if base_summary.pending == 0 && pending_count > 0 {
-        base_summary.pending = pending_count;
-    }
-
-    base_summary
-}
-
-pub(super) async fn latest_pending_deposits(
-    collection: &mongodb::Collection<Document>,
-) -> Vec<DepositQueueItem> {
-    match collection
-        .find(doc! { "status": "pending" })
-        .sort(doc! { "createdAt": -1 })
-        .limit(5)
-        .await
-    {
-        Ok(cursor) => cursor
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(deposit_queue_item_from_doc)
-            .collect(),
-        Err(_) => Vec::new(),
-    }
-}
-
-fn deposit_queue_item_from_doc(mut document: Document) -> DepositQueueItem {
-    let id = document
-        .remove("_id")
-        .and_then(|value| value.as_object_id())
-        .map(|id| id.to_hex())
-        .unwrap_or_default();
-    let total_amount = read_i64(&document, "totalAmount");
-    let amount = read_i64(&document, "amount");
-
-    DepositQueueItem {
-        invoice: format_invoice_code(&id),
-        id,
-        status: read_string(&document, "status"),
-        amount,
-        admin_fee: read_i64(&document, "adminFee"),
-        total_amount: if total_amount > 0 {
-            total_amount
-        } else {
-            amount
+    match summary {
+        Ok(row) => DepositQueueSummary {
+            total: row.get("total"),
+            pending: row.get("pending"),
+            approved: row.get("approved"),
+            rejected: row.get("rejected"),
+            unassigned: row.get("unassigned"),
+            mine: row.get("mine"),
+            locked: row.get("locked"),
+            pending_amount_total: row.get("pending_amount_total"),
+            pending_transfer_total: row.get("pending_transfer_total"),
         },
-        assigned_to: document
-            .get_object_id("assignedTo")
-            .map(|id| id.to_hex())
-            .ok(),
-        assigned_at: document
-            .get_datetime("assignedAt")
-            .map(|value| value.to_string())
-            .ok(),
-        created_at: document
-            .get_datetime("createdAt")
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
+        Err(_) => DepositQueueSummary::default(),
     }
+}
+
+pub(super) async fn latest_pending_deposits(pool: &PgPool) -> Vec<DepositQueueItem> {
+    let rows = sqlx::query(
+        "SELECT id, invoice_code, status, amount, admin_fee, total_amount, assigned_to, assigned_at, created_at \
+         FROM deposits WHERE status = 'pending' ORDER BY created_at DESC LIMIT 5",
+    )
+    .fetch_all(pool)
+    .await;
+
+    rows.unwrap_or_default()
+        .into_iter()
+        .map(|row| {
+            let id: Uuid = row.get("id");
+            let id = id.to_string();
+            let amount: i64 = row.get("amount");
+            let total_amount: Option<i64> = row.get("total_amount");
+            let invoice_code: Option<String> = row.get("invoice_code");
+            let assigned_to: Option<Uuid> = row.get("assigned_to");
+            let assigned_at: Option<chrono::DateTime<chrono::Utc>> = row.get("assigned_at");
+            let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
+
+            DepositQueueItem {
+                invoice: invoice_code.unwrap_or_else(|| format_invoice_code(&id)),
+                id,
+                status: row.get("status"),
+                amount,
+                admin_fee: row.get("admin_fee"),
+                total_amount: total_amount.filter(|value| *value > 0).unwrap_or(amount),
+                assigned_to: assigned_to.map(|value| value.to_string()),
+                assigned_at: assigned_at.map(|value| value.to_string()),
+                created_at: created_at.to_string(),
+            }
+        })
+        .collect()
 }
 
 fn format_invoice_code(id: &str) -> String {
-    let suffix = id.get(16..24).unwrap_or(id).to_uppercase();
+    let compact_id: String = id.chars().filter(|character| *character != '-').collect();
+    let suffix = compact_id.get(16..24).unwrap_or(&compact_id).to_uppercase();
     format!("INV{suffix}")
 }

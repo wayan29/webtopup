@@ -5,15 +5,13 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use futures_util::TryStreamExt;
-use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime, Document};
+use uuid::Uuid;
 
 use super::{internal_error, status_message, unavailable};
 use super::{mappers::*, points_helpers::*, types::*, validation::*};
 use crate::{
-    security::{require_permission, require_proxy_context, ErrorResponse},
+    security::{require_sql_permission, require_sql_user, ErrorResponse},
     state::AppState,
-    utils::bson::{read_i64, read_string},
 };
 
 const POINT_TYPES: [&str; 3] = ["earn", "redeem", "admin_adjustment"];
@@ -22,47 +20,24 @@ pub async fn points_settings(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    if let Err(response) = require_permission(&headers, &state, "manageProducts").await {
+    if let Err(response) = require_sql_permission(&headers, &state, "manageProducts").await {
         return response;
     }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
+    let value = match site_setting_i64(&state.pg_pool, POINTS_PER_TRANSACTION_KEY, 100).await {
+        Ok(value) => value,
+        Err(_) => return unavailable(),
+    };
+    let point_value_rate = match site_setting_i64(&state.pg_pool, POINT_VALUE_RATE_KEY, 1).await {
+        Ok(value) => value,
+        Err(_) => return unavailable(),
     };
 
-    let settings = client
-        .database(&state.mongo_db)
-        .collection::<Document>("settings");
-    let points = settings
-        .find_one(doc! { "key": "points_per_transaction" })
-        .await
-        .ok()
-        .flatten();
-    let rate = settings
-        .find_one(doc! { "key": "point_value_rate" })
-        .await
-        .ok()
-        .flatten();
-
     Json(PointsSettingsResponse {
-        id: points.as_ref().map(id_from_doc).unwrap_or_default(),
-        key: points
-            .as_ref()
-            .map(|doc| read_string(doc, "key"))
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "points_per_transaction".to_string()),
-        value: points
-            .as_ref()
-            .and_then(|doc| number_from_bson(doc.get("value")))
-            .unwrap_or(100),
-        description: points
-            .as_ref()
-            .map(|doc| read_string(doc, "description"))
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "Points earned per Rp 10,000 transaction".to_string()),
-        point_value_rate: rate
-            .as_ref()
-            .and_then(|doc| number_from_bson(doc.get("value")))
-            .unwrap_or(1),
+        id: POINTS_PER_TRANSACTION_KEY.to_string(),
+        key: POINTS_PER_TRANSACTION_KEY.to_string(),
+        value,
+        description: "Points earned per Rp 10,000 transaction".to_string(),
+        point_value_rate,
     })
     .into_response()
 }
@@ -72,12 +47,9 @@ pub async fn points_settings_update(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<PointsSettingsPayload>,
 ) -> Response {
-    if let Err(response) = require_permission(&headers, &state, "manageProducts").await {
+    if let Err(response) = require_sql_permission(&headers, &state, "manageProducts").await {
         return response;
     }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
     let value = payload.value.and_then(number_value);
     let point_value_rate = payload.point_value_rate.and_then(number_value);
     if value.is_some_and(|value| value < 1) {
@@ -92,35 +64,39 @@ pub async fn points_settings_update(
             "Point value rate must be at least 1 Rupiah",
         );
     }
-    let settings = client
-        .database(&state.mongo_db)
-        .collection::<Document>("settings");
+    if value.is_none() && point_value_rate.is_none() {
+        return Json(PointsSettingsUpdateResponse {
+            message: "Points settings updated successfully",
+            points_per_transaction: None,
+            point_value_rate: None,
+        })
+        .into_response();
+    }
+
+    let mut tx = match state.pg_pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return unavailable(),
+    };
     if let Some(value) = value {
-        if upsert_setting(
-            &settings,
-            "points_per_transaction",
-            value,
-            "Points earned per Rp 10,000 transaction",
-        )
-        .await
-        .is_err()
+        if upsert_points_setting(&mut tx, POINTS_PER_TRANSACTION_KEY, value)
+            .await
+            .is_err()
         {
             return internal_error();
         }
     }
     if let Some(point_value_rate) = point_value_rate {
-        if upsert_setting(
-            &settings,
-            "point_value_rate",
-            point_value_rate,
-            "Value of 1 point in Rupiah",
-        )
-        .await
-        .is_err()
+        if upsert_points_setting(&mut tx, POINT_VALUE_RATE_KEY, point_value_rate)
+            .await
+            .is_err()
         {
             return internal_error();
         }
     }
+    if tx.commit().await.is_err() {
+        return internal_error();
+    }
+
     Json(PointsSettingsUpdateResponse {
         message: "Points settings updated successfully",
         points_per_transaction: value,
@@ -133,26 +109,26 @@ pub async fn points_stats(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    if let Err(response) = require_permission(&headers, &state, "manageProducts").await {
+    if let Err(response) = require_sql_permission(&headers, &state, "manageProducts").await {
         return response;
     }
-    let Some(client) = &state.mongo_client else {
+    let earned = match sum_points(&state.pg_pool, None, "earn", false).await {
+        Ok(total) => total,
+        Err(_) => return unavailable(),
+    };
+    let redeemed = match sum_points(&state.pg_pool, None, "redeem", true).await {
+        Ok(total) => total,
+        Err(_) => return unavailable(),
+    };
+    let Ok((active_users, total_users)) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM users WHERE points > 0) AS active_users, \
+         (SELECT COUNT(*) FROM users WHERE role = 'member') AS total_users",
+    )
+    .fetch_one(&state.pg_pool)
+    .await
+    else {
         return unavailable();
     };
-
-    let db = client.database(&state.mongo_db);
-    let point_transactions = db.collection::<Document>("pointtransactions");
-    let users = db.collection::<Document>("users");
-    let earned = sum_points(&point_transactions, doc! { "type": "earn" }, false).await;
-    let redeemed = sum_points(&point_transactions, doc! { "type": "redeem" }, true).await;
-    let active_users = users
-        .count_documents(doc! { "points": { "$gt": 0 } })
-        .await
-        .unwrap_or_default() as i64;
-    let total_users = users
-        .count_documents(doc! { "role": "member" })
-        .await
-        .unwrap_or_default() as i64;
     let engagement_rate = if total_users > 0 {
         ((active_users as f64 / total_users as f64) * 1000.0).round() / 10.0
     } else {
@@ -174,65 +150,62 @@ pub async fn points_adjust(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<PointsAdjustPayload>,
 ) -> Response {
-    if let Err(response) = require_permission(&headers, &state, "manageProducts").await {
+    if let Err(response) = require_sql_permission(&headers, &state, "manageProducts").await {
         return response;
     }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let Ok(user_id) = ObjectId::parse_str(payload.user_id.trim()) else {
+    let Ok(user_id) = Uuid::parse_str(payload.user_id.trim()) else {
         return status_message(axum::http::StatusCode::NOT_FOUND, "User not found");
     };
 
-    let db = client.database(&state.mongo_db);
-    let users = db.collection::<Document>("users");
-    let mut filter = doc! { "_id": user_id };
-    if payload.points < 0 {
-        filter.insert("points", doc! { "$gte": payload.points.abs() });
-    }
-
-    let updated_user = users
-        .find_one_and_update(
-            filter,
-            doc! { "$inc": { "points": payload.points }, "$set": { "updatedAt": DateTime::now() } },
-        )
-        .return_document(mongodb::options::ReturnDocument::After)
-        .await;
-    let Ok(Some(user)) = updated_user else {
-        let exists = users
-            .find_one(doc! { "_id": user_id })
-            .projection(doc! { "_id": 1 })
-            .await
-            .ok()
-            .flatten()
-            .is_some();
-        return if exists {
-            status_message(axum::http::StatusCode::BAD_REQUEST, "Insufficient points")
-        } else {
-            status_message(axum::http::StatusCode::NOT_FOUND, "User not found")
-        };
+    let mut tx = match state.pg_pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return unavailable(),
     };
-
-    let now = DateTime::now();
-    let insert_result = db
-        .collection::<Document>("pointtransactions")
-        .insert_one(doc! {
-            "user": user_id,
-            "type": "admin_adjustment",
-            "points": payload.points,
-            "description": payload.description,
-            "createdAt": now,
-            "updatedAt": now,
-        })
-        .await;
-    if insert_result.is_err() {
-        rollback_user_points(&users, user_id, payload.points).await;
+    let current_points = match sqlx::query_scalar::<_, i64>("SELECT points FROM users WHERE id = $1 FOR UPDATE")
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+    {
+        Ok(points) => points,
+        Err(_) => return internal_error(),
+    };
+    let Some(current_points) = current_points else {
+        return status_message(axum::http::StatusCode::NOT_FOUND, "User not found");
+    };
+    if payload.points < 0 && current_points + payload.points < 0 {
+        return status_message(axum::http::StatusCode::BAD_REQUEST, "Insufficient points");
+    }
+    let new_points = match sqlx::query_scalar::<_, i64>(
+        "UPDATE users SET points = points + $2, updated_at = now() WHERE id = $1 RETURNING points",
+    )
+    .bind(user_id)
+    .bind(payload.points)
+    .fetch_one(&mut *tx)
+    .await
+    {
+        Ok(points) => points,
+        Err(_) => return internal_error(),
+    };
+    if sqlx::query(
+        "INSERT INTO point_ledger (user_ref, claim_key, points, transaction_type, description) \
+         VALUES ($1::text, 'admin:' || gen_random_uuid()::text, $2, 'admin_adjustment', $3)",
+    )
+    .bind(user_id)
+    .bind(payload.points)
+    .bind(payload.description.trim())
+    .execute(&mut *tx)
+    .await
+    .is_err()
+    {
+        return internal_error();
+    }
+    if tx.commit().await.is_err() {
         return internal_error();
     }
 
     Json(PointsAdjustResponse {
         message: "Points adjusted successfully",
-        new_points: read_i64(&user, "points"),
+        new_points,
     })
     .into_response()
 }
@@ -242,12 +215,9 @@ pub async fn point_transactions(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PointTransactionsQuery>,
 ) -> Response {
-    if let Err(response) = require_permission(&headers, &state, "manageProducts").await {
+    if let Err(response) = require_sql_permission(&headers, &state, "manageProducts").await {
         return response;
     }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
 
     let transaction_type = query.transaction_type.as_deref().unwrap_or_default().trim();
     if !transaction_type.is_empty()
@@ -265,36 +235,45 @@ pub async fn point_transactions(
 
     let page = query.page.unwrap_or(1).max(1);
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
-    let mut filter = Document::new();
-    if !transaction_type.is_empty() && transaction_type != "all" {
-        filter.insert("type", transaction_type);
-    }
-
-    let db = client.database(&state.mongo_db);
-    let collection = db.collection::<Document>("pointtransactions");
-    let total = collection
-        .count_documents(filter.clone())
-        .await
-        .unwrap_or_default() as i64;
-    let docs = match collection
-        .find(filter)
-        .sort(doc! { "createdAt": -1 })
-        .skip(((page - 1) * limit) as u64)
-        .limit(limit)
-        .await
-    {
-        Ok(cursor) => cursor.try_collect::<Vec<_>>().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
+    let type_filter = if transaction_type.is_empty() || transaction_type == "all" {
+        String::new()
+    } else {
+        transaction_type.to_string()
     };
-    let user_map = user_briefs(&db, &docs).await;
-    let reward_map = reward_briefs(&db, &docs).await;
+    let total = match sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM point_ledger WHERE ($1::text = '' OR transaction_type = $1::text)",
+    )
+    .bind(&type_filter)
+    .fetch_one(&state.pg_pool)
+    .await
+    {
+        Ok(total) => total,
+        Err(_) => return unavailable(),
+    };
+    let rows = match sqlx::query(
+        "SELECT l.id, l.user_ref, l.transaction_type, l.points, l.description, l.reward_id, l.created_at, \
+                u.id AS ledger_user_id, u.name AS user_name, u.email AS user_email, \
+                r.name AS reward_name \
+         FROM point_ledger l \
+         LEFT JOIN users u ON u.id::text = l.user_ref \
+         LEFT JOIN rewards r ON r.id = l.reward_id \
+         WHERE ($1::text = '' OR l.transaction_type = $1::text) \
+         ORDER BY l.created_at DESC, l.id DESC \
+         LIMIT $2 OFFSET $3",
+    )
+    .bind(&type_filter)
+    .bind(limit)
+    .bind((page - 1) * limit)
+    .fetch_all(&state.pg_pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return unavailable(),
+    };
     let total_pages = std::cmp::max(1, (total + limit - 1) / limit);
 
     Json(PointTransactionsResponse {
-        items: docs
-            .into_iter()
-            .map(|doc| point_transaction_from_doc(doc, &user_map, &reward_map))
-            .collect(),
+        items: rows.iter().map(point_transaction_from_row).collect(),
         meta: PointTransactionsMeta {
             page,
             limit,
@@ -310,21 +289,9 @@ pub async fn points_history(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PointTransactionsQuery>,
 ) -> Response {
-    let proxy_context = match require_proxy_context(&headers, &state) {
-        Ok(context) => context,
+    let user = match require_sql_user(&headers, &state).await {
+        Ok(user) => user,
         Err(response) => return response,
-    };
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let Some(user_id) = proxy_context.user_id else {
-        return (
-            axum::http::StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse {
-                message: "Unauthorized",
-            }),
-        )
-            .into_response();
     };
 
     let transaction_type = query.transaction_type.as_deref().unwrap_or_default().trim();
@@ -343,47 +310,83 @@ pub async fn points_history(
 
     let page = query.page.unwrap_or(1).max(1);
     let limit = query.limit.unwrap_or(15).clamp(1, 100);
-    let user_object_id = ObjectId::parse_str(&user_id).ok();
-    let user_filter_value = user_object_id
-        .map(Bson::ObjectId)
-        .unwrap_or_else(|| Bson::String(user_id.clone()));
-    let mut filter = doc! { "user": user_filter_value };
-    if !transaction_type.is_empty() && transaction_type != "all" {
-        filter.insert("type", transaction_type);
-    }
-
-    let db = client.database(&state.mongo_db);
-    let collection = db.collection::<Document>("pointtransactions");
-    let total = collection
-        .count_documents(filter.clone())
-        .await
-        .unwrap_or_default() as i64;
-    let docs = match collection
-        .find(filter)
-        .sort(doc! { "createdAt": -1 })
-        .skip(((page - 1) * limit) as u64)
-        .limit(limit)
-        .await
+    let user_ref = user.id.to_string();
+    let type_filter = if transaction_type.is_empty() || transaction_type == "all" {
+        String::new()
+    } else {
+        transaction_type.to_string()
+    };
+    let total = match sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM point_ledger \
+         WHERE user_ref = $1 AND ($2::text = '' OR transaction_type = $2::text)",
+    )
+    .bind(&user_ref)
+    .bind(&type_filter)
+    .fetch_one(&state.pg_pool)
+    .await
     {
-        Ok(cursor) => cursor.try_collect::<Vec<_>>().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
+        Ok(total) => total,
+        Err(_) => return unavailable(),
+    };
+    let rows = match sqlx::query(
+        "SELECT l.id, l.user_ref, l.transaction_type, l.points, l.description, l.reward_id, l.created_at, \
+                r.name AS reward_name, \
+                ft.id AS related_tx_id, ft.amount AS related_tx_amount, ft.status AS related_tx_status, \
+                ft.snapshot ->> 'target' AS related_tx_target, \
+                p.id AS product_id, p.name AS product_name \
+         FROM point_ledger l \
+         LEFT JOIN rewards r ON r.id = l.reward_id \
+         LEFT JOIN financial_transactions ft ON ft.id::text = l.related_transaction \
+         LEFT JOIN products p ON p.id = ft.product_id \
+         WHERE l.user_ref = $1 AND ($2::text = '' OR l.transaction_type = $2::text) \
+         ORDER BY l.created_at DESC, l.id DESC \
+         LIMIT $3 OFFSET $4",
+    )
+    .bind(&user_ref)
+    .bind(&type_filter)
+    .bind(limit)
+    .bind((page - 1) * limit)
+    .fetch_all(&state.pg_pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return unavailable(),
     };
 
-    let reward_map = reward_briefs(&db, &docs).await;
-    let transaction_map = transaction_briefs(&db, &docs).await;
-    let current_points = user_points(&db, user_object_id, &user_id).await;
-    let point_value_rate = setting_value(&db, "point_value_rate", 1).await.max(1);
-    let points_per_transaction = setting_value(&db, "points_per_transaction", 100)
+    let current_points = match user_points(&state.pg_pool, user.id).await {
+        Ok(points) => points,
+        Err(_) => return unavailable(),
+    };
+    let point_value_rate = match site_setting_i64(&state.pg_pool, POINT_VALUE_RATE_KEY, 1).await {
+        Ok(value) => value.max(1),
+        Err(_) => return unavailable(),
+    };
+    let points_per_transaction = match site_setting_i64(
+        &state.pg_pool,
+        POINTS_PER_TRANSACTION_KEY,
+        100,
+    )
+    .await
+    {
+        Ok(value) => value.max(1),
+        Err(_) => return unavailable(),
+    };
+    let total_earned = match sum_points(&state.pg_pool, Some(user_ref.as_str()), "earn", false)
         .await
-        .max(1);
-    let earned_filter = doc! { "user": user_object_id.map(Bson::ObjectId).unwrap_or_else(|| Bson::String(user_id.clone())), "type": "earn" };
-    let redeemed_filter = doc! { "user": user_object_id.map(Bson::ObjectId).unwrap_or_else(|| Bson::String(user_id.clone())), "type": "redeem" };
-    let total_earned = sum_points(&collection, earned_filter, false).await;
-    let total_redeemed = sum_points(&collection, redeemed_filter, true).await;
+    {
+        Ok(total) => total,
+        Err(_) => return unavailable(),
+    };
+    let total_redeemed = match sum_points(&state.pg_pool, Some(user_ref.as_str()), "redeem", true)
+        .await
+    {
+        Ok(total) => total,
+        Err(_) => return unavailable(),
+    };
     let total_pages = std::cmp::max(1, (total + limit - 1) / limit);
-    let items = docs
-        .into_iter()
-        .map(|doc| points_history_item_from_doc(doc, &reward_map, &transaction_map))
+    let items = rows
+        .iter()
+        .map(points_history_item_from_row)
         .collect::<Vec<_>>();
     let last_activity_at = items.first().map(|item| item.created_at.clone());
 

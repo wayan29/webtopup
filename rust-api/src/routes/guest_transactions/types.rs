@@ -1,4 +1,3 @@
-use mongodb::bson::oid::ObjectId;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -246,11 +245,6 @@ pub(super) struct PaymentMethodCheckBrief {
     pub(super) account_name: Option<String>,
 }
 
-pub(super) struct FlashSaleReservation {
-    pub(super) flash_sale_id: ObjectId,
-    pub(super) product_id: ObjectId,
-    pub(super) price: i64,
-}
 
 #[derive(Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

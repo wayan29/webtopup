@@ -1,8 +1,7 @@
-use mongodb::bson::{oid::ObjectId, Document};
 use serde_json::{Map, Value};
 use unicode_normalization::UnicodeNormalization;
 use url::Url;
-
+use uuid::Uuid;
 use crate::services::idempotency::sha256_hex;
 
 use super::slider_types::{
@@ -78,7 +77,7 @@ impl SliderPolicyError {
 /// Validate a reorder payload independently of the authoritative current list.
 /// Callers must still compare IDs with every current/non-archived slider in the write transaction.
 pub fn validate_slider_order_entries(
-    entries: &[(ObjectId, i64)],
+    entries: &[(Uuid, i64)],
 ) -> Result<(), SliderPolicyError> {
     if entries.is_empty() {
         return Err(SliderPolicyError::InvalidOrder);
@@ -203,8 +202,8 @@ pub fn effective_requires_step_up(
     action: SliderAction,
     before: Option<&SliderSnapshotItem>,
     after: Option<&SliderSnapshotItem>,
-    old_public_order: &[ObjectId],
-    new_public_order: &[ObjectId],
+    old_public_order: &[Uuid],
+    new_public_order: &[Uuid],
 ) -> bool {
     match action {
         SliderAction::Create => after.is_some_and(|value| value.status),
@@ -222,9 +221,9 @@ pub fn effective_requires_step_up(
 
 pub fn canonical_slider_claim_input(
     contract_version: &str,
-    operator_id: ObjectId,
+    operator_id: Uuid,
     action: SliderAction,
-    target_id: Option<ObjectId>,
+    target_id: Option<Uuid>,
     expected_revision: i64,
     normalized_payload: &Value,
 ) -> Value {
@@ -233,14 +232,13 @@ pub fn canonical_slider_claim_input(
         "contractVersion": contract_version,
         "expectedRevision": expected_revision,
         "normalizedPayload": canonicalize_value(normalized_payload),
-        "operatorId": operator_id.to_hex(),
-        "targetId": target_id.map(|value| value.to_hex()),
+        "operatorId": operator_id.to_string(),
+        "targetId": target_id.map(|value| value.to_string()),
     })
 }
 
-/// Return the public DTO without allowing operational fields to leak through serialization.
-pub fn public_slider_from_document(document: &Document) -> PublicSliderItem {
-    PublicSliderItem::from(document)
+pub fn public_slider_from_fields(id: &str, name: &str, image: &str, link: &str) -> PublicSliderItem {
+    PublicSliderItem { id: id.to_string(), name: name.to_string(), image: image.to_string(), link: link.to_string() }
 }
 
 /// Digest helper kept beside the canonical input so every caller uses SHA-256 over the same JSON.
@@ -397,12 +395,12 @@ fn canonicalize_value(value: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mongodb::bson::oid::ObjectId;
     use serde_json::json;
+    use uuid::Uuid;
 
     fn snapshot(status: bool) -> SliderSnapshotItem {
         SliderSnapshotItem {
-            id: ObjectId::new(),
+            id: Uuid::new_v4(),
             name: "Promo".to_string(),
             image: "/uploads/covers/1710000000000-deadbeef.webp".to_string(),
             link: "/promo".to_string(),
@@ -494,18 +492,18 @@ mod tests {
         assert!(!effective_requires_step_up(SliderAction::Update, Some(&draft), Some(&draft), &[], &[]));
         public.name = "Changed".into();
         assert!(effective_requires_step_up(SliderAction::Update, Some(&snapshot(true)), Some(&public), &[], &[]));
-        assert!(effective_requires_step_up(SliderAction::Reorder, None, None, &[ObjectId::new()], &[ObjectId::new()]));
+        assert!(effective_requires_step_up(SliderAction::Reorder, None, None, &[Uuid::new_v4()], &[Uuid::new_v4()]));
     }
 
     #[test]
     fn canonical_claim_input_binds_every_security_relevant_dimension() {
-        let operator = ObjectId::new();
-        let target = ObjectId::new();
+        let operator = Uuid::new_v4();
+        let target = Uuid::new_v4();
         let base = canonical_slider_claim_input("slider-revision-v1", operator, SliderAction::Update, Some(target), 7, &json!({"name":"Promo"}));
         let digest = canonical_slider_claim_digest(&base);
         let variants = [
             canonical_slider_claim_input("slider-revision-v2", operator, SliderAction::Update, Some(target), 7, &json!({"name":"Promo"})),
-            canonical_slider_claim_input("slider-revision-v1", ObjectId::new(), SliderAction::Update, Some(target), 7, &json!({"name":"Promo"})),
+            canonical_slider_claim_input("slider-revision-v1", Uuid::new_v4(), SliderAction::Update, Some(target), 7, &json!({"name":"Promo"})),
             canonical_slider_claim_input("slider-revision-v1", operator, SliderAction::Archive, Some(target), 7, &json!({"name":"Promo"})),
             canonical_slider_claim_input("slider-revision-v1", operator, SliderAction::Update, None, 7, &json!({"name":"Promo"})),
             canonical_slider_claim_input("slider-revision-v1", operator, SliderAction::Update, Some(target), 8, &json!({"name":"Promo"})),

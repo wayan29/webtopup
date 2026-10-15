@@ -1,26 +1,7 @@
 use axum::response::Response;
-use mongodb::bson::{doc, DateTime, Document};
-use rand::{rngs::OsRng, RngCore};
 use serde_json::Value;
 
 use super::status_message;
-
-pub(super) fn parse_date_boundary(
-    value: Option<&str>,
-    end_of_day: bool,
-) -> Result<Option<DateTime>, &'static str> {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(None);
-    };
-    let suffix = if end_of_day {
-        "T23:59:59.999Z"
-    } else {
-        "T00:00:00.000Z"
-    };
-    DateTime::parse_rfc3339_str(format!("{}{}", value, suffix))
-        .map(Some)
-        .map_err(|_| "Format tanggal voucher tidak valid")
-}
 
 pub(super) fn normalize_amount(value: Option<Value>) -> Result<i64, Response> {
     let amount = value.and_then(number_value).unwrap_or_default();
@@ -98,49 +79,6 @@ pub(super) fn normalize_voucher_prefix(value: Option<Value>) -> Result<String, R
         ));
     }
     Ok(prefix)
-}
-
-pub(super) async fn generate_voucher_codes(
-    vouchers: &mongodb::Collection<Document>,
-    quantity: i64,
-    prefix: &str,
-) -> Result<Vec<String>, Response> {
-    let mut codes = Vec::new();
-    let mut attempts = 0;
-    while codes.len() < quantity as usize {
-        let code = random_voucher_code(prefix);
-        attempts += 1;
-        if attempts > quantity * 25 {
-            return Err(status_message(
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Gagal membuat kode voucher unik",
-            ));
-        }
-        if codes.contains(&code) {
-            continue;
-        }
-        let exists = vouchers
-            .find_one(doc! { "code": &code })
-            .await
-            .ok()
-            .flatten()
-            .is_some();
-        if !exists {
-            codes.push(code);
-        }
-    }
-    Ok(codes)
-}
-
-fn random_voucher_code(prefix: &str) -> String {
-    let mut bytes = [0u8; 5];
-    OsRng.fill_bytes(&mut bytes);
-    let suffix: String = bytes.iter().map(|byte| format!("{byte:02X}")).collect();
-    if prefix.is_empty() {
-        suffix
-    } else {
-        format!("{prefix}{suffix}")
-    }
 }
 
 fn number_value(value: Value) -> Option<i64> {

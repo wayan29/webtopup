@@ -1,5 +1,5 @@
-use mongodb::bson::Document;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Deserialize)]
 pub struct AuditLogsQuery {
@@ -51,7 +51,7 @@ pub struct AuditLogItem {
     #[serde(rename = "userAgent")]
     pub user_agent: Option<String>,
     pub summary: String,
-    pub metadata: Option<Document>,
+    pub metadata: Option<Value>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
     #[serde(rename = "updatedAt")]

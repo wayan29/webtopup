@@ -1,4 +1,3 @@
-use mongodb::bson::oid::ObjectId;
 use serde::{ser::SerializeStruct, Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -67,8 +66,3 @@ pub struct LeaderboardMeta {
     pub generated_at: String,
 }
 
-#[derive(Clone)]
-pub struct CurrentMember {
-    pub id: ObjectId,
-    pub name: String,
-}

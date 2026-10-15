@@ -2,22 +2,23 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
+    http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
-use futures_util::TryStreamExt;
-use mongodb::bson::{doc, oid::ObjectId, Document};
+use serde_json::Value;
+use sqlx::{PgConnection, Postgres, QueryBuilder};
+use uuid::Uuid;
 
-use crate::{
-    security::{require_permission, ErrorResponse},
-    state::AppState,
-    utils::bson::read_string,
-};
+use crate::{security::require_sql_permission, state::AppState};
 
 use super::{
-    build_pipeline, build_public_products_filter, document_to_json, lookup_stage,
-    normalize_validation_config, product_item_from_doc, public_product_from_doc, status_message,
-    unavailable, unwind_stage, AdminProductsQuery,
+    mappers::{document, PRODUCT_SELECT},
+    payload::{
+        like_pattern, resolve_category_by_id, resolve_category_by_name, resolve_operator_by_id,
+        resolve_operator_by_name, resolve_product_type_by_id,
+    },
+    status_message, AdminProductsQuery,
 };
 
 pub async fn admin_all(
@@ -25,38 +26,46 @@ pub async fn admin_all(
     State(state): State<Arc<AppState>>,
     Query(query): Query<AdminProductsQuery>,
 ) -> Response {
-    if let Err(response) = require_permission(&headers, &state, "viewProducts").await {
+    if let Err(response) = require_sql_permission(&headers, &state, "viewProducts").await {
         return response;
     }
-
-    let Some(client) = &state.mongo_client else {
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                message: "MONGO_URI is not configured",
-            }),
-        )
-            .into_response();
-    };
-
-    let pipeline = build_pipeline(&query);
-    let inactive_operator_names = inactive_operator_names(client, &state.mongo_db).await;
-    let items = match client
-        .database(&state.mongo_db)
-        .collection::<Document>("products")
-        .aggregate(pipeline)
-        .await
-    {
-        Ok(cursor) => cursor
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|document| product_item_from_doc(document, &inactive_operator_names))
-            .collect(),
+    let mut builder = QueryBuilder::<Postgres>::new(PRODUCT_SELECT);
+    builder.push(" WHERE true");
+    let status = query.status.as_deref().map(str::trim).unwrap_or_default();
+    if !status.is_empty() && status != "all" {
+        builder.push(" AND p.status=").push_bind(status == "true" || status == "active");
+    }
+    if let Some(category) = trimmed(&query.category) {
+        builder.push(" AND p.category=").push_bind(category);
+    }
+    if let Some(id) = parse_uuid(query.category_id.as_deref()) {
+        builder.push(" AND p.category_id=").push_bind(id);
+    }
+    if let Some(id) = parse_uuid(query.operator_id.as_deref()) {
+        builder.push(" AND p.operator_id=").push_bind(id);
+    }
+    if let Some(id) = parse_uuid(query.product_type_id.as_deref()) {
+        builder.push(" AND p.product_type_id=").push_bind(id);
+    }
+    if let Some(brand) = trimmed(&query.brand) {
+        builder
+            .push(" AND lower(p.brand)=lower(")
+            .push_bind(brand)
+            .push(")");
+    }
+    if let Some(search) = trimmed(&query.search) {
+        let pattern = like_pattern(&search);
+        builder.push(" AND (p.name ILIKE ").push_bind(pattern.clone());
+        builder.push(" OR p.code ILIKE ").push_bind(pattern.clone());
+        builder.push(" OR p.brand ILIKE ").push_bind(pattern.clone());
+        builder.push(" OR p.vendor_sku ILIKE ").push_bind(pattern);
+        builder.push(")");
+    }
+    builder.push(" ORDER BY p.created_at DESC, p.id");
+    let items = match builder.build().fetch_all(&state.pg_pool).await {
+        Ok(rows) => rows.iter().map(|row| document(row, true, true)).collect(),
         Err(_) => Vec::new(),
     };
-
     Json(items).into_response()
 }
 
@@ -64,116 +73,187 @@ pub async fn public_list(
     State(state): State<Arc<AppState>>,
     Query(query): Query<AdminProductsQuery>,
 ) -> Response {
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
+    let mut conn = match state.pg_pool.acquire().await {
+        Ok(conn) => conn,
+        Err(_) => return unavailable(),
     };
-    let db = client.database(&state.mongo_db);
-    let filter = build_public_products_filter(&db, &query).await;
-    let inactive_category_ids = inactive_ids(&db, "categories").await;
-    let inactive_operator_ids = inactive_ids(&db, "operators").await;
-    let inactive_operator_names = inactive_operator_names(client, &state.mongo_db).await;
-    let inactive_product_type_ids = inactive_ids(&db, "producttypes").await;
-    let mut pipeline = Vec::new();
-    if !filter.is_empty() {
-        pipeline.push(doc! { "$match": filter });
+    match public_products(&mut conn, &query).await {
+        Ok(products) => Json(products).into_response(),
+        Err(_) => unavailable(),
     }
-    pipeline.extend([
-        lookup_stage("categories", "categoryId", "categoryData"),
-        unwind_stage("$categoryData"),
-        lookup_stage("operators", "operatorId", "operatorData"),
-        unwind_stage("$operatorData"),
-        lookup_stage("producttypes", "productTypeId", "productTypeData"),
-        unwind_stage("$productTypeData"),
-        doc! { "$sort": { "sortOrder": 1, "createdAt": 1 } },
-    ]);
-
-    let products = match db
-        .collection::<Document>("products")
-        .aggregate(pipeline)
-        .await
-    {
-        Ok(cursor) => cursor
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|document| {
-                public_product_from_doc(
-                    document,
-                    &inactive_category_ids,
-                    &inactive_operator_ids,
-                    &inactive_operator_names,
-                    &inactive_product_type_ids,
-                )
-            })
-            .collect::<Vec<_>>(),
-        Err(_) => Vec::new(),
-    };
-    Json(products).into_response()
 }
 
 pub async fn public_detail(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
+    let Some(id) = parse_uuid(Some(id.trim())) else {
+        return status_message(StatusCode::NOT_FOUND, "Product not found");
     };
-    let Ok(object_id) = ObjectId::parse_str(id.trim()) else {
-        return status_message(axum::http::StatusCode::NOT_FOUND, "Product not found");
-    };
-
-    match client
-        .database(&state.mongo_db)
-        .collection::<Document>("products")
-        .find_one(doc! { "_id": object_id })
+    let sql = format!("{PRODUCT_SELECT} WHERE p.id=$1");
+    match sqlx::query(&sql)
+        .bind(id)
+        .fetch_optional(&state.pg_pool)
         .await
     {
-        Ok(Some(mut document)) => {
-            if !document.contains_key("sortOrder") {
-                document.insert("sortOrder", 0);
-            }
-            normalize_validation_config(&mut document);
-            Json(document_to_json(document)).into_response()
+        Ok(Some(row)) => {
+            let mut value = document(&row, false, false);
+            super::mappers::normalize_validation(&mut value);
+            Json(value).into_response()
         }
-        Ok(None) => status_message(axum::http::StatusCode::NOT_FOUND, "Product not found"),
-        Err(_) => status_message(
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal Server Error",
-        ),
+        Ok(None) => status_message(StatusCode::NOT_FOUND, "Product not found"),
+        Err(_) => status_message(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error"),
     }
 }
 
-async fn inactive_operator_names(client: &mongodb::Client, db_name: &str) -> Vec<String> {
-    match client
-        .database(db_name)
-        .collection::<Document>("operators")
-        .find(doc! { "status": false })
-        .await
-    {
-        Ok(cursor) => cursor
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|document| read_string(&document, "name").to_lowercase())
-            .filter(|value| !value.is_empty())
-            .collect(),
-        Err(_) => Vec::new(),
+async fn public_products(
+    conn: &mut PgConnection,
+    query: &AdminProductsQuery,
+) -> Result<Vec<Value>, sqlx::Error> {
+    let resolved_category = match parse_uuid(query.category_id.as_deref()) {
+        Some(id) => resolve_category_by_id(conn, id).await,
+        None => match trimmed(&query.category) {
+            Some(name) => resolve_category_by_name(conn, &name).await,
+            None => None,
+        },
+    };
+    let resolved_operator = match parse_uuid(query.operator_id.as_deref()) {
+        Some(id) => resolve_operator_by_id(conn, id).await,
+        None => match trimmed(&query.brand) {
+            Some(brand) => {
+                resolve_operator_by_name(conn, &brand, resolved_category.as_ref()).await
+            }
+            None => None,
+        },
+    };
+    let resolved_product_type = match parse_uuid(query.product_type_id.as_deref()) {
+        Some(id) => resolve_product_type_by_id(conn, id).await,
+        None => None,
+    };
+    let mut scoped_operator = resolved_operator.clone();
+    let mut scoped_category = resolved_category.clone();
+    if scoped_operator.is_none() {
+        if let Some(product_type) = &resolved_product_type {
+            scoped_operator = resolve_operator_by_id(conn, product_type.operator_id).await;
+        }
     }
+    if scoped_category.is_none() {
+        if let Some(product_type) = &resolved_product_type {
+            scoped_category = resolve_category_by_id(conn, product_type.category_id).await;
+        }
+    }
+    if scoped_category.is_none() {
+        if let Some(operator) = &scoped_operator {
+            scoped_category = resolve_category_by_id(conn, operator.category_id).await;
+        }
+    }
+
+    let mut builder = QueryBuilder::<Postgres>::new(PRODUCT_SELECT);
+    builder.push(" WHERE true");
+    match query.status.as_deref() {
+        None => { builder.push(" AND p.status"); }
+        Some("all") => {}
+        Some(value) => { builder.push(" AND p.status=").push_bind(value == "true"); }
+    }
+    if let Some(search) = trimmed(&query.search) {
+        let pattern = like_pattern(&search);
+        builder.push(" AND (p.name ILIKE ").push_bind(pattern.clone());
+        builder.push(" OR p.code ILIKE ").push_bind(pattern.clone());
+        builder.push(" OR p.brand ILIKE ").push_bind(pattern);
+        builder.push(")");
+    }
+
+    match (&resolved_product_type, &scoped_operator) {
+        (Some(product_type), Some(operator)) => {
+            let category_id = scoped_category.as_ref().map(|value| value.id);
+            let category_name = scoped_category.as_ref().map(|value| value.name.clone());
+            builder
+                .push(" AND (p.product_type_id=")
+                .push_bind(product_type.id);
+            builder
+                .push(")");
+            builder.push(" OR (p.product_type_id IS NULL AND lower(p.brand)=lower(");
+            builder.push_bind(operator.name.clone());
+            builder.push(")");
+            push_legacy_category_clause(&mut builder, category_id, category_name);
+            builder.push("))");
+        }
+        (None, Some(operator)) => {
+            let category_id = scoped_category
+                .as_ref()
+                .map(|value| value.id)
+                .unwrap_or(operator.category_id);
+            let category_name = scoped_category.as_ref().map(|value| value.name.clone());
+            builder
+                .push(" AND (p.operator_id=")
+                .push_bind(operator.id)
+                .push(" OR (lower(p.brand)=lower(");
+            builder.push_bind(operator.name.clone());
+            builder.push(") AND p.operator_id IS NULL");
+            push_legacy_category_clause(&mut builder, Some(category_id), category_name);
+            builder.push("))");
+        }
+        _ => {
+            if scoped_operator.is_none() {
+                let category_id = resolved_category
+                    .as_ref()
+                    .map(|value| value.id)
+                    .or_else(|| parse_uuid(query.category_id.as_deref()));
+                let category_name = resolved_category
+                    .as_ref()
+                    .map(|value| value.name.clone())
+                    .or_else(|| trimmed(&query.category));
+                if category_id.is_some() || category_name.is_some() {
+                    builder.push(" AND (");
+                    push_legacy_category_clause(
+                        &mut builder,
+                        category_id,
+                        category_name.clone(),
+                    );
+                    builder.push(")");
+                }
+            }
+        }
+    }
+    builder.push(" ORDER BY p.sort_order, p.created_at, p.id");
+    let rows = builder.build().fetch_all(conn).await?;
+    Ok(rows.iter().map(|row| document(row, true, true)).collect())
 }
 
-async fn inactive_ids(db: &mongodb::Database, collection: &str) -> Vec<String> {
-    match db
-        .collection::<Document>(collection)
-        .find(doc! { "status": false })
-        .projection(doc! { "_id": 1 })
-        .await
-    {
-        Ok(cursor) => cursor
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|document| document.get_object_id("_id").ok().map(|id| id.to_hex()))
-            .collect(),
-        Err(_) => Vec::new(),
+/// `(p.category_id=$n OR lower(p.category)=lower($m))`, matching the legacy name-or-id filter.
+fn push_legacy_category_clause(
+    builder: &mut QueryBuilder<'_, Postgres>,
+    category_id: Option<Uuid>,
+    category_name: Option<String>,
+) {
+    if category_id.is_none() && category_name.is_none() {
+        return;
     }
+    builder.push(" AND (");
+    if let Some(id) = category_id {
+        builder.push("p.category_id=").push_bind(id);
+        if category_name.is_some() {
+            builder.push(" OR ");
+        }
+    }
+    if let Some(name) = category_name {
+        builder.push("lower(p.category)=lower(").push_bind(name).push(")");
+    }
+    builder.push(")");
+}
+
+fn trimmed(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+pub(super) fn parse_uuid(value: Option<&str>) -> Option<Uuid> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| Uuid::parse_str(value).ok())
+}
+
+fn unavailable() -> Response {
+    status_message(StatusCode::SERVICE_UNAVAILABLE, "Layanan database belum tersedia")
 }

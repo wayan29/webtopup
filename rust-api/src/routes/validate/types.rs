@@ -1,6 +1,5 @@
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
 
 #[derive(Deserialize)]
 pub struct OperatorValidationPayload {
@@ -22,7 +21,7 @@ pub struct MobileLegendsValidationPayload {
     pub zone_id: Option<String>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ValidationResponse {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -30,7 +29,7 @@ pub struct ValidationResponse {
     pub message: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct GameValidationResponse {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -38,7 +37,7 @@ pub struct GameValidationResponse {
     pub message: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct GameValidationData {
     #[serde(rename = "userId")]
     pub user_id: String,
@@ -47,18 +46,18 @@ pub struct GameValidationData {
     pub nickname: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OperatorValidationData {
     #[serde(rename = "phoneNumber")]
     pub phone_number: String,
     #[serde(rename = "originalNumber")]
     pub original_number: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub operator: Option<&'static str>,
+    pub operator: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub color: Option<&'static str>,
+    pub color: Option<String>,
 }
 
 pub struct OperatorInfo {
@@ -69,14 +68,12 @@ pub struct OperatorInfo {
 
 #[derive(Clone)]
 pub struct CachedValidation {
-    pub expires_at: Instant,
     pub status: StatusCode,
     pub payload: ValidationResponse,
 }
 
 #[derive(Clone)]
 pub struct CachedGameValidation {
-    pub expires_at: Instant,
     pub status: StatusCode,
     pub payload: GameValidationResponse,
 }

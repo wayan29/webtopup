@@ -1,51 +1,28 @@
-use futures_util::TryStreamExt;
-use mongodb::bson::{doc, Bson, Document};
 use serde_json::{json, Map, Value};
+use sqlx::{PgPool, Row};
 
-pub(super) async fn deposit_settings(db: &mongodb::Database) -> Map<String, Value> {
+pub(super) async fn deposit_settings(pool: &PgPool) -> Map<String, Value> {
     let mut settings = Map::from_iter([
         ("maintenanceMode".to_string(), json!(false)),
-        (
-            "maintenanceMessage".to_string(),
-            json!("Sistem sedang dalam pemeliharaan. Silakan coba beberapa saat lagi."),
-        ),
+        ("maintenanceMessage".to_string(), json!("Sistem sedang dalam pemeliharaan. Silakan coba beberapa saat lagi.")),
         ("minDeposit".to_string(), json!(10_000)),
         ("maxDeposit".to_string(), json!(10_000_000)),
         ("depositFee".to_string(), json!(0)),
         ("depositFeeType".to_string(), json!("fixed")),
     ]);
-    let keys = settings
-        .keys()
-        .map(|key| Bson::String(key.clone()))
-        .collect::<Vec<_>>();
-    let docs = match db
-        .collection::<Document>("settings")
-        .find(doc! { "key": { "$in": keys } })
-        .await
-    {
-        Ok(cursor) => cursor.try_collect::<Vec<_>>().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
-    };
-    for doc in docs {
-        if let Ok(key) = doc.get_str("key") {
-            if settings.contains_key(key) {
-                settings.insert(key.to_string(), bson_to_json(doc.get("value")));
+    let keys = settings.keys().cloned().collect::<Vec<_>>();
+    if let Ok(rows) = sqlx::query("SELECT key,value FROM site_settings WHERE key=ANY($1)")
+        .bind(&keys).fetch_all(pool).await {
+        for row in rows {
+            let key: String = row.get("key");
+            if settings.contains_key(&key) {
+                if let Ok(value) = row.try_get::<Value, _>("value") { settings.insert(key, value); }
             }
         }
     }
     settings
 }
 
-fn bson_to_json(value: Option<&Bson>) -> Value {
-    match value {
-        Some(Bson::Boolean(value)) => json!(*value),
-        Some(Bson::Int32(value)) => json!(*value),
-        Some(Bson::Int64(value)) => json!(*value),
-        Some(Bson::Double(value)) => json!(*value),
-        Some(Bson::String(value)) => json!(value),
-        _ => Value::Null,
-    }
-}
 
 pub(super) fn setting_bool(settings: &Map<String, Value>, key: &str, fallback: bool) -> bool {
     settings

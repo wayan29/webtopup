@@ -24,7 +24,7 @@ pub(super) fn unavailable() -> axum::response::Response {
     (
         axum::http::StatusCode::SERVICE_UNAVAILABLE,
         Json(ErrorResponse {
-            message: "MONGO_URI is not configured",
+            message: "Database unavailable",
         }),
     )
         .into_response()

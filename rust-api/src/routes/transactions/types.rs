@@ -1,4 +1,3 @@
-use mongodb::bson::{oid::ObjectId, DateTime};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -188,23 +187,6 @@ pub(crate) struct RecheckProduct {
     pub(crate) vendor_sku: String,
 }
 
-pub(super) struct FlashSaleReservation {
-    pub(super) flash_sale_id: ObjectId,
-    pub(super) product_id: ObjectId,
-    pub(super) price: i64,
-}
-
-pub(super) struct TransactionRefundSnapshot {
-    pub(super) status: String,
-    pub(super) updated_at: DateTime,
-    pub(super) refunded: bool,
-    pub(super) refunded_by: Option<ObjectId>,
-    pub(super) refunded_at: Option<DateTime>,
-    pub(super) refund_reason: Option<String>,
-    pub(super) status_updated_by: Option<ObjectId>,
-    pub(super) status_updated_at: Option<DateTime>,
-    pub(super) status_update_note: Option<String>,
-}
 
 pub(super) struct StatusPayload {
     pub(super) status: String,
@@ -218,17 +200,6 @@ pub(super) struct TransitionPlan {
     pub(super) should_award_points: bool,
     pub(super) should_revoke_points: bool,
     pub(super) next_refunded: bool,
-}
-
-pub(super) struct TransactionStatusSnapshot {
-    pub(super) status: String,
-    pub(super) updated_at: DateTime,
-    pub(super) refunded: bool,
-    pub(super) vendor_trx_id: Option<String>,
-    pub(super) sn: Option<String>,
-    pub(super) status_updated_by: Option<ObjectId>,
-    pub(super) status_updated_at: Option<DateTime>,
-    pub(super) status_update_note: Option<String>,
 }
 
 #[derive(Deserialize)]

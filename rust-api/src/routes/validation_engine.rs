@@ -1,7 +1,3 @@
-use mongodb::bson::Document;
-
-use crate::utils::bson::read_string;
-
 use super::validate::{
     normalize::{normalize_digit_input, normalize_phone_input},
     operators::operators,
@@ -30,34 +26,15 @@ pub(in crate::routes) struct PaidValidationResult {
     pub(in crate::routes) sn: Option<String>,
 }
 
-pub(in crate::routes) fn product_validation_config(
-    product: &Document,
-) -> Option<PaidValidationConfig> {
-    let validation = product.get_document("validation").ok()?;
-    if !validation.get_bool("enabled").unwrap_or(false) {
-        return None;
-    }
-    let validation_type = read_string(validation, "type");
-    if !matches!(validation_type.as_str(), "nickname" | "operator") {
-        return None;
-    }
-    let game = read_string(validation, "game");
-    if validation_type == "nickname" && !matches!(game.as_str(), "freefire" | "mobilelegends") {
-        return None;
-    }
-    if validation_type == "operator" && !game.is_empty() {
-        return None;
-    }
-    let result_label = read_string(validation, "resultLabel");
-    Some(PaidValidationConfig {
-        validation_type,
-        game,
-        result_label: if result_label.is_empty() {
-            "Hasil".to_string()
-        } else {
-            result_label
-        },
-    })
+pub(in crate::routes) fn product_validation_config_json(product: &serde_json::Value) -> Option<PaidValidationConfig> {
+    let validation=product.get("validation")?;
+    if !validation.get("enabled")?.as_bool()? { return None; }
+    let validation_type=validation.get("type")?.as_str()?.to_owned();
+    if !matches!(validation_type.as_str(),"nickname"|"operator") { return None; }
+    let game=validation.get("game").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned();
+    if (validation_type=="nickname"&&!matches!(game.as_str(),"freefire"|"mobilelegends"))||(validation_type=="operator"&&!game.is_empty()){return None}
+    let result_label=validation.get("resultLabel").and_then(serde_json::Value::as_str).filter(|s|!s.is_empty()).unwrap_or("Hasil").to_owned();
+    Some(PaidValidationConfig{validation_type,game,result_label})
 }
 
 pub(in crate::routes) async fn run_paid_validation(

@@ -237,12 +237,3 @@ pub(super) struct PointsHistoryResponse {
     pub(super) meta: PointsHistoryMeta,
 }
 
-pub(super) struct NormalizedRewardPayload {
-    pub(super) name: String,
-    pub(super) description: String,
-    pub(super) points_required: i64,
-    pub(super) stock: i64,
-    pub(super) image_url: String,
-    pub(super) category: String,
-    pub(super) status: bool,
-}

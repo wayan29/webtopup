@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
@@ -6,66 +6,23 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use chrono::Datelike;
-use futures_util::TryStreamExt;
-use mongodb::{
-    bson::{doc, oid::ObjectId, Bson, DateTime, Document},
-    options::{ReturnDocument, UpdateModifications},
-};
-use serde_json::{Map, Value};
+use serde_json::Value;
+use sqlx::Row;
 
 use crate::{
     routes::auth::require_trusted_step_up_group,
-    security::{require_member_user, require_permission, ErrorResponse},
-    services::{
-        bot_protection::{
-            cloudflare_turnstile_verifier, enforce_turnstile, kill_switch_enabled,
-            load_bot_protection_settings,
-        },
-        identifier_integrity::{
-            allocate_reference_in_session, load_reference_format, require_identifier_indexes,
-            MAX_REFERENCE_ALLOCATION_ATTEMPTS, ReferenceError,
-        },
-        idempotency::{
-            self, commit_mongo_transaction_with_unknown_retry, effect_marker_matches_identity,
-            effect_slot_capacity_response, find_balance_effect_by_identity,
-            is_effect_slot_capacity_rejection, mark_effect_resolved_update,
-            prune_resolved_effect_slots_pipeline, refund_credit_filter, refund_credit_pipeline,
-            CompletedSnapshot, DomainMarkerRecovery, DomainRecovery, EffectIdentity,
-            IdempotencyBegin, IdempotencyStore, MongoIdempotencyStore, TransactionCommitOutcome,
-            REFUND_PHASE_AUDITED, REFUND_PHASE_CLAIMED, REFUND_PHASE_CREDITED,
-            ROUTE_TRANSACTION_REFUND,
-        },
-    },
+    security::{require_permission, require_sql_permission, require_sql_user, ErrorResponse},
+    services::{bot_protection::{cloudflare_turnstile_verifier, enforce_turnstile, kill_switch_enabled}, idempotency},
     state::AppState,
-    utils::bson::{escape_regex, read_i64, read_string},
 };
 
 mod csv;
-mod json;
 mod list;
 pub(crate) mod provider;
-mod status;
-mod stuck;
 pub(crate) mod types;
 
-use super::validation_engine::{
-    product_validation_config, run_paid_validation, PaidValidationStatus,
-};
 use csv::build_transaction_csv;
-use json::{bson_to_json, document_to_json, document_to_map};
-use list::{
-    build_transactions_pipeline, document_array, first_array_item, first_document, lookup_stage,
-    unwind_stage,
-};
-use provider::{check_vendor_status, top_up_vendor};
-use status::{
-    apply_optional_payload_string, apply_transition_plan, apply_user_balance_delta, award_points,
-    insert_optional_datetime_or_unset, insert_optional_object_id_or_unset,
-    insert_optional_string_or_unset, revoke_awarded_points, rollback_transaction_status,
-    transaction_status_snapshot,
-};
-use stuck::stuck_transaction_item_from_doc;
+use list::sql_transaction_items;
 use types::*;
 
 const DEFAULT_THRESHOLD_MINUTES: i64 = 15;
@@ -86,417 +43,162 @@ pub async fn stuck_transactions(
         return response;
     }
 
-    let Some(client) = &state.mongo_client else {
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                message: "MONGO_URI is not configured",
-            }),
-        )
-            .into_response();
-    };
-
     let threshold_minutes = parse_positive_i64(
         query.threshold_minutes.as_deref(),
         DEFAULT_THRESHOLD_MINUTES,
         MAX_THRESHOLD_MINUTES,
     );
     let limit = parse_positive_i64(query.limit.as_deref(), DEFAULT_LIMIT, MAX_LIMIT);
-    let cutoff_ms = DateTime::now().timestamp_millis() - (threshold_minutes * 60 * 1000);
-    let cutoff = DateTime::from_millis(cutoff_ms);
-    let filter = doc! {
-        "status": { "$in": ["pending", "processing"] },
-        "updatedAt": { "$lte": cutoff }
-    };
-
-    let collection = client
-        .database(&state.mongo_db)
-        .collection::<Document>("transactions");
-    let items = match collection
-        .aggregate(vec![
-            doc! { "$match": filter.clone() },
-            doc! { "$sort": { "updatedAt": 1 } },
-            doc! { "$limit": limit },
-            doc! {
-                "$lookup": {
-                    "from": "users",
-                    "localField": "user",
-                    "foreignField": "_id",
-                    "as": "user"
-                }
-            },
-            doc! { "$unwind": { "path": "$user", "preserveNullAndEmptyArrays": true } },
-            doc! {
-                "$lookup": {
-                    "from": "products",
-                    "localField": "product",
-                    "foreignField": "_id",
-                    "as": "product"
-                }
-            },
-            doc! { "$unwind": { "path": "$product", "preserveNullAndEmptyArrays": true } },
-        ])
-        .await
+    let cutoff = chrono::Utc::now()
+        - chrono::Duration::minutes(threshold_minutes);
+    let rows = match sqlx::query(
+        "SELECT t.id,t.target,t.status,t.amount,t.reference_id,t.source,t.snapshot,t.created_at,t.updated_at,\
+         u.id AS user_id,COALESCE(u.name,'') AS user_name,COALESCE(u.email,'') AS user_email,\
+         p.id AS product_id,COALESCE(p.name,'') AS product_name,COALESCE(p.code,'') AS product_code,\
+         COALESCE(p.category,'') AS product_category,COALESCE(p.brand,'') AS product_brand,COALESCE(p.vendor_name,'') AS product_vendor \
+         FROM financial_transactions t LEFT JOIN users u ON u.id=t.user_id \
+         LEFT JOIN products p ON p.id=t.product_id \
+         WHERE t.kind='member' AND t.status IN ('pending','processing') AND t.updated_at <= $1 \
+         ORDER BY t.updated_at ASC LIMIT $2",
+    )
+    .bind(cutoff)
+    .bind(limit)
+    .fetch_all(&state.pg_pool)
+    .await
     {
-        Ok(cursor) => cursor.try_collect::<Vec<_>>().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
-    }
-    .into_iter()
-    .map(|document| stuck_transaction_item_from_doc(document, cutoff_ms, threshold_minutes))
-    .collect::<Vec<_>>();
-    let total = collection.count_documents(filter).await.unwrap_or(0);
-
+        Ok(rows) => rows,
+        Err(_) => return internal_error(),
+    };
+    let total = match sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM financial_transactions WHERE kind='member' AND status IN ('pending','processing') AND updated_at <= $1",
+    )
+    .bind(cutoff)
+    .fetch_one(&state.pg_pool)
+    .await
+    {
+        Ok(total) => total,
+        Err(_) => return internal_error(),
+    };
+    let items = rows.into_iter().map(|row| {
+        let updated_at = row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at");
+        let created_at = row.get::<chrono::DateTime<chrono::Utc>, _>("created_at");
+        let snapshot = row.get::<serde_json::Value, _>("snapshot");
+        let user_id = row.try_get::<Option<uuid::Uuid>, _>("user_id").ok().flatten();
+        let product_id = row.try_get::<Option<uuid::Uuid>, _>("product_id").ok().flatten();
+        StuckTransactionItem {
+            id: row.get::<uuid::Uuid, _>("id").to_string(), target: row.get("target"),
+            status: row.get("status"), amount: row.get("amount"), reference_id: row.get("reference_id"),
+            vendor_trx_id: snapshot.get("vendorTrxId").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(),
+            customer_ref_id: snapshot.get("customerRefId").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(),
+            source: row.get("source"), created_at: created_at.to_rfc3339(), updated_at: updated_at.to_rfc3339(),
+            age_minutes: (chrono::Utc::now() - updated_at).num_minutes(),
+            user: user_id.map(|id| StuckTransactionUser { id: id.to_string(), name: row.get("user_name"), email: row.get("user_email") }),
+            product: product_id.map(|id| StuckTransactionProduct { id: id.to_string(), name: row.get("product_name"), code: row.get("product_code"), category: row.get("product_category"), brand: row.get("product_brand"), vendor: row.get("product_vendor") }),
+        }
+    }).collect::<Vec<_>>();
     Json(StuckTransactionsResponse {
         threshold_minutes,
-        total,
+        total: total.max(0) as u64,
         items,
     })
     .into_response()
 }
-
 pub async fn create_transaction(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<CreateTransactionPayload>,
 ) -> Response {
-    let proxy_user = match require_member_user(&headers, &state).await {
-        Ok(user) => user,
+    let context = match crate::security::require_proxy_context(&headers, &state) {
+        Ok(context) => context,
         Err(response) => return response,
     };
-    let user_id = proxy_user.id;
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
+    let Some(user_id) = context.user_id.as_deref().and_then(|value| uuid::Uuid::parse_str(value).ok()) else {
+        return status_message(StatusCode::UNAUTHORIZED, "Unauthorized: Invalid token");
     };
     let target = normalize_payload_text(payload.target.as_deref());
-    if target.is_empty() {
-        return status_message(StatusCode::BAD_REQUEST, "Target wajib diisi");
-    }
+    if target.is_empty() { return status_message(StatusCode::BAD_REQUEST, "Target wajib diisi"); }
     let server_id = normalize_payload_text(payload.server_id.as_deref());
-
-    let db = client.database(&state.mongo_db);
-    if let Some(message) = active_maintenance_message(&db).await {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "message": message })),
-        )
-            .into_response();
+    let maintenance=match sqlx::query_scalar::<_,bool>("SELECT COALESCE((value #>> '{}')::boolean,false) FROM site_settings WHERE key='maintenanceMode'").fetch_optional(&state.pg_pool).await {Ok(value)=>value,Err(_)=>return internal_error()};
+    if maintenance==Some(true) {
+        let message=sqlx::query_scalar::<_,String>("SELECT COALESCE(value #>> '{}','Sistem sedang dalam pemeliharaan. Silakan coba beberapa saat lagi.') FROM site_settings WHERE key='maintenanceMessage'").fetch_optional(&state.pg_pool).await.ok().flatten().unwrap_or_else(||"Sistem sedang dalam pemeliharaan. Silakan coba beberapa saat lagi.".to_owned());
+        return (StatusCode::SERVICE_UNAVAILABLE,Json(serde_json::json!({"message":message}))).into_response();
     }
-
-    let (stored_enabled, site_key) = load_bot_protection_settings(&db).await;
+    let settings = match sqlx::query("SELECT key,value FROM site_settings WHERE key IN ('botProtectionEnabled','turnstileSiteKey')").fetch_all(&state.pg_pool).await { Ok(rows)=>rows,Err(_)=>return internal_error() };
+    let stored_enabled=settings.iter().find(|row|row.get::<String,_>("key")=="botProtectionEnabled").and_then(|row|row.get::<serde_json::Value,_>("value").as_bool()).unwrap_or(false);
+    let site_key=settings.iter().find(|row|row.get::<String,_>("key")=="turnstileSiteKey").and_then(|row|row.get::<serde_json::Value,_>("value").as_str().map(str::to_owned)).unwrap_or_default();
     let secret = std::env::var("TURNSTILE_SECRET_KEY").unwrap_or_default();
     let kill_switch = kill_switch_enabled(std::env::var("TURNSTILE_DISABLED").ok().as_deref());
-    let remote_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("unknown");
-    if let Err(response) = enforce_turnstile(
-        stored_enabled,
-        &site_key,
-        &secret,
-        kill_switch,
-        payload.turnstile_token.as_deref(),
-        Some(remote_ip),
-        cloudflare_turnstile_verifier(),
-    )
-    .await
-    {
-        return response;
-    }
+    let remote_ip = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()).and_then(|v| v.split(',').next()).map(str::trim).filter(|v| !v.is_empty()).unwrap_or("unknown");
+    if let Err(response) = enforce_turnstile(stored_enabled, &site_key, &secret, kill_switch, payload.turnstile_token.as_deref(), Some(remote_ip), cloudflare_turnstile_verifier()).await { return response; }
 
-    let products = db.collection::<Document>("products");
-    let product_filter = if let Some(product_id) = payload
-        .product_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let Ok(product_id) = ObjectId::parse_str(product_id) else {
-            return status_message(StatusCode::NOT_FOUND, "Product not found");
-        };
-        doc! { "_id": product_id }
-    } else if let Some(product_code) = payload
-        .product_code
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        doc! { "code": product_code }
-    } else {
-        return status_message(StatusCode::NOT_FOUND, "Product not found");
+    let product_id_filter=match payload.product_id.as_deref().map(str::trim).filter(|value|!value.is_empty()) {Some(value)=>match uuid::Uuid::parse_str(value){Ok(id)=>Some(id),Err(_)=>return status_message(StatusCode::NOT_FOUND,"Product not found")},None=>None};
+    let product_code_filter=payload.product_code.as_deref().map(str::trim).filter(|value|!value.is_empty());
+    if product_id_filter.is_none()&&product_code_filter.is_none(){return status_message(StatusCode::NOT_FOUND,"Product not found")}
+    let product = match sqlx::query("SELECT p.id,p.code,p.name,p.price_basic,p.price_gold,p.price_platinum,p.category_id,p.operator_id,p.product_type_id,p.category,p.brand,p.vendor_name,p.vendor_sku,p.validation,c.status category_status,c.is_active category_active,o.status operator_status,t.status type_status FROM products p LEFT JOIN categories c ON c.id=p.category_id LEFT JOIN operators o ON o.id=p.operator_id LEFT JOIN product_types t ON t.id=p.product_type_id WHERE p.status=true AND (($1::uuid IS NOT NULL AND p.id=$1) OR ($1::uuid IS NULL AND p.code=$2))")
+        .bind(product_id_filter).bind(product_code_filter).fetch_optional(&state.pg_pool).await {
+        Ok(Some(row)) => row, Ok(None) => return status_message(StatusCode::NOT_FOUND,"Product not found"), Err(_) => return internal_error()
     };
-    let Some(product) = (match products.find_one(product_filter).await {
-        Ok(value) => value,
-        Err(_) => return internal_error(),
-    }) else {
-        return status_message(StatusCode::NOT_FOUND, "Product not found");
-    };
-    if product.get_bool("status").ok() == Some(false) {
-        return status_message(StatusCode::BAD_REQUEST, "Product is unavailable");
+    if product.try_get::<Option<bool>,_>("category_status").ok().flatten()==Some(false) || product.try_get::<Option<bool>,_>("category_active").ok().flatten()==Some(false) || product.try_get::<Option<bool>,_>("operator_status").ok().flatten()==Some(false) || product.try_get::<Option<bool>,_>("type_status").ok().flatten()==Some(false) {
+        return (StatusCode::BAD_REQUEST,Json(serde_json::json!({"message":"Produk tidak tersedia untuk dibeli: Kategori/operator/jenis produk nonaktif"}))).into_response();
     }
-    let purchase_issues = product_purchase_issues(&db, &product).await;
-    if !purchase_issues.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "message": format!("Produk tidak tersedia untuk dibeli: {}", purchase_issues.join(", "))
-            })),
-        )
-            .into_response();
+    let product_id = product.get::<uuid::Uuid,_>("id"); let code=product.get::<String,_>("code");
+    let product_name=product.get::<String,_>("name"); let vendor_name=product.get::<String,_>("vendor_name"); let vendor_sku=product.get::<String,_>("vendor_sku");
+    let level = match sqlx::query_scalar::<_,String>("SELECT level FROM users WHERE id=$1 AND role='member' AND active=true").bind(user_id).fetch_optional(&state.pg_pool).await { Ok(Some(level))=>level,Ok(None)=>return status_message(StatusCode::NOT_FOUND,"User not found"),Err(_)=>return internal_error() };
+    let base_price = match level.as_str(){"gold"=>product.get("price_gold"),"platinum"=>product.get("price_platinum"),_=>product.get("price_basic")};
+    if base_price<=0 { return status_message(StatusCode::BAD_REQUEST,"Product not found or unavailable"); }
+    let category_id=product.try_get("category_id").ok(); let operator_id=product.try_get("operator_id").ok();
+    let product_ctx=crate::routes::vouchers::DiscountProductContext{product_id:Some(product_id),category_id,operator_id};
+    let mut tx=match state.pg_pool.begin().await {Ok(tx)=>tx,Err(_)=>return internal_error()};
+    let balance=match sqlx::query_scalar::<_,i64>("SELECT balance FROM users WHERE id=$1 AND role='member' AND active=true FOR UPDATE").bind(user_id).fetch_optional(&mut *tx).await {Ok(Some(v))=>v,Ok(None)=>return status_message(StatusCode::NOT_FOUND,"User not found"),Err(_)=>return internal_error()};
+    let idem_key=headers.get("idempotency-key").and_then(|v|v.to_str().ok()).map(str::trim).filter(|v|!v.is_empty()).map(str::to_owned);
+    let request_digest=format!("{:x}",md5::compute(format!("{}\0{}\0{}\0{}\0{}\0{}",payload.product_id.as_deref().unwrap_or(""),payload.product_code.as_deref().unwrap_or(""),target,server_id,payload.voucher_code.as_deref().unwrap_or(""),payload.use_flash_sale.unwrap_or(false))));
+    if let Some(key)=idem_key.as_deref() {
+        let existing=match sqlx::query("SELECT digest,response,response_status FROM financial_requests WHERE actor=$1 AND operation='member-checkout' AND key=$2 FOR UPDATE").bind(user_id.to_string()).bind(key).fetch_optional(&mut *tx).await {Ok(value)=>value,Err(_)=>return internal_error()};
+        if let Some(row)=existing { if row.get::<String,_>("digest")!=request_digest {return status_message(StatusCode::CONFLICT,"Idempotency key reused with different request");} if let Some(body)=row.get::<Option<serde_json::Value>,_>("response") { return (StatusCode::from_u16(row.get::<Option<i32>,_>("response_status").unwrap_or(201) as u16).unwrap_or(StatusCode::CREATED),Json(body)).into_response(); } return status_message(StatusCode::CONFLICT,"Transaction is being processed"); }
+        if sqlx::query("INSERT INTO financial_requests(actor,operation,key,digest) VALUES($1,'member-checkout',$2,$3)").bind(user_id.to_string()).bind(key).bind(&request_digest).execute(&mut *tx).await.is_err(){return internal_error();}
     }
-
-    let users = db.collection::<Document>("users");
-    let transactions = db.collection::<Document>("transactions");
-    let Some(user) = (match users.find_one(doc! { "_id": user_id }).await {
-        Ok(value) => value,
-        Err(_) => return internal_error(),
-    }) else {
-        return status_message(StatusCode::NOT_FOUND, "User not found");
-    };
-    let user_level = non_empty_or(read_string(&user, "level"), "basic");
-    let base_price = product_price_for_level(&product, &user_level);
-    let mut price = base_price;
-    let mut flash_sale_reservation = None;
-    let mut applied_discount = None;
-
-    if payload.use_flash_sale.unwrap_or(false) {
-        if let Some(reservation) =
-            reserve_flash_sale_stock(&db, product.get_object_id("_id").ok(), base_price).await
-        {
-            price = reservation.price;
-            flash_sale_reservation = Some(reservation);
-        }
-    }
-
-    // Optional checkout discount voucher (after flash sale so min-purchase uses discounted base).
-    let voucher_code = payload
-        .voucher_code
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_uppercase());
-    if let Some(code) = voucher_code {
-        let vouchers = db.collection::<Document>("vouchers");
-        let product_ctx = crate::routes::vouchers::DiscountProductContext {
-            product_id: product.get_object_id("_id").ok(),
-            category_id: product.get_object_id("categoryId").ok(),
-            operator_id: product.get_object_id("operatorId").ok(),
-        };
-        match crate::routes::vouchers::consume_discount_voucher(
-            &vouchers,
-            &code,
-            price,
-            Some(user_id),
-            &product_ctx,
-        )
-        .await
-        {
-            Ok(applied) => {
-                price = applied.final_price;
-                applied_discount = Some(applied);
-            }
-            Err(response) => {
-                rollback_flash_sale_stock(&db, flash_sale_reservation.as_ref()).await;
-                return response;
-            }
-        }
-    }
-
-    let updated_user = users
-        .find_one_and_update(
-            doc! { "_id": user_id, "balance": { "$gte": price } },
-            doc! { "$inc": { "balance": -price }, "$set": { "updatedAt": DateTime::now() } },
-        )
-        .return_document(ReturnDocument::After)
-        .await;
-    let Some(updated_user) = (match updated_user {
-        Ok(value) => value,
-        Err(_) => {
-            rollback_flash_sale_stock(&db, flash_sale_reservation.as_ref()).await;
-            if let Some(applied) = applied_discount.as_ref() {
-                let vouchers = db.collection::<Document>("vouchers");
-                crate::routes::vouchers::release_discount_slot(&vouchers, applied, Some(user_id)).await;
-            }
-            return internal_error();
-        }
-    }) else {
-        rollback_flash_sale_stock(&db, flash_sale_reservation.as_ref()).await;
-        if let Some(applied) = applied_discount.as_ref() {
-            let vouchers = db.collection::<Document>("vouchers");
-            crate::routes::vouchers::release_discount_slot(&vouchers, applied, Some(user_id)).await;
-        }
-        return status_message(StatusCode::BAD_REQUEST, "Insufficient balance");
-    };
-
-    let compensate = || async {
-        rollback_flash_sale_stock(&db, flash_sale_reservation.as_ref()).await;
-        if let Some(applied) = applied_discount.as_ref() {
-            let vouchers = db.collection::<Document>("vouchers");
-            crate::routes::vouchers::release_discount_slot(&vouchers, applied, Some(user_id)).await;
-        }
-        let _ = apply_user_balance_delta(&users, user_id, price).await;
-    };
-
-    if !state.mongo_transactions_enabled {
-        compensate().await;
-        return identifier_transactions_unavailable();
-    }
-    if require_identifier_indexes(&db).await.is_err() {
-        compensate().await;
-        return identifier_index_unavailable();
-    }
-
-    let format = load_reference_format(&db).await;
-    let now = DateTime::now();
-    let product_id = product
-        .get_object_id("_id")
-        .unwrap_or_else(|_| ObjectId::new());
-    let mut transaction_id = ObjectId::new();
-    let mut ref_id = String::new();
-    let mut allocated_ok = false;
-    for attempt in 0..MAX_REFERENCE_ALLOCATION_ATTEMPTS {
-        transaction_id = ObjectId::new();
-        let mut session = match client.start_session().await {
-            Ok(session) => session,
-            Err(_) => {
-                compensate().await;
-                return internal_error();
-            }
-        };
-        if session.start_transaction().await.is_err() {
-            compensate().await;
-            return identifier_transactions_unavailable();
-        }
-
-        let allocated = match allocate_reference_in_session(&db, &mut session, &format).await {
-            Ok(value) => value,
-            Err(ReferenceError::SequenceExhausted) => {
-                let _ = session.abort_transaction().await;
-                compensate().await;
-                return ref_id_sequence_exhausted();
-            }
-            Err(ReferenceError::TransientConflict) if attempt + 1 < MAX_REFERENCE_ALLOCATION_ATTEMPTS => {
-                let _ = session.abort_transaction().await;
-                continue;
-            }
-            Err(_) => {
-                let _ = session.abort_transaction().await;
-                compensate().await;
-                return internal_error();
-            }
-        };
-        ref_id = allocated.reference_id.clone();
-
-        let mut transaction_doc = doc! {
-            "_id": transaction_id,
-            "user": user_id,
-            "product": product_id,
-            "target": &target,
-            "amount": price,
-            "status": "pending",
-            "referenceId": &ref_id,
-            "refunded": false,
-            "source": "web",
-            "createdAt": now,
-            "updatedAt": now,
-            "__v": 0,
-        };
-        if !server_id.is_empty() {
-            transaction_doc.insert("serverId", server_id.clone());
-        }
-        if let Some(applied) = applied_discount.as_ref() {
-            transaction_doc.insert("discountVoucherCode", &applied.code);
-            transaction_doc.insert("discountAmount", applied.discount_amount);
-            transaction_doc.insert("baseAmount", base_price);
-        }
-
-        if let Err(error) = transactions
-            .insert_one(transaction_doc)
-            .session(&mut session)
-            .await
-        {
-            let _ = session.abort_transaction().await;
-            if crate::services::identifier_integrity::is_transient_identifier_write_conflict(&error)
-                && attempt + 1 < MAX_REFERENCE_ALLOCATION_ATTEMPTS
-            {
-                continue;
-            }
-            compensate().await;
-            return internal_error();
-        }
-
-        match commit_mongo_transaction_with_unknown_retry(&mut session).await {
-            TransactionCommitOutcome::Committed => {
-                allocated_ok = true;
-                break;
-            }
-            TransactionCommitOutcome::FailedDefinitely if attempt + 1 < MAX_REFERENCE_ALLOCATION_ATTEMPTS => {
-                continue;
-            }
-            TransactionCommitOutcome::FailedDefinitely => {
-                compensate().await;
-                return internal_error();
-            }
-            TransactionCommitOutcome::Ambiguous => {
-                let found = transactions
-                    .find_one(doc! { "_id": transaction_id, "referenceId": &ref_id })
-                    .await
-                    .ok()
-                    .flatten();
-                if found.is_none() {
-                    compensate().await;
-                    return transaction_reference_commit_unknown();
-                }
-                allocated_ok = true;
-                break;
-            }
-        }
-    }
-    if !allocated_ok {
-        compensate().await;
-        return internal_error();
-    }
-
-    if let Some(validation_config) = product_validation_config(&product) {
-        let validation_result = run_paid_validation(&validation_config, &target, &server_id).await;
-        apply_initial_validation_result(&db, transaction_id, user_id, price, validation_result)
-            .await;
-    } else {
-        let recheck_product = recheck_product_from_product_doc(&product);
-        if let Ok(vendor_result) =
-            top_up_vendor(&state, &ref_id, &target, &server_id, &recheck_product).await
-        {
-            apply_initial_vendor_result(&db, transaction_id, user_id, price, &vendor_result).await;
-        }
-    }
-
-    let transaction = transactions
-        .find_one(doc! { "_id": transaction_id })
-        .await
-        .ok()
-        .flatten()
-        .map(document_to_json)
-        .unwrap_or_else(|| serde_json::json!({ "_id": transaction_id.to_hex() }));
-    let remaining_balance = users
-        .find_one(doc! { "_id": user_id })
-        .projection(doc! { "balance": 1 })
-        .await
-        .ok()
-        .flatten()
-        .map(|document| read_i64(&document, "balance"))
-        .unwrap_or_else(|| read_i64(&updated_user, "balance"));
-
-    (
-        StatusCode::CREATED,
-        Json(CreateTransactionResponse {
-            message: "Transaction created",
-            transaction,
-            remaining_balance,
-        }),
-    )
-        .into_response()
+    let transaction_id = uuid::Uuid::new_v4();
+    let mut price=base_price;
+    let flash_sale=if payload.use_flash_sale.unwrap_or(false) { match crate::services::flash_sales::reserve_flash_sale_stock(&mut *tx,crate::services::flash_sales::FlashProductKey::Code(&code),base_price).await {Ok(Some(reservation))=>{price=reservation.price;Some(reservation)},Ok(None)=>None,Err(_)=>return internal_error()} } else {None};
+    let voucher=if let Some(code)=payload.voucher_code.as_deref().map(str::trim).filter(|v|!v.is_empty()) { match crate::routes::vouchers::consume_discount_voucher_sql(&mut *tx,&code.to_uppercase(),price,Some(user_id),&product_ctx).await {Ok(applied)=>{price=applied.final_price;Some(applied)},Err(response)=>return response} } else {None};
+    if balance<price { return status_message(StatusCode::BAD_REQUEST,"Insufficient balance"); }
+    let now_wib=chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(7*3600).expect("valid WIB offset"));
+    let date_wib=now_wib.date_naive();
+    let settings=match sqlx::query("SELECT key,value FROM site_settings WHERE key IN ('refIdPrefix','refIdDateFormat','refIdSeparator','refIdSequenceDigits')").fetch_all(&mut *tx).await {Ok(rows)=>rows,Err(_)=>return internal_error()};
+    let setting=|key:&str|settings.iter().find(|row|row.get::<String,_>("key")==key).map(|row|row.get::<serde_json::Value,_>("value"));
+    let prefix=setting("refIdPrefix").and_then(|v|v.as_str().map(str::to_owned)).filter(|v|!v.trim().is_empty()).unwrap_or_else(||"REF".to_owned());
+    let date_format=setting("refIdDateFormat").and_then(|v|v.as_str().map(str::to_owned)).unwrap_or_else(||"DDMMYYYY".to_owned());
+    let separator=setting("refIdSeparator").and_then(|v|v.as_str().map(str::to_owned)).unwrap_or_default();
+    let digits=setting("refIdSequenceDigits").and_then(|v|v.as_i64()).unwrap_or(4).clamp(1,10) as usize;
+    let sequence=match sqlx::query_scalar::<_,i64>("INSERT INTO reference_counters(scope,date_wib,sequence) VALUES('member-transaction',$1,1) ON CONFLICT(scope,date_wib) DO UPDATE SET sequence=reference_counters.sequence+1 RETURNING sequence").bind(date_wib).fetch_one(&mut *tx).await {Ok(value)=>value,Err(_)=>return internal_error()};
+    if sequence>=10_i64.pow(digits as u32){return ref_id_sequence_exhausted();}
+    let date_part=match date_format.as_str(){"YYYYMMDD"=>now_wib.format("%Y%m%d").to_string(),"MMDDYYYY"=>now_wib.format("%m%d%Y").to_string(),"DDMMYY"=>now_wib.format("%d%m%y").to_string(),"YYMMDD"=>now_wib.format("%y%m%d").to_string(),_=>now_wib.format("%d%m%Y").to_string()};
+    let sequence_part=format!("{:0width$}",sequence,width=digits);
+    let reference_id=[prefix.as_str(),date_part.as_str(),sequence_part.as_str()].into_iter().filter(|part|!part.is_empty()).collect::<Vec<_>>().join(&separator);
+    let product_snapshot=serde_json::json!({"code":code,"name":product_name,"vendorName":vendor_name,"vendorSku":vendor_sku,"category":product.get::<String,_>("category"),"brand":product.get::<String,_>("brand"),"validation":product.get::<serde_json::Value,_>("validation")});
+    let discount_amount=voucher.as_ref().map(|v|v.discount_amount);
+    let base_amount=voucher.as_ref().map(|_|base_price);
+    let voucher_code=voucher.as_ref().map(|v|v.code.clone());
+    let snapshot=serde_json::json!({"product":product_snapshot,"target":target,"serverId":server_id,"source":"web","discountVoucherCode":voucher_code,"discountAmount":discount_amount,"baseAmount":base_amount,"flashSale":flash_sale.as_ref().map(|r|r.flash_sale_id.to_string())});
+    let next_balance=balance-price;
+    let inserted=sqlx::query("INSERT INTO financial_transactions(id,reference_id,user_id,product_id,kind,amount,status,snapshot,target,server_id,source,discount_voucher_code,discount_amount,base_amount,provider_reference) VALUES($1,$2,$3,$4,'member',$5,'pending',$6,$7,$8,'web',$9,$10,$11,$2)")
+        .bind(transaction_id).bind(&reference_id).bind(user_id).bind(product_id).bind(price).bind(&snapshot).bind(&target).bind(&server_id).bind(&voucher_code).bind(discount_amount).bind(base_amount).execute(&mut *tx).await;
+    if inserted.is_err() { return internal_error(); }
+    if sqlx::query("INSERT INTO financial_status_events(transaction_id,status,payload) VALUES($1,'pending',$2)").bind(transaction_id).bind(serde_json::json!({"source":"member_checkout","referenceId":reference_id})).execute(&mut *tx).await.is_err(){return internal_error()}
+    if sqlx::query("INSERT INTO ledger_entries(user_id,source,kind,direction,amount,balance_after) VALUES($1,$2,'debit',-1,$3,$4)").bind(user_id).bind(format!("transaction:{transaction_id}")).bind(price).bind(next_balance).execute(&mut *tx).await.is_err() || sqlx::query("UPDATE users SET balance=$2,updated_at=now() WHERE id=$1").bind(user_id).bind(next_balance).execute(&mut *tx).await.is_err() { return internal_error(); }
+    let provider_job=serde_json::json!({"referenceId":reference_id,"productCode":code,"sku":vendor_sku,"target":target,"serverId":server_id,"amount":price,"source":"web"});
+    if sqlx::query("INSERT INTO financial_provider_jobs(reference_id,snapshot) VALUES($1,$2)").bind(&reference_id).bind(&provider_job).execute(&mut *tx).await.is_err() || sqlx::query("INSERT INTO provider_outbox(ref_id,payload,state) VALUES($1,$2,'pending')").bind(&reference_id).bind(&provider_job).execute(&mut *tx).await.is_err() { return internal_error(); }
+    if let Some(voucher)=voucher.as_ref() { if sqlx::query("INSERT INTO financial_checkout_effects(transaction_id,user_id,effect_type,effect_key,amount,metadata) VALUES($1,$2,'voucher',$3,$4,$5)").bind(transaction_id).bind(user_id).bind(format!("{transaction_id}:{}",voucher.voucher_id)).bind(voucher.discount_amount).bind(serde_json::json!({"code":voucher.code})).execute(&mut *tx).await.is_err(){return internal_error()} }
+    if let Some(flash)=flash_sale.as_ref() { if sqlx::query("INSERT INTO financial_checkout_effects(transaction_id,user_id,effect_type,effect_key,amount,metadata) VALUES($1,$2,'flash_sale',$3,$4,$5)").bind(transaction_id).bind(user_id).bind(format!("{transaction_id}:{}",flash.flash_sale_id)).bind(flash.price).bind(serde_json::json!({"productId":flash.product_id})).execute(&mut *tx).await.is_err(){return internal_error()} }
+    let created_at=match sqlx::query_scalar::<_,chrono::DateTime<chrono::Utc>>("SELECT created_at FROM financial_transactions WHERE id=$1").bind(transaction_id).fetch_one(&mut *tx).await {Ok(value)=>value,Err(_)=>return internal_error()};
+    let mut transaction=serde_json::json!({"_id":transaction_id.to_string(),"user":user_id.to_string(),"product":product_id.to_string(),"target":target,"amount":price,"status":"pending","referenceId":reference_id,"refunded":false,"source":"web","createdAt":created_at.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),"updatedAt":created_at.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()});
+    if !server_id.is_empty(){transaction["serverId"]=serde_json::json!(server_id)}
+    if let Some(voucher)=voucher.as_ref(){transaction["discountVoucherCode"]=serde_json::json!(voucher.code);transaction["discountAmount"]=serde_json::json!(voucher.discount_amount);transaction["baseAmount"]=serde_json::json!(base_price)}
+    let body=serde_json::to_value(CreateTransactionResponse{message:"Transaction created",transaction,remaining_balance:next_balance}).unwrap_or(serde_json::Value::Null);
+    if body.is_null(){return internal_error()}
+    if let Some(key)=idem_key.as_deref(){if sqlx::query("UPDATE financial_requests SET response=$4,response_status=201 WHERE actor=$1 AND operation='member-checkout' AND key=$2 AND digest=$3").bind(user_id.to_string()).bind(key).bind(&request_digest).bind(&body).execute(&mut *tx).await.is_err(){return internal_error()}}
+    if tx.commit().await.is_err(){return internal_error()}
+    (StatusCode::CREATED,Json(body)).into_response()
 }
 
 pub async fn manual_transactions(
@@ -508,64 +210,11 @@ pub async fn manual_transactions(
         return response;
     }
 
-    let Some(client) = &state.mongo_client else {
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                message: "MONGO_URI is not configured",
-            }),
-        )
-            .into_response();
-    };
-
-    let page = parse_positive_i64(query.page.as_deref(), 1, 100_000);
-    let limit = parse_positive_i64(query.limit.as_deref(), 20, MANUAL_MAX_LIMIT);
-    let pipeline = match build_transactions_pipeline(&query, page, limit, true) {
-        Ok(pipeline) => pipeline,
-        Err(response) => return response,
-    };
-    let result = first_document(
-        client
-            .database(&state.mongo_db)
-            .collection::<Document>("transactions")
-            .aggregate(pipeline)
-            .await,
-    )
-    .await
-    .unwrap_or_default();
-    let total = first_array_item(&result, "meta")
-        .map(|item| read_i64(&item, "total"))
-        .unwrap_or(0);
-    let total_pages = if total > 0 {
-        ((total as f64) / (limit as f64)).ceil() as i64
-    } else {
-        1
-    };
-    let summary = first_array_item(&result, "summary")
-        .map(|item| ManualTransactionsSummary {
-            total: read_i64(&item, "total"),
-            pending: read_i64(&item, "pending"),
-            processing: read_i64(&item, "processing"),
-            success: read_i64(&item, "success"),
-            failed: read_i64(&item, "failed"),
-            amount_total: read_i64(&item, "amountTotal"),
-        })
-        .unwrap_or_default();
-
-    Json(ManualTransactionsResponse {
-        items: document_array(&result, "items")
-            .into_iter()
-            .map(manual_transaction_item_from_doc)
-            .collect(),
-        meta: ManualTransactionsMeta {
-            page,
-            limit,
-            total,
-            total_pages,
-        },
-        summary,
-    })
-    .into_response()
+    let page=parse_positive_i64(query.page.as_deref(),1,100_000);
+    let limit=parse_positive_i64(query.limit.as_deref(),20,MANUAL_MAX_LIMIT);
+    let (items,summary,total)=match list::sql_transaction_items(&state.pg_pool,&query,page,limit,true).await{Ok(value)=>value,Err(response)=>return response};
+    let total_pages=if total>0{((total as f64)/(limit as f64)).ceil() as i64}else{1};
+    Json(ManualTransactionsResponse{items,meta:ManualTransactionsMeta{page,limit,total,total_pages},summary}).into_response()
 }
 
 pub async fn admin_transactions(
@@ -577,64 +226,11 @@ pub async fn admin_transactions(
         return response;
     }
 
-    let Some(client) = &state.mongo_client else {
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                message: "MONGO_URI is not configured",
-            }),
-        )
-            .into_response();
-    };
-
-    let page = parse_positive_i64(query.page.as_deref(), 1, 100_000);
-    let limit = parse_positive_i64(query.limit.as_deref(), 20, MANUAL_MAX_LIMIT);
-    let pipeline = match build_transactions_pipeline(&query, page, limit, false) {
-        Ok(pipeline) => pipeline,
-        Err(response) => return response,
-    };
-    let result = first_document(
-        client
-            .database(&state.mongo_db)
-            .collection::<Document>("transactions")
-            .aggregate(pipeline)
-            .await,
-    )
-    .await
-    .unwrap_or_default();
-    let total = first_array_item(&result, "meta")
-        .map(|item| read_i64(&item, "total"))
-        .unwrap_or(0);
-    let total_pages = if total > 0 {
-        ((total as f64) / (limit as f64)).ceil() as i64
-    } else {
-        1
-    };
-    let summary = first_array_item(&result, "summary")
-        .map(|item| ManualTransactionsSummary {
-            total: read_i64(&item, "total"),
-            pending: read_i64(&item, "pending"),
-            processing: read_i64(&item, "processing"),
-            success: read_i64(&item, "success"),
-            failed: read_i64(&item, "failed"),
-            amount_total: read_i64(&item, "amountTotal"),
-        })
-        .unwrap_or_default();
-
-    Json(ManualTransactionsResponse {
-        items: document_array(&result, "items")
-            .into_iter()
-            .map(manual_transaction_item_from_doc)
-            .collect(),
-        meta: ManualTransactionsMeta {
-            page,
-            limit,
-            total,
-            total_pages,
-        },
-        summary,
-    })
-    .into_response()
+    let page=parse_positive_i64(query.page.as_deref(),1,100_000);
+    let limit=parse_positive_i64(query.limit.as_deref(),20,MANUAL_MAX_LIMIT);
+    let (items,summary,total)=match list::sql_transaction_items(&state.pg_pool,&query,page,limit,false).await{Ok(value)=>value,Err(response)=>return response};
+    let total_pages=if total>0{((total as f64)/(limit as f64)).ceil() as i64}else{1};
+    Json(ManualTransactionsResponse{items,meta:ManualTransactionsMeta{page,limit,total,total_pages},summary}).into_response()
 }
 
 pub async fn admin_transactions_export(
@@ -646,32 +242,10 @@ pub async fn admin_transactions_export(
         return response;
     }
 
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-
-    let pipeline = match build_transactions_pipeline(&query, 1, TRANSACTION_EXPORT_LIMIT, false) {
-        Ok(pipeline) => pipeline,
-        Err(response) => return response,
-    };
-    if let Err(response) = require_trusted_step_up_group(&headers, "exports.sensitive") {
-        return response;
-    }
-    let result = first_document(
-        client
-            .database(&state.mongo_db)
-            .collection::<Document>("transactions")
-            .aggregate(pipeline)
-            .await,
-    )
-    .await
-    .unwrap_or_default();
-    let items = document_array(&result, "items")
-        .into_iter()
-        .map(manual_transaction_item_from_doc)
-        .collect::<Vec<_>>();
-    let csv = build_transaction_csv(&items);
-    let filename = format!("admin-transactions-{}.csv", date_key(DateTime::now()));
+    if let Err(response) = require_trusted_step_up_group(&headers, "exports.sensitive") { return response; }
+    let (items,_,_)=match list::sql_transaction_items(&state.pg_pool,&query,1,TRANSACTION_EXPORT_LIMIT,false).await{Ok(value)=>value,Err(response)=>return response};
+    let csv=build_transaction_csv(&items);
+    let filename = format!("admin-transactions-{}.csv", date_key(chrono::Utc::now()));
     let mut response_headers = HeaderMap::new();
     response_headers.insert(
         header::CONTENT_TYPE,
@@ -690,1686 +264,118 @@ pub async fn refund_transaction(
     Path(id): Path<String>,
     Json(payload): Json<RefundPayload>,
 ) -> Response {
-    let proxy_user = match require_permission(&headers, &state, "processManualTransaction").await {
-        Ok(user) => user,
-        Err(response) => return response,
-    };
-    if let Err(response) = require_trusted_step_up_group(&headers, "finance.refund") {
-        return response;
-    }
-    let processor_id = proxy_user.id;
-    let idempotency_key = match idempotency::require_idempotency_key(&headers) {
-        Ok(key) => key,
-        Err(error) => return error.into_response(),
-    };
-    let Ok(transaction_id) = ObjectId::parse_str(id.trim()) else {
-        return status_message(StatusCode::BAD_REQUEST, "ID transaksi tidak valid");
-    };
-    let reason = payload.reason.unwrap_or_default().trim().to_string();
-    if reason.len() < 5 || reason.len() > 300 {
-        return status_message(
-            StatusCode::BAD_REQUEST,
-            "Alasan refund wajib 5-300 karakter",
-        );
-    }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-
-    let db = client.database(&state.mongo_db);
-    let transactions = db.collection::<Document>("transactions");
-    let users = db.collection::<Document>("users");
-    let adjustments = db.collection::<Document>("userbalanceadjustments");
-    let hmac_key = state.session_token_hash_secret.as_bytes();
-    let request_digest = idempotency::refund_digest(hmac_key, &transaction_id.to_hex(), &reason);
-    let active_key = idempotency_key.clone();
-    let mut lease_generation: u64 = 0;
-    let effect_identity = active_key
-        .as_ref()
-        .map(|key| EffectIdentity::refund(processor_id, key, &request_digest, transaction_id));
-
-    if let Some(ref key) = active_key {
-        let store = MongoIdempotencyStore::new(&db);
-        let recovery = RefundMarkerRecovery {
-            transactions: &transactions,
-            users: &users,
-            adjustments: &adjustments,
-            processor_id,
-            transaction_id,
-            reason: reason.clone(),
-            request_digest: request_digest.clone(),
-        };
-        match idempotency::begin_with_recovery(
-            &store,
-            &recovery,
-            processor_id,
-            ROUTE_TRANSACTION_REFUND,
-            key,
-            &request_digest,
-            DateTime::now(),
-        )
-        .await
-        {
-            Ok(IdempotencyBegin::Started {
-                lease_generation: gen,
-            }) => {
-                lease_generation = gen;
-            }
-            Ok(IdempotencyBegin::Completed { status, body }) => {
-                crate::routes::auth::security_audit::metric_idempotency_duplicate_prevented(
-                    "refund", "replayed",
-                );
-                return idempotency::completed_response(status, body);
-            }
-            Ok(IdempotencyBegin::Conflict) => {
-                crate::routes::auth::security_audit::metric_idempotency_duplicate_prevented(
-                    "refund", "conflict",
-                );
-                return idempotency::conflict_response();
-            }
-            Ok(IdempotencyBegin::InProgress) => {
-                crate::routes::auth::security_audit::metric_idempotency_duplicate_prevented(
-                    "refund",
-                    "in_progress",
-                );
-                return idempotency::in_progress_response();
-            }
-            Err(error) => return error.into_response(),
-        }
-    }
-
-    match execute_refund_state_machine(
-        &db,
-        &transactions,
-        &users,
-        &adjustments,
-        processor_id,
-        transaction_id,
-        &reason,
-        active_key.as_deref(),
-        &request_digest,
-        lease_generation,
-        effect_identity.as_ref(),
-    )
-    .await
-    {
-        Ok(body_value) => {
-            if let Some(ref key) = active_key {
-                let store = MongoIdempotencyStore::new(&db);
-                let complete = CompletedSnapshot {
-                    status: 200,
-                    body: body_value.clone(),
-                    resource_id: Some(transaction_id.to_hex()),
-                };
-                if let Err(error) = store
-                    .complete(
-                        processor_id,
-                        ROUTE_TRANSACTION_REFUND,
-                        key,
-                        &request_digest,
-                        lease_generation,
-                        &complete,
-                        DateTime::now(),
-                    )
-                    .await
-                {
-                    // Domain applied; leave started for recovery. 500 is client-ambiguous.
-                    eprintln!("Failed to finalize refund idempotency record: {error:?}");
-                    return error.into_response();
-                }
-                if let Some(identity) = effect_identity.as_ref() {
-                    if let Ok(Some(tx)) =
-                        transactions.find_one(doc! { "_id": transaction_id }).await
-                    {
-                        if let Ok(user_id) = tx.get_object_id("user") {
-                            let now = DateTime::now();
-                            let _ = users
-                                .update_one(
-                                    doc! { "_id": user_id },
-                                    mark_effect_resolved_update(identity, now),
-                                )
-                                .await;
-                            let _ = users
-                                .update_one(
-                                    doc! { "_id": user_id },
-                                    UpdateModifications::Pipeline(
-                                        prune_resolved_effect_slots_pipeline(now),
-                                    ),
-                                )
-                                .await;
-                        }
-                    }
-                }
-            }
-            (StatusCode::OK, Json(body_value)).into_response()
-        }
-        Err(RefundExecError::Client(response)) => response,
-        Err(RefundExecError::Ambiguous(response)) => response,
-    }
+    let actor = match require_sql_permission(&headers, &state, "processManualTransaction").await { Ok(user) => user, Err(response) => return response };
+    if let Err(response) = require_trusted_step_up_group(&headers, "finance.refund") { return response; }
+    let Some(transaction_id) = uuid::Uuid::parse_str(id.trim()).ok() else { return status_message(StatusCode::BAD_REQUEST, "ID transaksi tidak valid"); };
+    let key = match idempotency::require_idempotency_key(&headers) { Ok(Some(key)) => key, Ok(None) => return status_message(StatusCode::BAD_REQUEST,"Idempotency-Key required"), Err(error) => return error.into_response() };
+    let reason = payload.reason.unwrap_or_default().trim().to_owned();
+    if !(5..=300).contains(&reason.len()) { return status_message(StatusCode::BAD_REQUEST,"Alasan refund wajib 5-300 karakter"); }
+    let digest = format!("{:x}", md5::compute(format!("{}\0{}\0{}", transaction_id, reason, actor.id)));
+    let mut tx = match state.pg_pool.begin().await { Ok(tx) => tx, Err(_) => return unavailable() };
+    let op_key = format!("transaction-refund:{}:{}",actor.id,key);
+    let existing = match sqlx::query("SELECT digest,response,response_status FROM financial_requests WHERE actor=$1 AND operation='transaction-refund' AND key=$2 FOR UPDATE").bind(actor.id.to_string()).bind(&key).fetch_optional(&mut *tx).await { Ok(v)=>v,Err(_)=>return internal_error() };
+    if let Some(row)=existing { if row.get::<String,_>("digest")!=digest { return status_message(StatusCode::CONFLICT,"Idempotency key reused with different request"); } if let Some(body)=row.get::<Option<Value>,_>("response") { let _=tx.rollback().await; return (StatusCode::from_u16(row.get::<Option<i32>,_>("response_status").unwrap_or(200) as u16).unwrap_or(StatusCode::OK),Json(body)).into_response(); } return status_message(StatusCode::CONFLICT,"Transaction is being processed"); }
+    if sqlx::query("INSERT INTO financial_requests(actor,operation,key,digest) VALUES($1,'transaction-refund',$2,$3)").bind(actor.id.to_string()).bind(&key).bind(&digest).execute(&mut *tx).await.is_err(){return internal_error();}
+    let row=match sqlx::query("SELECT id,user_id,amount,status,refunded,reference_id,target,source,snapshot,created_at,updated_at FROM financial_transactions WHERE id=$1 FOR UPDATE").bind(transaction_id).fetch_optional(&mut *tx).await{Ok(Some(row))=>row,Ok(None)=>return status_message(StatusCode::NOT_FOUND,"Transaction not found"),Err(_)=>return internal_error()};
+    let Some(user_id)=row.try_get::<Option<uuid::Uuid>,_>("user_id").ok().flatten() else{return status_message(StatusCode::CONFLICT,"Transaction has no refundable wallet owner")};
+    if row.get::<bool,_>("refunded") {return status_message(StatusCode::CONFLICT,"Transaction already refunded");}
+    let amount=row.get::<i64,_>("amount"); if amount<=0{return status_message(StatusCode::CONFLICT,"Transaction amount is not refundable");}
+    if row.get::<String,_>("status")=="success" { return status_message(StatusCode::BAD_REQUEST,"Transaksi sukses harus diubah ke failed dari edit status agar poin ikut direkonsiliasi"); }
+    let balance=match sqlx::query_scalar::<_,i64>("SELECT balance FROM users WHERE id=$1 FOR UPDATE").bind(user_id).fetch_optional(&mut *tx).await{Ok(Some(v))=>v,Ok(None)=>return status_message(StatusCode::NOT_FOUND,"User transaksi tidak ditemukan"),Err(_)=>return internal_error()};
+    let next=match balance.checked_add(amount){Some(v)=>v,None=>return internal_error()};let now=chrono::Utc::now();
+    if sqlx::query("UPDATE users SET balance=$2,updated_at=$3 WHERE id=$1").bind(user_id).bind(next).bind(now).execute(&mut *tx).await.is_err()
+        ||sqlx::query("INSERT INTO ledger_entries(user_id,source,kind,direction,amount,balance_after) VALUES($1,$2,'refund',1,$3,$4)").bind(user_id).bind(format!("transaction-refund:{transaction_id}")).bind(amount).bind(next).execute(&mut *tx).await.is_err()
+        ||sqlx::query("INSERT INTO financial_audits(actor_id,action,subject_id,amount,operation_key) VALUES($1,'transaction_refund',$2,$3,$4)").bind(actor.id).bind(transaction_id).bind(amount).bind(&op_key).execute(&mut *tx).await.is_err(){return internal_error();}
+    let note=format!("Refund transaksi: {reason}");
+    if sqlx::query("UPDATE financial_transactions SET refunded=true,status='failed',refunded_at=$2,refund_reason=$3,refunded_by=$4,status_updated_by=$4,status_updated_at=$2,status_update_note=$5,updated_at=$2 WHERE id=$1").bind(transaction_id).bind(now).bind(&reason).bind(actor.id).bind(&note).execute(&mut *tx).await.is_err()
+       ||sqlx::query("INSERT INTO financial_status_events(transaction_id,status,payload) VALUES($1,'failed',$2)").bind(transaction_id).bind(serde_json::json!({"source":"transaction_refund","actorId":actor.id,"reason":reason})).execute(&mut *tx).await.is_err(){return internal_error();}
+    let body=serde_json::json!({"message":"Saldo transaksi berhasil direfund","transaction":{"_id":transaction_id.to_string(),"user":user_id.to_string(),"target":row.get::<String,_>("target"),"amount":amount,"status":"failed","referenceId":row.get::<String,_>("reference_id"),"refunded":true,"refundedAt":now.to_rfc3339(),"refundReason":reason,"source":row.get::<String,_>("source"),"createdAt":row.get::<chrono::DateTime<chrono::Utc>,_>("created_at").to_rfc3339(),"updatedAt":now.to_rfc3339(),"statusUpdatedBy":{"_id":actor.id.to_string() },"statusUpdatedAt":now.to_rfc3339(),"statusUpdateNote":note}});
+    if sqlx::query("UPDATE financial_requests SET response=$4,response_status=200 WHERE actor=$1 AND operation='transaction-refund' AND key=$2 AND digest=$3").bind(actor.id.to_string()).bind(&key).bind(&digest).bind(&body).execute(&mut *tx).await.is_err(){return internal_error();}
+    if tx.commit().await.is_err(){let replay=sqlx::query("SELECT digest,response,response_status FROM financial_requests WHERE actor=$1 AND operation='transaction-refund' AND key=$2").bind(actor.id.to_string()).bind(&key).fetch_optional(&state.pg_pool).await; if let Ok(Some(row))=replay {if row.get::<String,_>("digest")==digest {if let Some(body)=row.get::<Option<Value>,_>("response"){return (StatusCode::OK,Json(body)).into_response();}}} return status_message(StatusCode::SERVICE_UNAVAILABLE,"Refund result uncertain; retry with the same idempotency key");}
+    (StatusCode::OK,Json(body)).into_response()
 }
 
-enum RefundExecError {
-    /// Validation / conflict before durable money — safe pre-effect release may have run.
-    Client(Response),
-    /// After claim/credit: do not release; return 500 for reconciliation UX.
-    Ambiguous(Response),
+pub async fn update_status(headers: HeaderMap, State(state): State<Arc<AppState>>, Path(id): Path<String>, Json(payload): Json<StatusUpdatePayload>) -> Response {
+    let actor=match require_sql_permission(&headers,&state,"processManualTransaction").await{Ok(v)=>v,Err(r)=>return r};
+    if let Err(r)=require_trusted_step_up_group(&headers,"transactions.manual"){return r;}
+    let Some(id)=uuid::Uuid::parse_str(id.trim()).ok()else{return status_message(StatusCode::BAD_REQUEST,"ID transaksi tidak valid")};
+    let payload=match normalize_status_payload(payload){Ok(v)=>v,Err(r)=>return r};
+    let key=headers.get("idempotency-key").and_then(|v|v.to_str().ok()).map(str::trim).filter(|v|!v.is_empty()).map(str::to_owned);
+    let digest=format!("{:x}",md5::compute(serde_json::to_vec(&serde_json::json!([id,payload.status,payload.vendor_trx_id,payload.sn,payload.note])).unwrap_or_default()));
+    let mut tx=match state.pg_pool.begin().await{Ok(v)=>v,Err(_)=>return unavailable()};
+    if let Some(key)=key.as_deref(){let found=match sqlx::query("SELECT digest,response FROM financial_requests WHERE actor=$1 AND operation='transaction-status' AND key=$2 FOR UPDATE").bind(actor.id.to_string()).bind(key).fetch_optional(&mut *tx).await{Ok(v)=>v,Err(_)=>return internal_error()};if let Some(r)=found{if r.get::<String,_>("digest")!=digest{return status_message(StatusCode::CONFLICT,"Idempotency key reused with different request")}if let Some(v)=r.get::<Option<Value>,_>("response"){let _=tx.rollback().await;return (StatusCode::OK,Json(v)).into_response()}return status_message(StatusCode::CONFLICT,"Transaction is being processed")}if sqlx::query("INSERT INTO financial_requests(actor,operation,key,digest) VALUES($1,'transaction-status',$2,$3)").bind(actor.id.to_string()).bind(key).bind(&digest).execute(&mut *tx).await.is_err(){return internal_error()}}
+    let row=match sqlx::query("SELECT user_id,amount,status,refunded,reference_id,target,source,created_at,vendor_trx_id,sn,message FROM financial_transactions WHERE id=$1 FOR UPDATE").bind(id).fetch_optional(&mut *tx).await{Ok(Some(v))=>v,Ok(None)=>return status_message(StatusCode::NOT_FOUND,"Transaction not found"),Err(_)=>return internal_error()};
+    let Some(user)=row.try_get::<Option<uuid::Uuid>,_>("user_id").ok().flatten()else{return status_message(StatusCode::CONFLICT,"Transaction has no wallet owner")};let old=row.get::<String,_>("status");let amount=row.get::<i64,_>("amount");let plan=apply_transition_plan(&old,row.get("refunded"),amount,&payload.status);let now=chrono::Utc::now();let note=build_admin_status_note(&old,&payload.status,&payload.note);
+    if plan.balance_delta!=0{let bal=match sqlx::query_scalar::<_,i64>("SELECT balance FROM users WHERE id=$1 FOR UPDATE").bind(user).fetch_optional(&mut *tx).await{Ok(Some(v))=>v,Ok(None)=>return status_message(StatusCode::NOT_FOUND,"User transaksi tidak ditemukan"),Err(_)=>return internal_error()};let next=if plan.balance_delta>0{match bal.checked_add(plan.balance_delta){Some(v)=>v,None=>return internal_error()}}else{match bal.checked_sub(-plan.balance_delta){Some(v)if v>=0=>v,_=>return status_message(StatusCode::CONFLICT,"Insufficient balance")}};let source=format!("transaction-status:{id}:{old}:{}",payload.status);let kind=if plan.balance_delta>0{"refund"}else{"debit"};if sqlx::query("UPDATE users SET balance=$2,updated_at=$3 WHERE id=$1").bind(user).bind(next).bind(now).execute(&mut *tx).await.is_err()||sqlx::query("INSERT INTO ledger_entries(user_id,source,kind,direction,amount,balance_after) VALUES($1,$2,$3,$4,$5,$6)").bind(user).bind(source).bind(kind).bind(if plan.balance_delta>0{1_i16}else{-1_i16}).bind(plan.balance_delta.abs()).bind(next).execute(&mut *tx).await.is_err(){return internal_error()}}
+    let source=format!("transaction-success:{id}");let prior=match sqlx::query_scalar::<_,i64>("SELECT points FROM point_awards WHERE source=$1").bind(&source).fetch_optional(&mut *tx).await{Ok(v)=>v,Err(_)=>return internal_error()};
+    if plan.should_award_points&&prior.is_none(){let per=match sqlx::query_scalar::<_,Value>("SELECT value FROM site_settings WHERE key='points_per_transaction'").fetch_optional(&mut *tx).await{Ok(v)=>v.and_then(|v|v.as_i64()).filter(|v|*v>0).unwrap_or(100),Err(_)=>return internal_error()};let points=(amount/10_000).saturating_mul(per);if points>0&&(sqlx::query("UPDATE users SET points=points+$2,updated_at=$3 WHERE id=$1").bind(user).bind(points).bind(now).execute(&mut *tx).await.is_err()||sqlx::query("INSERT INTO point_awards(source,user_id,points) VALUES($1,$2,$3)").bind(&source).bind(user).bind(points).execute(&mut *tx).await.is_err()){return internal_error()}}
+    if plan.should_revoke_points{if let Some(points)=prior{if sqlx::query("UPDATE users SET points=points-$2,updated_at=$3 WHERE id=$1 AND points >= $2").bind(user).bind(points).bind(now).execute(&mut *tx).await.is_err()||sqlx::query("DELETE FROM point_awards WHERE source=$1").bind(&source).execute(&mut *tx).await.is_err(){return internal_error()}}}
+    let vendor=payload.vendor_trx_id.or_else(||row.try_get("vendor_trx_id").ok().flatten());let sn=payload.sn.or_else(||row.try_get("sn").ok().flatten());let message=if payload.note.is_empty(){row.get::<String,_>("message")}else{payload.note.clone()};
+    if sqlx::query("UPDATE financial_transactions SET status=$2,refunded=$3,status_updated_by=$4,status_updated_at=$5,status_update_note=$6,vendor_trx_id=$7,sn=$8,message=$9,updated_at=$5 WHERE id=$1").bind(id).bind(&payload.status).bind(plan.next_refunded).bind(actor.id).bind(now).bind(&note).bind(&vendor).bind(&sn).bind(&message).execute(&mut *tx).await.is_err()||sqlx::query("INSERT INTO financial_status_events(transaction_id,status,payload) VALUES($1,$2,$3)").bind(id).bind(&payload.status).bind(serde_json::json!({"source":"manual_status","actorId":actor.id,"note":note})).execute(&mut *tx).await.is_err(){return internal_error()}
+    let body=serde_json::json!({"message":"Transaction updated","transaction":{"_id":id.to_string(),"user":{"_id":user.to_string()},"target":row.get::<String,_>("target"),"amount":amount,"status":payload.status,"referenceId":row.get::<String,_>("reference_id"),"vendorTrxId":vendor,"sn":sn,"message":message,"refunded":plan.next_refunded,"source":row.get::<String,_>("source"),"createdAt":row.get::<chrono::DateTime<chrono::Utc>,_>("created_at").to_rfc3339(),"updatedAt":now.to_rfc3339(),"statusUpdatedAt":now.to_rfc3339(),"statusUpdatedBy":{"_id":actor.id.to_string()},"statusUpdateNote":note}});
+    if let Some(key)=key.as_deref(){if sqlx::query("UPDATE financial_requests SET response=$4,response_status=200 WHERE actor=$1 AND operation='transaction-status' AND key=$2 AND digest=$3").bind(actor.id.to_string()).bind(key).bind(&digest).bind(&body).execute(&mut *tx).await.is_err(){return internal_error()}}
+    if tx.commit().await.is_err(){return status_message(StatusCode::SERVICE_UNAVAILABLE,"Status update result uncertain; retry with same idempotency key")} (StatusCode::OK,Json(body)).into_response()
 }
 
-async fn execute_refund_state_machine(
-    db: &mongodb::Database,
-    transactions: &mongodb::Collection<Document>,
-    users: &mongodb::Collection<Document>,
-    adjustments: &mongodb::Collection<Document>,
-    processor_id: ObjectId,
-    transaction_id: ObjectId,
-    reason: &str,
-    active_key: Option<&str>,
-    request_digest: &str,
-    lease_generation: u64,
-    effect_identity: Option<&EffectIdentity>,
-) -> Result<Value, RefundExecError> {
-    let Some(transaction) = (match transactions.find_one(doc! { "_id": transaction_id }).await {
-        Ok(value) => value,
-        Err(_) => {
-            release_refund_started_pre_effect(db, processor_id, active_key, request_digest, lease_generation).await;
-            return Err(RefundExecError::Client(internal_error()));
-        }
-    }) else {
-        release_refund_started_pre_effect(db, processor_id, active_key, request_digest, lease_generation).await;
-        return Err(RefundExecError::Client(status_message(
-            StatusCode::NOT_FOUND,
-            "Transaction not found",
-        )));
-    };
-
-    // Resume path: transaction already claimed under our key — never treat claim alone as success.
-    if transaction.get_bool("refunded").unwrap_or(false) {
-        if let Some(key) = active_key {
-            if transaction.get_str("idempotencyKey").ok() == Some(key) {
-                return forward_refund_from_claim(
-                    db,
-                    transactions,
-                    users,
-                    adjustments,
-                    &transaction,
-                    processor_id,
-                    transaction_id,
-                    reason,
-                    key,
-                    effect_identity,
-                )
-                .await;
-            }
-            // Different key already refunded this resource.
-            release_refund_started_pre_effect(db, processor_id, Some(key), request_digest, lease_generation).await;
-            return Err(RefundExecError::Client(status_message(
-                StatusCode::CONFLICT,
-                "Transaksi ini sudah direfund",
-            )));
-        }
-        return Err(RefundExecError::Client(status_message(
-            StatusCode::CONFLICT,
-            "Transaksi ini sudah direfund",
-        )));
-    }
-
-    if read_string(&transaction, "status") == "success" {
-        release_refund_started_pre_effect(db, processor_id, active_key, request_digest, lease_generation).await;
-        return Err(RefundExecError::Client(status_message(
-            StatusCode::BAD_REQUEST,
-            "Transaksi sukses harus diubah ke failed dari edit status agar poin ikut direkonsiliasi",
-        )));
-    }
-    let Some(user_id) = transaction.get_object_id("user").ok() else {
-        release_refund_started_pre_effect(db, processor_id, active_key, request_digest, lease_generation).await;
-        return Err(RefundExecError::Client(status_message(
-            StatusCode::NOT_FOUND,
-            "User transaksi tidak ditemukan",
-        )));
-    };
-    let amount = read_i64(&transaction, "amount");
-    let Some(pre_claim_snapshot) = transaction_refund_snapshot(&transaction) else {
-        release_refund_started_pre_effect(db, processor_id, active_key, request_digest, lease_generation).await;
-        return Err(RefundExecError::Client(internal_error()));
-    };
-    let refund_reason = build_refund_reason(&transaction_id, reason);
-    let now = DateTime::now();
-
-    // Phase: claimed — exclusive claim. Claim alone is NOT proof of credit/audit.
-    let mut set_fields = doc! {
-        "status": "failed",
-        "refunded": true,
-        "refundedBy": processor_id,
-        "refundedAt": now,
-        "refundReason": reason,
-        "statusUpdatedBy": processor_id,
-        "statusUpdatedAt": now,
-        "statusUpdateNote": &refund_reason,
-        "updatedAt": now,
-        "refundPhase": REFUND_PHASE_CLAIMED,
-    };
-    if let Some(key) = active_key {
-        set_fields.insert("idempotencyKey", key);
-    }
-    // Freeze an immutable response skeleton at claim time for exact replay later.
-    if let Ok(skeleton) =
-        serde_json::to_value(manual_transaction_item_from_doc(transaction.clone()))
-    {
-        set_fields.insert(
-            "refundResponseSnapshotJson",
-            serde_json::to_string(&skeleton).unwrap_or_default(),
-        );
-    }
-
-    let claimed = match transactions
-        .find_one_and_update(
-            doc! {
-                "_id": transaction_id,
-                "refunded": { "$ne": true },
-                "updatedAt": pre_claim_snapshot.updated_at,
-            },
-            doc! { "$set": set_fields },
-        )
-        .return_document(ReturnDocument::After)
-        .await
-    {
-        Ok(Some(document)) => document,
-        Ok(None) => {
-            if let Some(key) = active_key {
-                if let Ok(Some(current)) =
-                    transactions.find_one(doc! { "_id": transaction_id }).await
-                {
-                    if current.get_bool("refunded").unwrap_or(false)
-                        && current.get_str("idempotencyKey").ok() == Some(key)
-                    {
-                        return forward_refund_from_claim(
-                            db,
-                            transactions,
-                            users,
-                            adjustments,
-                            &current,
-                            processor_id,
-                            transaction_id,
-                            reason,
-                            key,
-                            effect_identity,
-                        )
-                        .await;
-                    }
-                }
-                // Lost the claim race without our key — pure pre-effect for us.
-                release_refund_started_pre_effect(db, processor_id, Some(key), request_digest, lease_generation)
-                    .await;
-            }
-            return Err(RefundExecError::Client(status_message(
-                StatusCode::CONFLICT,
-                "Transaksi sedang diperbarui oleh proses lain. Muat ulang halaman lalu coba lagi.",
-            )));
-        }
-        Err(_) => {
-            release_refund_started_pre_effect(db, processor_id, active_key, request_digest, lease_generation).await;
-            return Err(RefundExecError::Client(internal_error()));
-        }
-    };
-
-    // From here: claim is durable. Never release started; never unsafe rollback+delete.
-    finish_refund_after_claim(
-        db,
-        transactions,
-        users,
-        adjustments,
-        &claimed,
-        processor_id,
-        transaction_id,
-        user_id,
-        amount,
-        reason,
-        &refund_reason,
-        active_key,
-        effect_identity,
-    )
-    .await
-}
-
-async fn forward_refund_from_claim(
-    db: &mongodb::Database,
-    transactions: &mongodb::Collection<Document>,
-    users: &mongodb::Collection<Document>,
-    adjustments: &mongodb::Collection<Document>,
-    claimed: &Document,
-    processor_id: ObjectId,
-    transaction_id: ObjectId,
-    reason: &str,
-    key: &str,
-    effect_identity: Option<&EffectIdentity>,
-) -> Result<Value, RefundExecError> {
-    let phase = claimed
-        .get_str("refundPhase")
-        .unwrap_or(REFUND_PHASE_CLAIMED);
-    // Only complete when credit (+ preferably audit) is proven.
-    if phase == REFUND_PHASE_AUDITED || phase == REFUND_PHASE_CREDITED {
-        if let Some(snapshot) =
-            reconstruct_refund_snapshot_immutable(claimed, users, key, effect_identity).await
-        {
-            // Ensure audit exists if only credited.
-            if phase == REFUND_PHASE_CREDITED {
-                let _ = ensure_refund_audit(
-                    adjustments,
-                    claimed,
-                    processor_id,
-                    transaction_id,
-                    reason,
-                    key,
-                    effect_identity,
-                )
-                .await;
-                let _ = transactions
-                    .update_one(
-                        doc! {
-                            "_id": transaction_id,
-                            "idempotencyKey": key,
-                            "refundPhase": REFUND_PHASE_CREDITED,
-                        },
-                        doc! { "$set": { "refundPhase": REFUND_PHASE_AUDITED, "updatedAt": DateTime::now() } },
-                    )
-                    .await;
-            }
-            return Ok(snapshot.body);
-        }
-    }
-
-    let Some(user_id) = claimed.get_object_id("user").ok() else {
-        return Err(RefundExecError::Ambiguous(internal_error()));
-    };
-    let amount = read_i64(claimed, "amount");
-    let refund_reason = build_refund_reason(&transaction_id, reason);
-    finish_refund_after_claim(
-        db,
-        transactions,
-        users,
-        adjustments,
-        claimed,
-        processor_id,
-        transaction_id,
-        user_id,
-        amount,
-        reason,
-        &refund_reason,
-        Some(key),
-        effect_identity,
-    )
-    .await
-}
-
-async fn finish_refund_after_claim(
-    _db: &mongodb::Database,
-    transactions: &mongodb::Collection<Document>,
-    users: &mongodb::Collection<Document>,
-    adjustments: &mongodb::Collection<Document>,
-    claimed: &Document,
-    processor_id: ObjectId,
-    transaction_id: ObjectId,
-    user_id: ObjectId,
-    amount: i64,
-    reason: &str,
-    refund_reason: &str,
-    active_key: Option<&str>,
-    effect_identity: Option<&EffectIdentity>,
-) -> Result<Value, RefundExecError> {
-    let now = DateTime::now();
-    let key = active_key.unwrap_or("");
-
-    // Phase: credited — atomic money + full-identity marker on user.
-    let credit_applied = if key.is_empty() || effect_identity.is_none() {
-        // Rollout-off path: best-effort credit without key coupling.
-        match users
-            .find_one_and_update(
-                doc! { "_id": user_id },
-                doc! { "$inc": { "balance": amount }, "$set": { "updatedAt": now } },
-            )
-            .return_document(ReturnDocument::After)
-            .await
-        {
-            Ok(Some(_)) => true,
-            Ok(None) => {
-                return Err(RefundExecError::Ambiguous(internal_error()));
-            }
-            Err(_) => return Err(RefundExecError::Ambiguous(internal_error())),
-        }
-    } else {
-        let identity = effect_identity.expect("checked above");
-        let filter = refund_credit_filter(user_id, identity);
-        let pipeline = refund_credit_pipeline(identity, amount, refund_reason, transaction_id, now);
-        match users
-            .find_one_and_update(filter, UpdateModifications::Pipeline(pipeline))
-            .return_document(ReturnDocument::After)
-            .await
-        {
-            Ok(Some(user)) => {
-                // Freeze credit marker numbers onto the transaction for immutable audit/replay.
-                if let Some(marker) = find_balance_effect_by_identity(&user, identity) {
-                    if !effect_marker_matches_identity(&marker, identity) {
-                        return Err(RefundExecError::Ambiguous(internal_error()));
-                    }
-                    let before = marker
-                        .get("balanceBefore")
-                        .cloned()
-                        .unwrap_or(Bson::Int64(0));
-                    let after = marker
-                        .get("balanceAfter")
-                        .cloned()
-                        .unwrap_or(Bson::Int64(amount));
-                    let _ = transactions
-                        .update_one(
-                            doc! { "_id": transaction_id, "idempotencyKey": key },
-                            doc! {
-                                "$set": {
-                                    "refundBalanceBefore": before,
-                                    "refundBalanceAfter": after,
-                                    "refundPhase": REFUND_PHASE_CREDITED,
-                                    "updatedAt": DateTime::now(),
-                                }
-                            },
-                        )
-                        .await;
-                }
-                true
-            }
-            Ok(None) => {
-                // Already credited for this full identity, capacity exhausted, or missing user.
-                let existing = users.find_one(doc! { "_id": user_id }).await.ok().flatten();
-                match existing {
-                    Some(user) if find_balance_effect_by_identity(&user, identity).is_some() => {
-                        // Existing matching unresolved slot remains reconcilable at the cap.
-                        true
-                    }
-                    Some(user) if is_effect_slot_capacity_rejection(Some(&user), identity) => {
-                        // NEW credit blocked by unresolved/total slot cap. Claim is durable so
-                        // leave started; surface a stable capacity outcome (no money mutation).
-                        return Err(RefundExecError::Ambiguous(effect_slot_capacity_response()));
-                    }
-                    _ => {
-                        // Claim durable but credit impossible — leave started; no release.
-                        return Err(RefundExecError::Ambiguous(internal_error()));
-                    }
-                }
-            }
-            Err(error) => {
-                eprintln!("Failed atomic refund credit+marker: {error}");
-                return Err(RefundExecError::Ambiguous(internal_error()));
-            }
-        }
-    };
-
-    if !credit_applied {
-        return Err(RefundExecError::Ambiguous(internal_error()));
-    }
-
-    if !key.is_empty() {
-        let _ = transactions
-            .update_one(
-                doc! {
-                    "_id": transaction_id,
-                    "idempotencyKey": key,
-                    "refundPhase": { "$in": [REFUND_PHASE_CLAIMED, REFUND_PHASE_CREDITED] },
-                },
-                doc! {
-                    "$set": {
-                        "refundPhase": REFUND_PHASE_CREDITED,
-                        "updatedAt": DateTime::now(),
-                    }
-                },
-            )
-            .await;
-    }
-
-    // Phase: audited — insert once; failure leaves credited for forward reconcile.
-    if let Err(error) = ensure_refund_audit(
-        adjustments,
-        claimed,
-        processor_id,
-        transaction_id,
-        reason,
-        if key.is_empty() { "" } else { key },
-        effect_identity,
-    )
-    .await
-    {
-        eprintln!(
-            "Failed refund audit after credit; leaving claimed/credited for reconcile: {error:?}"
-        );
-        return Err(RefundExecError::Ambiguous(internal_error()));
-    }
-
-    if !key.is_empty() {
-        let _ = transactions
-            .update_one(
-                doc! {
-                    "_id": transaction_id,
-                    "idempotencyKey": key,
-                },
-                doc! {
-                    "$set": {
-                        "refundPhase": REFUND_PHASE_AUDITED,
-                        "updatedAt": DateTime::now(),
-                    }
-                },
-            )
-            .await;
-    }
-
-    // Build immutable response from claim-time skeleton + refund stamps (not live population).
-    let body = build_immutable_refund_response(claimed, reason)
-        .or_else(|| {
-            let item = manual_transaction_item_from_doc(claimed.clone());
-            serde_json::to_value(&RefundResponse {
-                message: "Saldo transaksi berhasil direfund",
-                transaction: item,
-            })
-            .ok()
-        })
-        .ok_or_else(|| RefundExecError::Ambiguous(internal_error()))?;
-
-    // Persist exact response body on the transaction for future exact replay.
-    if !key.is_empty() {
-        if let Ok(encoded) = serde_json::to_string(&body) {
-            let _ = transactions
-                .update_one(
-                    doc! { "_id": transaction_id, "idempotencyKey": key },
-                    doc! {
-                        "$set": {
-                            "refundCompletedResponseJson": encoded,
-                            "updatedAt": DateTime::now(),
-                        }
-                    },
-                )
-                .await;
-        }
-    }
-
-    Ok(body)
-}
-
-async fn ensure_refund_audit(
-    adjustments: &mongodb::Collection<Document>,
-    claimed: &Document,
-    processor_id: ObjectId,
-    transaction_id: ObjectId,
-    reason: &str,
-    key: &str,
-    effect_identity: Option<&EffectIdentity>,
-) -> Result<Option<ObjectId>, ()> {
-    let user_id = claimed.get_object_id("user").map_err(|_| ())?;
-    let amount = read_i64(claimed, "amount");
-    let refund_reason = build_refund_reason(&transaction_id, reason);
-
-    if let Some(identity) = effect_identity {
-        if let Ok(Some(existing)) = adjustments
-            .find_one(doc! {
-                "idempotencyKey": &identity.idempotency_key,
-                "adjustedBy": processor_id,
-                "transactionId": transaction_id,
-                "routeKey": ROUTE_TRANSACTION_REFUND,
-                "requestDigest": &identity.request_digest,
-            })
-            .await
-        {
-            return Ok(existing.get_object_id("_id").ok());
-        }
-    } else if !key.is_empty() {
-        if let Ok(Some(existing)) = adjustments
-            .find_one(doc! {
-                "idempotencyKey": key,
-                "adjustedBy": processor_id,
-                "user": user_id,
-            })
-            .await
-        {
-            return Ok(existing.get_object_id("_id").ok());
-        }
-    }
-
-    // Prefer values frozen on the transaction after credit; else amount-only (immutable to retries).
-    let balance_before = claimed
-        .get_i64("refundBalanceBefore")
-        .ok()
-        .or_else(|| {
-            claimed
-                .get_f64("refundBalanceBefore")
-                .ok()
-                .map(|v| v as i64)
-        })
-        .unwrap_or(0);
-    let balance_after = claimed
-        .get_i64("refundBalanceAfter")
-        .ok()
-        .or_else(|| claimed.get_f64("refundBalanceAfter").ok().map(|v| v as i64))
-        .unwrap_or(amount);
-
-    let audit_now = DateTime::now();
-    let mut audit_doc = doc! {
-        "user": user_id,
-        "adjustedBy": processor_id,
-        "type": "add",
-        "amount": amount,
-        "balanceBefore": balance_before,
-        "balanceAfter": balance_after,
-        "reason": &refund_reason,
-        "createdAt": audit_now,
-        "updatedAt": audit_now,
-        "__v": 0,
-        "transactionId": transaction_id,
-    };
-    if let Some(identity) = effect_identity {
-        audit_doc.insert("idempotencyKey", &identity.idempotency_key);
-        audit_doc.insert("routeKey", ROUTE_TRANSACTION_REFUND);
-        audit_doc.insert("requestDigest", &identity.request_digest);
-        audit_doc.insert(
-            "resourceId",
-            identity
-                .resource_id
-                .clone()
-                .unwrap_or_else(|| transaction_id.to_hex()),
-        );
-    } else if !key.is_empty() {
-        audit_doc.insert("idempotencyKey", key);
-    }
-    match adjustments.insert_one(audit_doc).await {
-        Ok(result) => Ok(result.inserted_id.as_object_id()),
-        Err(error) => {
-            if is_duplicate_key_error(&error) {
-                if let Some(identity) = effect_identity {
-                    if let Ok(Some(existing)) = adjustments
-                        .find_one(doc! {
-                            "idempotencyKey": &identity.idempotency_key,
-                            "adjustedBy": processor_id,
-                            "transactionId": transaction_id,
-                            "routeKey": ROUTE_TRANSACTION_REFUND,
-                            "requestDigest": &identity.request_digest,
-                        })
-                        .await
-                    {
-                        return Ok(existing.get_object_id("_id").ok());
-                    }
-                } else if !key.is_empty() {
-                    if let Ok(Some(existing)) = adjustments
-                        .find_one(doc! {
-                            "idempotencyKey": key,
-                            "adjustedBy": processor_id,
-                            "user": user_id,
-                        })
-                        .await
-                    {
-                        return Ok(existing.get_object_id("_id").ok());
-                    }
-                }
-            }
-            eprintln!("Failed to insert refund audit: {error}");
-            Err(())
-        }
-    }
-}
-
-fn build_immutable_refund_response(claimed: &Document, reason: &str) -> Option<Value> {
-    if let Ok(raw) = claimed.get_str("refundCompletedResponseJson") {
-        if let Ok(value) = serde_json::from_str::<Value>(raw) {
-            return Some(value);
-        }
-    }
-    // Rebuild from claim-time JSON skeleton + refund fields (deterministic, not live joins).
-    let mut item = if let Ok(raw) = claimed.get_str("refundResponseSnapshotJson") {
-        serde_json::from_str::<ManualTransactionItemJson>(raw)
-            .ok()
-            .map(manual_item_from_json)
-    } else {
-        None
-    }
-    .unwrap_or_else(|| manual_transaction_item_from_doc(claimed.clone()));
-
-    item.refunded = true;
-    item.refund_reason = reason.to_string();
-    item.refunded_at = claimed
-        .get_datetime("refundedAt")
-        .ok()
-        .map(|value| {
-            value
-                .try_to_rfc3339_string()
-                .unwrap_or_else(|_| value.to_string())
-        })
-        .or(item.refunded_at);
-    item.status = "failed".to_string();
-    item.status_update_note = claimed
-        .get_str("statusUpdateNote")
-        .ok()
-        .map(str::to_string)
-        .unwrap_or(item.status_update_note);
-    item.updated_at = claimed
-        .get_datetime("updatedAt")
-        .ok()
-        .map(|value| {
-            value
-                .try_to_rfc3339_string()
-                .unwrap_or_else(|_| value.to_string())
-        })
-        .unwrap_or(item.updated_at);
-
-    serde_json::to_value(&RefundResponse {
-        message: "Saldo transaksi berhasil direfund",
-        transaction: item,
-    })
-    .ok()
-}
-
-/// JSON-shaped mirror for immutable refund snapshots (serde only; not a Mongo model).
-#[derive(serde::Deserialize)]
-struct ManualTransactionItemJson {
-    #[serde(rename = "_id")]
-    id: String,
-    #[serde(default)]
-    target: String,
-    #[serde(default)]
-    amount: i64,
-    #[serde(default)]
-    status: String,
-    #[serde(rename = "referenceId", default)]
-    reference_id: String,
-    #[serde(rename = "vendorTrxId", default)]
-    vendor_trx_id: String,
-    #[serde(rename = "customerRefId", default)]
-    customer_ref_id: String,
-    #[serde(default)]
-    sn: String,
-    #[serde(default)]
-    message: String,
-    #[serde(default)]
-    refunded: bool,
-    #[serde(rename = "refundedAt")]
-    refunded_at: Option<String>,
-    #[serde(rename = "refundReason", default)]
-    refund_reason: String,
-    #[serde(default)]
-    source: String,
-    #[serde(rename = "createdAt", default)]
-    created_at: String,
-    #[serde(rename = "updatedAt", default)]
-    updated_at: String,
-    #[serde(rename = "statusUpdatedAt")]
-    status_updated_at: Option<String>,
-    #[serde(rename = "statusUpdateNote", default)]
-    status_update_note: String,
-    #[serde(default)]
-    user: UserBriefJson,
-    #[serde(default)]
-    product: ProductBriefJson,
-    #[serde(rename = "statusUpdatedBy", default)]
-    status_updated_by: UserBriefJson,
-    #[serde(rename = "discountVoucherCode", default)]
-    discount_voucher_code: Option<String>,
-    #[serde(rename = "discountAmount", default)]
-    discount_amount: Option<i64>,
-    #[serde(rename = "baseAmount", default)]
-    base_amount: Option<i64>,
-    #[serde(rename = "flashSale", default)]
-    flash_sale: Option<String>,
-}
-
-#[derive(Default, serde::Deserialize)]
-struct UserBriefJson {
-    #[serde(rename = "_id", default)]
-    id: String,
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    email: String,
-    role: Option<String>,
-}
-
-#[derive(Default, serde::Deserialize)]
-struct ProductBriefJson {
-    #[serde(rename = "_id", default)]
-    id: String,
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    code: String,
-    #[serde(default)]
-    category: String,
-    #[serde(default)]
-    brand: String,
-    #[serde(rename = "vendorName", default)]
-    vendor_name: String,
-}
-
-fn manual_item_from_json(value: ManualTransactionItemJson) -> ManualTransactionItem {
-    ManualTransactionItem {
-        id: value.id,
-        target: value.target,
-        amount: value.amount,
-        status: value.status,
-        reference_id: value.reference_id,
-        vendor_trx_id: value.vendor_trx_id,
-        customer_ref_id: value.customer_ref_id,
-        sn: value.sn,
-        message: value.message,
-        refunded: value.refunded,
-        refunded_at: value.refunded_at,
-        refund_reason: value.refund_reason,
-        source: value.source,
-        created_at: value.created_at,
-        updated_at: value.updated_at,
-        status_updated_at: value.status_updated_at,
-        status_update_note: value.status_update_note,
-        discount_voucher_code: value.discount_voucher_code,
-        discount_amount: value.discount_amount,
-        base_amount: value.base_amount,
-        flash_sale: value.flash_sale,
-        user: UserBrief {
-            id: value.user.id,
-            name: value.user.name,
-            email: value.user.email,
-            role: value.user.role,
-        },
-        product: ProductBrief {
-            id: value.product.id,
-            name: value.product.name,
-            code: value.product.code,
-            category: value.product.category,
-            brand: value.product.brand,
-            vendor_name: value.product.vendor_name,
-        },
-        status_updated_by: UserBrief {
-            id: value.status_updated_by.id,
-            name: value.status_updated_by.name,
-            email: value.status_updated_by.email,
-            role: value.status_updated_by.role,
-        },
-    }
-}
-
-async fn reconstruct_refund_snapshot_immutable(
-    claimed: &Document,
-    users: &mongodb::Collection<Document>,
-    key: &str,
-    effect_identity: Option<&EffectIdentity>,
-) -> Option<CompletedSnapshot> {
-    let phase = claimed.get_str("refundPhase").ok()?;
-    // Claim alone is never enough.
-    if phase != REFUND_PHASE_CREDITED && phase != REFUND_PHASE_AUDITED {
-        // Also accept credit marker on user even if phase lagging — full identity only.
-        let user_id = claimed.get_object_id("user").ok()?;
-        let user = users
-            .find_one(doc! { "_id": user_id })
-            .await
-            .ok()
-            .flatten()?;
-        let has_credit = if let Some(identity) = effect_identity {
-            find_balance_effect_by_identity(&user, identity).is_some()
-        } else {
-            false
-        };
-        if !has_credit {
-            return None;
-        }
-    }
-    let body = build_immutable_refund_response(
-        claimed,
-        claimed.get_str("refundReason").unwrap_or_default(),
-    )?;
-    let transaction_id = claimed.get_object_id("_id").ok()?;
-    Some(CompletedSnapshot {
-        status: 200,
-        body,
-        resource_id: Some(transaction_id.to_hex()),
-    })
-}
-
-struct RefundMarkerRecovery<'a> {
-    transactions: &'a mongodb::Collection<Document>,
-    users: &'a mongodb::Collection<Document>,
-    adjustments: &'a mongodb::Collection<Document>,
-    processor_id: ObjectId,
-    transaction_id: ObjectId,
-    reason: String,
-    request_digest: String,
-}
-
-impl DomainMarkerRecovery for RefundMarkerRecovery<'_> {
-    async fn recover(
-        &self,
-        actor_id: ObjectId,
-        route_key: &str,
-        idempotency_key: &str,
-        request_digest: &str,
-    ) -> DomainRecovery {
-        if route_key != ROUTE_TRANSACTION_REFUND || actor_id != self.processor_id {
-            return DomainRecovery::None;
-        }
-        if request_digest != self.request_digest {
-            return DomainRecovery::None;
-        }
-        let identity = EffectIdentity::refund(
-            actor_id,
-            idempotency_key,
-            request_digest,
-            self.transaction_id,
-        );
-        let Some(document) = (match self
-            .transactions
-            .find_one(doc! {
-                "_id": self.transaction_id,
-                "refunded": true,
-                "refundedBy": self.processor_id,
-                "refundReason": &self.reason,
-                "idempotencyKey": idempotency_key,
-            })
-            .await
-        {
-            Ok(value) => value,
-            Err(_) => return DomainRecovery::None,
-        }) else {
-            return DomainRecovery::None;
-        };
-
-        let phase = document
-            .get_str("refundPhase")
-            .unwrap_or(REFUND_PHASE_CLAIMED);
-
-        // Claim alone is NOT completion proof.
-        if phase == REFUND_PHASE_CLAIMED {
-            // Credit marker may exist even if phase lagging.
-            if let Ok(user_id) = document.get_object_id("user") {
-                if let Ok(Some(user)) = self.users.find_one(doc! { "_id": user_id }).await {
-                    if find_balance_effect_by_identity(&user, &identity).is_some() {
-                        if let Some(snapshot) = reconstruct_refund_snapshot_immutable(
-                            &document,
-                            self.users,
-                            idempotency_key,
-                            Some(&identity),
-                        )
-                        .await
-                        {
-                            let has_audit = self
-                                .adjustments
-                                .find_one(doc! {
-                                    "idempotencyKey": idempotency_key,
-                                    "adjustedBy": self.processor_id,
-                                    "transactionId": self.transaction_id,
-                                    "routeKey": ROUTE_TRANSACTION_REFUND,
-                                    "requestDigest": request_digest,
-                                })
-                                .await
-                                .ok()
-                                .flatten()
-                                .is_some();
-                            if has_audit {
-                                return DomainRecovery::EffectApplied {
-                                    snapshot: Some(snapshot),
-                                };
-                            }
-                        }
-                        return DomainRecovery::EffectApplied { snapshot: None };
-                    }
-                }
-            }
-            // Claim without credit: allow forward reconcile (Started), not success replay.
-            return DomainRecovery::EffectApplied { snapshot: None };
-        }
-
-        if phase == REFUND_PHASE_CREDITED || phase == REFUND_PHASE_AUDITED {
-            if let Some(snapshot) = reconstruct_refund_snapshot_immutable(
-                &document,
-                self.users,
-                idempotency_key,
-                Some(&identity),
-            )
-            .await
-            {
-                let has_audit = self
-                    .adjustments
-                    .find_one(doc! {
-                        "idempotencyKey": idempotency_key,
-                        "adjustedBy": self.processor_id,
-                        "transactionId": self.transaction_id,
-                        "routeKey": ROUTE_TRANSACTION_REFUND,
-                        "requestDigest": request_digest,
-                    })
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some();
-                if has_audit || phase == REFUND_PHASE_AUDITED {
-                    return DomainRecovery::EffectApplied {
-                        snapshot: Some(snapshot),
-                    };
-                }
-                return DomainRecovery::EffectApplied { snapshot: None };
-            }
-            return DomainRecovery::EffectApplied { snapshot: None };
-        }
-
-        DomainRecovery::EffectApplied { snapshot: None }
-    }
-}
-
-/// Release only for pure pre-effect aborts (before claim). Never after claim/credit.
-async fn release_refund_started_pre_effect(
-    db: &mongodb::Database,
-    processor_id: ObjectId,
-    key: Option<&str>,
-    request_digest: &str,
-    lease_generation: u64,
-) {
-    let Some(key) = key else {
-        return;
-    };
-    let store = MongoIdempotencyStore::new(db);
-    let _ = store
-        .release_started(
-            processor_id,
-            ROUTE_TRANSACTION_REFUND,
-            key,
-            request_digest,
-            lease_generation,
-        )
-        .await;
-}
-
-fn is_duplicate_key_error(error: &mongodb::error::Error) -> bool {
-    match error.kind.as_ref() {
-        mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(write)) => {
-            write.code == 11000
-        }
-        _ => {
-            let message = error.to_string();
-            message.contains("E11000") || message.contains("duplicate key")
-        }
-    }
-}
-
-pub async fn update_status(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(payload): Json<StatusUpdatePayload>,
-) -> Response {
-    let proxy_user = match require_permission(&headers, &state, "processManualTransaction").await {
-        Ok(user) => user,
-        Err(response) => return response,
-    };
-    if let Err(response) = require_trusted_step_up_group(&headers, "transactions.manual") {
-        return response;
-    }
-    let processor_id = proxy_user.id;
-    let Ok(transaction_id) = ObjectId::parse_str(id.trim()) else {
-        return status_message(StatusCode::BAD_REQUEST, "ID transaksi tidak valid");
-    };
-    let payload = match normalize_status_payload(payload) {
-        Ok(payload) => payload,
-        Err(response) => return response,
-    };
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-
-    let db = client.database(&state.mongo_db);
-    let transactions = db.collection::<Document>("transactions");
-    let users = db.collection::<Document>("users");
-    let point_transactions = db.collection::<Document>("pointtransactions");
-    let settings = db.collection::<Document>("settings");
-    let Some(transaction) = (match transactions.find_one(doc! { "_id": transaction_id }).await {
-        Ok(value) => value,
-        Err(_) => return internal_error(),
-    }) else {
-        return status_message(StatusCode::NOT_FOUND, "Transaction not found");
-    };
-
-    let Some(user_id) = transaction.get_object_id("user").ok() else {
-        return status_message(StatusCode::NOT_FOUND, "User transaksi tidak ditemukan");
-    };
-    let amount = read_i64(&transaction, "amount");
-    let Some(snapshot) = transaction_status_snapshot(&transaction) else {
-        return internal_error();
-    };
-    let transition =
-        apply_transition_plan(&snapshot.status, snapshot.refunded, amount, &payload.status);
-    let audit_note = build_admin_status_note(&snapshot.status, &payload.status, &payload.note);
-
-    let mut balance_delta_applied = 0;
-    let mut points_revoked = 0;
-    let mut points_awarded = 0;
-    let mut claimed = false;
-
-    let result = async {
-        let now = DateTime::now();
-        let mut set_fields = doc! {
-            "status": &payload.status,
-            "refunded": transition.next_refunded,
-            "statusUpdatedBy": processor_id,
-            "statusUpdatedAt": now,
-            "updatedAt": now,
-        };
-        let mut unset_fields = Document::new();
-
-        apply_optional_payload_string(
-            &mut set_fields,
-            &mut unset_fields,
-            "vendorTrxId",
-            &payload.vendor_trx_id,
-        );
-        apply_optional_payload_string(&mut set_fields, &mut unset_fields, "sn", &payload.sn);
-        if payload.note.is_empty() {
-            unset_fields.insert("statusUpdateNote", 1);
-        } else {
-            set_fields.insert("statusUpdateNote", payload.note.clone());
-        }
-
-        let mut update = doc! { "$set": set_fields };
-        if !unset_fields.is_empty() {
-            update.insert("$unset", unset_fields);
-        }
-        let updated_transaction = transactions
-            .find_one_and_update(
-                doc! {
-                    "_id": transaction_id,
-                    "status": &snapshot.status,
-                    "refunded": snapshot.refunded,
-                    "updatedAt": snapshot.updated_at,
-                },
-                update,
-            )
-            .return_document(ReturnDocument::After)
-            .await
-            .map_err(|_| StatusUpdateError::Internal)?
-            .ok_or(StatusUpdateError::Conflict)?;
-        claimed = true;
-
-        if transition.balance_delta != 0 {
-            apply_user_balance_delta(&users, user_id, transition.balance_delta).await?;
-            balance_delta_applied = transition.balance_delta;
-        }
-
-        if transition.should_revoke_points {
-            points_revoked = revoke_awarded_points(
-                &users,
-                &point_transactions,
-                user_id,
-                transaction_id,
-                &audit_note,
-            )
-            .await?;
-        }
-
-        if transition.should_award_points {
-            points_awarded = award_points(
-                &settings,
-                &users,
-                &point_transactions,
-                user_id,
-                amount,
-                transaction_id,
-                &audit_note,
-            )
-            .await?;
-        }
-
-        Ok::<Document, StatusUpdateError>(updated_transaction)
-    }
-    .await;
-
-    let fallback_transaction = match result {
-        Ok(transaction) => transaction,
-        Err(error) => {
-            if claimed {
-                rollback_transaction_status(&transactions, transaction_id, &snapshot).await;
-            }
-            if points_awarded > 0 {
-                let _ = revoke_awarded_points(
-                    &users,
-                    &point_transactions,
-                    user_id,
-                    transaction_id,
-                    "Rollback points after failed transaction status update",
-                )
-                .await;
-            }
-            if points_revoked > 0 {
-                let _ = award_points(
-                    &settings,
-                    &users,
-                    &point_transactions,
-                    user_id,
-                    amount,
-                    transaction_id,
-                    "Rollback points after failed transaction status update",
-                )
-                .await;
-            }
-            if balance_delta_applied != 0 {
-                let _ = apply_user_balance_delta(&users, user_id, -balance_delta_applied).await;
-            }
-
-            return error.into_response();
-        }
-    };
-
-    let populated = match populated_transaction_item(&db, transaction_id).await {
-        Some(item) => item,
-        None => manual_transaction_item_from_doc(fallback_transaction),
-    };
-    Json(StatusUpdateResponse {
-        message: "Transaction updated",
-        transaction: populated,
-    })
-    .into_response()
-}
-
-pub async fn recheck_status(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Response {
-    let proxy_user = match require_permission(&headers, &state, "processManualTransaction").await {
-        Ok(user) => user,
-        Err(response) => return response,
-    };
-    let processor_id = proxy_user.id;
-    let Ok(transaction_id) = ObjectId::parse_str(id.trim()) else {
-        return status_message(StatusCode::BAD_REQUEST, "ID transaksi tidak valid");
-    };
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-
-    let db = client.database(&state.mongo_db);
-    let transactions = db.collection::<Document>("transactions");
-    let users = db.collection::<Document>("users");
-    let point_transactions = db.collection::<Document>("pointtransactions");
-    let settings = db.collection::<Document>("settings");
-    let Some(transaction) = (match transactions.find_one(doc! { "_id": transaction_id }).await {
-        Ok(value) => value,
-        Err(_) => return internal_error(),
-    }) else {
-        return status_message(StatusCode::NOT_FOUND, "Transaction not found");
-    };
-
-    let current_status = read_string(&transaction, "status");
-    if !matches!(current_status.as_str(), "pending" | "processing") {
-        return status_message(
-            StatusCode::BAD_REQUEST,
-            "Hanya transaksi pending/proses yang bisa dicek ulang ke vendor",
-        );
-    }
-
-    let product = if let Ok(product_id) = transaction.get_object_id("product") {
-        match find_product_for_recheck(&db, product_id).await {
-            ProductRecheckTarget::Vendor(product) => Some(product),
-            ProductRecheckTarget::Validation => {
-                return status_message(
-                    StatusCode::BAD_REQUEST,
-                    "Produk validasi menunggu review manual dan tidak dicek ulang ke vendor",
-                );
-            }
-            ProductRecheckTarget::Missing => None,
-        }
-    } else {
-        None
-    };
-    let vendor_status = match check_vendor_status(&state, &transaction, product.as_ref()).await {
-        Ok(value) => value,
-        Err(_) => return internal_error(),
-    };
-
-    if vendor_status.status == "pending" {
-        let populated = populated_transaction_item(&db, transaction_id).await;
-        return Json(RecheckResponse {
-            changed: false,
-            status: current_status,
-            message: vendor_status.message.clone(),
-            vendor_message: vendor_status.message,
-            transaction: populated,
-        })
-        .into_response();
-    }
-
-    let Some(user_id) = transaction.get_object_id("user").ok() else {
-        return status_message(StatusCode::NOT_FOUND, "User transaksi tidak ditemukan");
-    };
-    let amount = read_i64(&transaction, "amount");
-    let Some(snapshot) = transaction_status_snapshot(&transaction) else {
-        return internal_error();
-    };
-    let transition = apply_transition_plan(
-        &snapshot.status,
-        snapshot.refunded,
-        amount,
-        &vendor_status.status,
-    );
-    let audit_note = format!("Vendor recheck: {}", vendor_status.message);
-
-    let mut balance_delta_applied = 0;
-    let mut points_revoked = 0;
-    let mut points_awarded = 0;
-    let mut claimed = false;
-
-    let result = async {
-        let now = DateTime::now();
-        let mut set_fields = doc! {
-            "status": &vendor_status.status,
-            "refunded": transition.next_refunded,
-            "statusUpdatedBy": processor_id,
-            "statusUpdatedAt": now,
-            "statusUpdateNote": &audit_note,
-            "updatedAt": now,
-        };
-        let mut unset_fields = Document::new();
-        insert_optional_string_or_unset(
-            &mut set_fields,
-            &mut unset_fields,
-            "sn",
-            vendor_status.sn.as_deref(),
-        );
-
-        let mut update = doc! { "$set": set_fields };
-        if !unset_fields.is_empty() {
-            update.insert("$unset", unset_fields);
-        }
-
-        let updated_transaction = transactions
-            .find_one_and_update(
-                doc! {
-                    "_id": transaction_id,
-                    "status": &snapshot.status,
-                    "refunded": snapshot.refunded,
-                    "updatedAt": snapshot.updated_at,
-                },
-                update,
-            )
-            .return_document(ReturnDocument::After)
-            .await
-            .map_err(|_| StatusUpdateError::Internal)?
-            .ok_or(StatusUpdateError::Conflict)?;
-        claimed = true;
-
-        if transition.balance_delta != 0 {
-            apply_user_balance_delta(&users, user_id, transition.balance_delta).await?;
-            balance_delta_applied = transition.balance_delta;
-        }
-
-        if transition.should_revoke_points {
-            points_revoked = revoke_awarded_points(
-                &users,
-                &point_transactions,
-                user_id,
-                transaction_id,
-                &audit_note,
-            )
-            .await?;
-        }
-
-        if transition.should_award_points {
-            points_awarded = award_points(
-                &settings,
-                &users,
-                &point_transactions,
-                user_id,
-                amount,
-                transaction_id,
-                &audit_note,
-            )
-            .await?;
-        }
-
-        Ok::<Document, StatusUpdateError>(updated_transaction)
-    }
-    .await;
-
-    if let Err(error) = result {
-        if claimed {
-            rollback_transaction_status(&transactions, transaction_id, &snapshot).await;
-        }
-        if points_awarded > 0 {
-            let _ = revoke_awarded_points(
-                &users,
-                &point_transactions,
-                user_id,
-                transaction_id,
-                "Rollback points after failed transaction recheck",
-            )
-            .await;
-        }
-        if points_revoked > 0 {
-            let _ = award_points(
-                &settings,
-                &users,
-                &point_transactions,
-                user_id,
-                amount,
-                transaction_id,
-                "Rollback points after failed transaction recheck",
-            )
-            .await;
-        }
-        if balance_delta_applied != 0 {
-            let _ = apply_user_balance_delta(&users, user_id, -balance_delta_applied).await;
-        }
-
-        return error.into_response();
-    }
-
-    let populated = populated_transaction_item(&db, transaction_id).await;
-    Json(RecheckResponse {
-        changed: true,
-        status: vendor_status.status,
-        message: "Status transaksi diperbarui dari vendor".to_string(),
-        vendor_message: vendor_status.message,
-        transaction: populated,
-    })
-    .into_response()
+pub async fn recheck_status(headers: HeaderMap, State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    if let Err(r)=require_sql_permission(&headers,&state,"processManualTransaction").await{return r;}
+    let Some(id)=uuid::Uuid::parse_str(id.trim()).ok()else{return status_message(StatusCode::BAD_REQUEST,"ID transaksi tidak valid")};
+    let row=match sqlx::query("SELECT status,snapshot FROM financial_transactions WHERE id=$1").bind(id).fetch_optional(&state.pg_pool).await{Ok(Some(v))=>v,Ok(None)=>return status_message(StatusCode::NOT_FOUND,"Transaction not found"),Err(_)=>return internal_error()};
+    if !matches!(row.get::<String,_>("status").as_str(),"pending"|"processing"){return status_message(StatusCode::BAD_REQUEST,"Hanya transaksi pending/proses yang bisa dicek ulang ke vendor")}
+    status_message(StatusCode::SERVICE_UNAVAILABLE,"Vendor recheck unavailable: this route cannot safely resolve encrypted seller credentials or claim and settle provider work through the SQL provider contract; transaction unchanged")
 }
 
 pub async fn member_transactions(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    let proxy_user = match require_member_user(&headers, &state).await {
+    let proxy_user = match require_sql_user(&headers, &state).await {
         Ok(user) => user,
         Err(response) => return response,
     };
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
     let user_id = proxy_user.id;
     let role = proxy_user.role.as_str();
-    let db = client.database(&state.mongo_db);
-    let balance_filter = if matches!(role, "owner" | "admin" | "cs") {
-        doc! {}
-    } else {
-        doc! { "user": user_id }
+    let all_users = matches!(role, "owner" | "admin" | "cs");
+    let member_rows = match sqlx::query(
+        "SELECT t.id,t.user_id,t.product_id,t.reference_id,t.partner_ref,t.amount,t.status,t.refunded,t.snapshot,t.created_at,t.updated_at,t.target,t.source,t.provider_reference,t.provider_result,\
+         COALESCE(u.name,'') user_name,COALESCE(p.name,'') product_name,COALESCE(p.code,'') product_code \
+         FROM financial_transactions t LEFT JOIN users u ON u.id=t.user_id LEFT JOIN products p ON p.id=t.product_id \
+         WHERE t.kind='member' AND ($1 OR t.user_id=$2) ORDER BY t.created_at DESC",
+    )
+    .bind(all_users)
+    .bind(user_id)
+    .fetch_all(&state.pg_pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return internal_error(),
     };
-    let balance_transactions = load_sorted_docs(&db, "transactions", balance_filter).await;
-    let products = transaction_products(&db, &balance_transactions).await;
-    let users = transaction_users(&db, &balance_transactions).await;
-    let mut items = balance_transactions
-        .into_iter()
-        .map(|document| balance_transaction_json(document, &users, &products))
-        .collect::<Vec<_>>();
-
-    if !matches!(role, "owner" | "admin" | "cs") {
-        let guest_transactions =
-            load_sorted_docs(&db, "guesttransactions", doc! { "user": user_id }).await;
-        let guest_products = transaction_products(&db, &guest_transactions).await;
-        items.extend(
-            guest_transactions
-                .into_iter()
-                .map(|document| guest_transaction_json(document, user_id, &guest_products)),
-        );
+    let mut items = member_rows.into_iter().map(|row| {
+        let created_at = row.get::<chrono::DateTime<chrono::Utc>, _>("created_at");
+        let updated_at = row.get::<chrono::DateTime<chrono::Utc>, _>("updated_at");
+        serde_json::json!({
+            "_id": row.get::<uuid::Uuid, _>("id").to_string(),
+            "user": {"_id": row.try_get::<Option<uuid::Uuid>,_>("user_id").ok().flatten().map(|v| v.to_string()),"name":row.get::<String,_>("user_name"),"email":row.get::<String,_>("user_email")},
+            "product": {"_id": row.get::<uuid::Uuid,_>("product_id").to_string(),"name":row.get::<String,_>("product_name"),"code":row.get::<String,_>("product_code")},
+            "target":row.get::<String,_>("target"),"amount":row.get::<i64,_>("amount"),"status":row.get::<String,_>("status"),
+            "referenceId":row.get::<String,_>("reference_id"),"customerRefId":row.try_get::<Option<String>,_>("partner_ref").ok().flatten(),
+            "source":row.get::<String,_>("source"),"refunded":row.get::<bool,_>("refunded"),"createdAt":created_at.to_rfc3339(),"updatedAt":updated_at.to_rfc3339(),
+            "vendorTrxId":row.try_get::<Option<String>,_>("provider_reference").ok().flatten(),
+            "sn":row.get::<Value,_>("provider_result").get("sn").and_then(Value::as_str),
+            "message":row.get::<Value,_>("provider_result").get("message").and_then(Value::as_str)
+        })
+    }).collect::<Vec<_>>();
+    if !all_users {
+        let guest_rows = match sqlx::query(
+            "SELECT gt.id,gt.product_id,gt.user_id,gt.invoice_number,gt.target,gt.total_amount,gt.payment_status,gt.transaction_status,gt.created_at,gt.updated_at,gt.vendor_trx_id,gt.sn,gt.provider_result,COALESCE(p.name,'') product_name,COALESCE(p.code,'') product_code FROM guest_transactions gt LEFT JOIN products p ON p.id=gt.product_id WHERE gt.user_id=$1 ORDER BY gt.created_at DESC",
+        ).bind(user_id).fetch_all(&state.pg_pool).await { Ok(rows)=>rows,Err(_)=>return internal_error() };
+        items.extend(guest_rows.into_iter().map(|row| {
+            let id=row.get::<uuid::Uuid,_>("id"); let created_at=row.get::<chrono::DateTime<chrono::Utc>,_>("created_at"); let updated_at=row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at");
+            serde_json::json!({"_id":id.to_string(),"user":user_id.to_string(),"product":{"_id":row.get::<uuid::Uuid,_>("product_id").to_string(),"name":row.get::<String,_>("product_name"),"code":row.get::<String,_>("product_code")},"target":row.get::<String,_>("target"),"amount":row.get::<i64,_>("total_amount"),"status":row.get::<String,_>("transaction_status"),"paymentStatus":row.get::<String,_>("payment_status"),"referenceId":row.get::<String,_>("invoice_number"),"vendorTrxId":row.try_get::<Option<String>,_>("vendor_trx_id").ok().flatten(),"sn":row.try_get::<Option<String>,_>("sn").ok().flatten(),"source":"guest","createdAt":created_at.to_rfc3339(),"updatedAt":updated_at.to_rfc3339(),"providerResult":row.get::<Value,_>("provider_result")})
+        }));
     }
-
-    items.sort_by(|left, right| json_date(right, "createdAt").cmp(&json_date(left, "createdAt")));
+    items.sort_by(|left,right| right.get("createdAt").and_then(Value::as_str).cmp(&left.get("createdAt").and_then(Value::as_str)));
     Json(Value::Array(items)).into_response()
-}
-
-fn manual_transaction_item_from_doc(mut document: Document) -> ManualTransactionItem {
-    let id = document
-        .remove("_id")
-        .and_then(|value| value.as_object_id())
-        .map(|id| id.to_hex())
-        .unwrap_or_default();
-
-    ManualTransactionItem {
-        id,
-        target: read_string(&document, "target"),
-        amount: read_i64(&document, "amount"),
-        status: read_string(&document, "status"),
-        reference_id: read_string(&document, "referenceId"),
-        vendor_trx_id: read_string(&document, "vendorTrxId"),
-        customer_ref_id: read_string(&document, "customerRefId"),
-        sn: read_string(&document, "sn"),
-        message: read_string(&document, "message"),
-        refunded: document.get_bool("refunded").unwrap_or(false),
-        refunded_at: date_string(&document, "refundedAt"),
-        refund_reason: read_string(&document, "refundReason"),
-        source: non_empty_or(read_string(&document, "source"), "web"),
-        created_at: date_string(&document, "createdAt").unwrap_or_default(),
-        updated_at: date_string(&document, "updatedAt").unwrap_or_default(),
-        status_updated_at: date_string(&document, "statusUpdatedAt"),
-        status_update_note: read_string(&document, "statusUpdateNote"),
-        user: document
-            .get_document("user")
-            .ok()
-            .and_then(user_brief_from_doc)
-            .unwrap_or_default(),
-        product: document
-            .get_document("product")
-            .ok()
-            .and_then(product_brief_from_doc)
-            .unwrap_or_default(),
-        status_updated_by: document
-            .get_document("statusUpdatedBy")
-            .ok()
-            .and_then(user_brief_from_doc)
-            .unwrap_or_default(),
-        discount_voucher_code: document
-            .get_str("discountVoucherCode")
-            .ok()
-            .map(ToString::to_string)
-            .filter(|value| !value.is_empty()),
-        discount_amount: document
-            .get("discountAmount")
-            .and_then(|value| match value {
-                Bson::Int32(v) => Some(i64::from(*v)),
-                Bson::Int64(v) => Some(*v),
-                Bson::Double(v) => Some(*v as i64),
-                _ => None,
-            })
-            .filter(|value| *value > 0),
-        base_amount: document
-            .get("baseAmount")
-            .and_then(|value| match value {
-                Bson::Int32(v) => Some(i64::from(*v)),
-                Bson::Int64(v) => Some(*v),
-                Bson::Double(v) => Some(*v as i64),
-                _ => None,
-            })
-            .filter(|value| *value > 0),
-        flash_sale: document
-            .get_object_id("flashSale")
-            .ok()
-            .map(|id| id.to_hex())
-            .or_else(|| {
-                document
-                    .get_str("flashSale")
-                    .ok()
-                    .map(ToString::to_string)
-                    .filter(|value| !value.is_empty())
-            }),
-    }
-}
-
-fn transaction_refund_snapshot(document: &Document) -> Option<TransactionRefundSnapshot> {
-    Some(TransactionRefundSnapshot {
-        status: read_string(document, "status"),
-        updated_at: *document.get_datetime("updatedAt").ok()?,
-        refunded: document.get_bool("refunded").unwrap_or(false),
-        refunded_by: document.get_object_id("refundedBy").ok(),
-        refunded_at: document.get_datetime("refundedAt").ok().copied(),
-        refund_reason: document
-            .get_str("refundReason")
-            .ok()
-            .map(ToString::to_string),
-        status_updated_by: document.get_object_id("statusUpdatedBy").ok(),
-        status_updated_at: document.get_datetime("statusUpdatedAt").ok().copied(),
-        status_update_note: document
-            .get_str("statusUpdateNote")
-            .ok()
-            .map(ToString::to_string),
-    })
-}
-
-fn build_refund_reason(transaction_id: &ObjectId, reason: &str) -> String {
-    let id = transaction_id.to_hex();
-    let suffix = id
-        .get(id.len().saturating_sub(8)..)
-        .unwrap_or(id.as_str())
-        .to_uppercase();
-    format!("Refund transaksi {suffix}: {reason}")
-}
-
-async fn rollback_transaction_refund(
-    transactions: &mongodb::Collection<Document>,
-    transaction_id: ObjectId,
-    snapshot: &TransactionRefundSnapshot,
-) {
-    let mut set_fields = doc! {
-        "status": &snapshot.status,
-        "refunded": snapshot.refunded,
-        "updatedAt": snapshot.updated_at,
-    };
-    let mut unset_fields = Document::new();
-    insert_optional_object_id_or_unset(
-        &mut set_fields,
-        &mut unset_fields,
-        "refundedBy",
-        snapshot.refunded_by,
-    );
-    insert_optional_datetime_or_unset(
-        &mut set_fields,
-        &mut unset_fields,
-        "refundedAt",
-        snapshot.refunded_at,
-    );
-    insert_optional_string_or_unset(
-        &mut set_fields,
-        &mut unset_fields,
-        "refundReason",
-        snapshot.refund_reason.as_deref(),
-    );
-    insert_optional_object_id_or_unset(
-        &mut set_fields,
-        &mut unset_fields,
-        "statusUpdatedBy",
-        snapshot.status_updated_by,
-    );
-    insert_optional_datetime_or_unset(
-        &mut set_fields,
-        &mut unset_fields,
-        "statusUpdatedAt",
-        snapshot.status_updated_at,
-    );
-    insert_optional_string_or_unset(
-        &mut set_fields,
-        &mut unset_fields,
-        "statusUpdateNote",
-        snapshot.status_update_note.as_deref(),
-    );
-
-    let mut update = doc! { "$set": set_fields };
-    if !unset_fields.is_empty() {
-        update.insert("$unset", unset_fields);
-    }
-    let _ = transactions
-        .update_one(doc! { "_id": transaction_id }, update)
-        .await;
 }
 
 fn normalize_status_payload(payload: StatusUpdatePayload) -> Result<StatusPayload, Response> {
@@ -2437,750 +443,33 @@ fn normalize_payload_text(value: Option<&str>) -> String {
     value.unwrap_or_default().trim().to_string()
 }
 
-async fn active_maintenance_message(db: &mongodb::Database) -> Option<String> {
-    let settings = db.collection::<Document>("settings");
-    let maintenance = settings
-        .find_one(doc! { "key": "maintenanceMode" })
-        .await
-        .ok()
-        .flatten()
-        .and_then(|document| document.get("value").cloned())
-        .map(|value| bson_to_bool(&value))
-        .unwrap_or(false);
-    if !maintenance {
-        return None;
-    }
-
-    let message = settings
-        .find_one(doc! { "key": "maintenanceMessage" })
-        .await
-        .ok()
-        .flatten()
-        .and_then(|document| document.get("value").cloned())
-        .and_then(|value| match value {
-            Bson::String(value) => Some(value.trim().to_string()),
-            _ => None,
-        })
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
-            "Sistem sedang dalam pemeliharaan. Silakan coba beberapa saat lagi.".to_string()
-        });
-    Some(message)
+fn date_key(date: chrono::DateTime<chrono::Utc>) -> String {
+    date.format("%Y-%m-%d").to_string()
 }
 
-fn bson_to_bool(value: &Bson) -> bool {
-    match value {
-        Bson::Boolean(value) => *value,
-        Bson::String(value) => value == "true" || value == "1",
-        Bson::Int32(value) => *value != 0,
-        Bson::Int64(value) => *value != 0,
-        Bson::Double(value) => *value != 0.0,
-        _ => false,
-    }
-}
+fn apply_transition_plan(
+    current_status: &str,
+    refunded: bool,
+    amount: i64,
+    next_status: &str,
+) -> TransitionPlan {
+    let mut balance_delta = 0;
+    let mut next_refunded = refunded;
 
-fn product_price_for_level(product: &Document, level: &str) -> i64 {
-    let price = product.get_document("price").ok();
-    let key = if matches!(level, "gold" | "platinum") {
-        level
-    } else {
-        "basic"
-    };
-    price
-        .map(|document| read_i64(document, key))
-        .filter(|value| *value > 0)
-        .unwrap_or(0)
-}
-
-async fn product_purchase_issues(db: &mongodb::Database, product: &Document) -> Vec<String> {
-    let mut issues = Vec::new();
-    if referenced_status_false(db, "categories", product.get_object_id("categoryId").ok()).await
-        || named_status_false(db, "categories", &read_string(product, "category")).await
-    {
-        issues.push("Kategori nonaktif".to_string());
-    }
-    if referenced_status_false(db, "operators", product.get_object_id("operatorId").ok()).await
-        || named_status_false(db, "operators", &read_string(product, "brand")).await
-    {
-        issues.push("Operator nonaktif".to_string());
-    }
-    if referenced_status_false(
-        db,
-        "producttypes",
-        product.get_object_id("productTypeId").ok(),
-    )
-    .await
-    {
-        issues.push("Jenis produk nonaktif".to_string());
-    }
-    issues
-}
-
-async fn referenced_status_false(
-    db: &mongodb::Database,
-    collection: &str,
-    id: Option<ObjectId>,
-) -> bool {
-    let Some(id) = id else {
-        return false;
-    };
-    db.collection::<Document>(collection)
-        .find_one(doc! { "_id": id })
-        .projection(doc! { "status": 1 })
-        .await
-        .ok()
-        .flatten()
-        .and_then(|document| document.get_bool("status").ok())
-        == Some(false)
-}
-
-async fn named_status_false(db: &mongodb::Database, collection: &str, name: &str) -> bool {
-    if name.trim().is_empty() {
-        return false;
-    }
-    db.collection::<Document>(collection)
-        .find_one(
-            doc! { "name": { "$regex": format!("^{}$", escape_regex(name)), "$options": "i" } },
-        )
-        .projection(doc! { "status": 1 })
-        .await
-        .ok()
-        .flatten()
-        .and_then(|document| document.get_bool("status").ok())
-        == Some(false)
-}
-
-async fn reserve_flash_sale_stock(
-    db: &mongodb::Database,
-    product_id: Option<ObjectId>,
-    base_price: i64,
-) -> Option<FlashSaleReservation> {
-    let product_id = product_id?;
-    let now = DateTime::now();
-    let flash_sale = db
-        .collection::<Document>("flashsales")
-        .find_one(doc! {
-            "isActive": true,
-            "startDate": { "$lte": now },
-            "endDate": { "$gte": now },
-            "products.productId": product_id,
-        })
-        .await
-        .ok()
-        .flatten()?;
-    let products = flash_sale.get_array("products").ok()?;
-    let flash_product = products.iter().find_map(|value| match value {
-        Bson::Document(document)
-            if document.get_object_id("productId").ok() == Some(product_id) =>
-        {
-            Some(document)
-        }
-        _ => None,
-    })?;
-    let stock = read_i64(flash_product, "stock");
-    let sold_count = read_i64(flash_product, "soldCount");
-    if stock - sold_count <= 0 {
-        return None;
-    }
-    let discount_type = read_string(flash_product, "discountType");
-    let discount_value = read_i64(flash_product, "discountValue");
-    let price = if discount_type == "percentage" {
-        (base_price - ((base_price * discount_value) / 100)).max(0)
-    } else {
-        (base_price - discount_value).max(0)
-    };
-    let flash_sale_id = flash_sale.get_object_id("_id").ok()?;
-    let result = db
-        .collection::<Document>("flashsales")
-        .update_one(
-            doc! {
-                "_id": flash_sale_id,
-                "products.productId": product_id,
-                "$expr": {
-                    "$gt": [
-                        {
-                            "$size": {
-                                "$filter": {
-                                    "input": "$products",
-                                    "as": "product",
-                                    "cond": {
-                                        "$and": [
-                                            { "$eq": ["$$product.productId", product_id] },
-                                            { "$gt": [{ "$subtract": ["$$product.stock", "$$product.soldCount"] }, 0] }
-                                        ]
-                                    }
-                                }
-                            }
-                        },
-                        0
-                    ]
-                },
-            },
-            doc! { "$inc": { "products.$.soldCount": 1 } },
-        )
-        .await
-        .ok()?;
-    if result.modified_count == 0 {
-        return None;
-    }
-    Some(FlashSaleReservation {
-        flash_sale_id,
-        product_id,
-        price,
-    })
-}
-
-async fn rollback_flash_sale_stock(
-    db: &mongodb::Database,
-    reservation: Option<&FlashSaleReservation>,
-) {
-    let Some(reservation) = reservation else {
-        return;
-    };
-    let _ = db
-        .collection::<Document>("flashsales")
-        .update_one(
-            doc! { "_id": reservation.flash_sale_id, "products.productId": reservation.product_id },
-            doc! { "$inc": { "products.$.soldCount": -1 } },
-        )
-        .await;
-}
-
-fn recheck_product_from_product_doc(product: &Document) -> RecheckProduct {
-    let vendor = product.get_document("vendor").ok();
-    let code = read_string(product, "code");
-    RecheckProduct {
-        code: code.clone(),
-        vendor_name: vendor
-            .map(|value| read_string(value, "name"))
-            .unwrap_or_default(),
-        vendor_sku: vendor
-            .map(|value| read_string(value, "sku"))
-            .filter(|value| !value.is_empty())
-            .unwrap_or(code),
-    }
-}
-
-async fn apply_initial_validation_result(
-    db: &mongodb::Database,
-    transaction_id: ObjectId,
-    user_id: ObjectId,
-    price: i64,
-    validation_result: super::validation_engine::PaidValidationResult,
-) {
-    let transactions = db.collection::<Document>("transactions");
-    let users = db.collection::<Document>("users");
-    let mut set_fields = doc! {
-        "updatedAt": DateTime::now(),
-        "message": validation_result.message.clone(),
-    };
-    match validation_result.status {
-        PaidValidationStatus::Success => {
-            set_fields.insert("status", "success");
-            set_fields.insert(
-                "statusUpdateNote",
-                format!("Validasi otomatis berhasil: {}", validation_result.message),
-            );
-            if let Some(sn) = validation_result.sn {
-                set_fields.insert("sn", sn);
-            }
-        }
-        PaidValidationStatus::Failed => {
-            set_fields.insert("status", "failed");
-            set_fields.insert(
-                "statusUpdateNote",
-                format!("Validasi otomatis gagal: {}", validation_result.message),
-            );
-            set_fields.insert("refunded", true);
-            set_fields.insert("refundedAt", DateTime::now());
-            set_fields.insert("refundReason", "Validasi otomatis gagal");
-        }
-        PaidValidationStatus::ProviderError => {
-            set_fields.insert("status", "pending");
-            set_fields.insert(
-                "statusUpdateNote",
-                format!("Validasi otomatis tertunda: {}", validation_result.message),
-            );
-        }
-    }
-    let _ = transactions
-        .update_one(doc! { "_id": transaction_id }, doc! { "$set": set_fields })
-        .await;
-
-    if validation_result.status == PaidValidationStatus::Failed {
-        let _ = apply_user_balance_delta(&users, user_id, price).await;
+    if next_status == "failed" && !refunded {
+        balance_delta = amount;
+        next_refunded = true;
+    } else if next_status != "failed" && refunded {
+        balance_delta = -amount;
+        next_refunded = false;
     }
 
-    if validation_result.status == PaidValidationStatus::Success {
-        let _ = award_points(
-            &db.collection::<Document>("settings"),
-            &users,
-            &db.collection::<Document>("pointtransactions"),
-            user_id,
-            price,
-            transaction_id,
-            &format!("Earned from transaction - Rp {}", format_idr_amount(price)),
-        )
-        .await;
+    TransitionPlan {
+        balance_delta,
+        should_award_points: current_status != "success" && next_status == "success",
+        should_revoke_points: current_status == "success" && next_status != "success",
+        next_refunded,
     }
-}
-
-async fn apply_initial_vendor_result(
-    db: &mongodb::Database,
-    transaction_id: ObjectId,
-    user_id: ObjectId,
-    price: i64,
-    vendor_result: &VendorTopUpResult,
-) {
-    let transactions = db.collection::<Document>("transactions");
-    let users = db.collection::<Document>("users");
-    let mut set_fields = doc! {
-        "status": &vendor_result.status,
-        "updatedAt": DateTime::now(),
-    };
-    if let Some(value) = &vendor_result.vendor_trx_id {
-        set_fields.insert("vendorTrxId", value.clone());
-    }
-    if let Some(value) = &vendor_result.sn {
-        set_fields.insert("sn", value.clone());
-    }
-    if let Some(value) = &vendor_result.message {
-        set_fields.insert("message", value.clone());
-    }
-    let _ = transactions
-        .update_one(doc! { "_id": transaction_id }, doc! { "$set": set_fields })
-        .await;
-
-    if vendor_result.status == "failed" {
-        let _ = apply_user_balance_delta(&users, user_id, price).await;
-        let _ = transactions
-            .update_one(
-                doc! { "_id": transaction_id },
-                doc! {
-                    "$set": {
-                        "refunded": true,
-                        "refundedAt": DateTime::now(),
-                        "refundReason": "Vendor returned failed during initial processing",
-                        "updatedAt": DateTime::now(),
-                    }
-                },
-            )
-            .await;
-    }
-
-    if vendor_result.status == "success" {
-        let _ = award_points(
-            &db.collection::<Document>("settings"),
-            &users,
-            &db.collection::<Document>("pointtransactions"),
-            user_id,
-            price,
-            transaction_id,
-            &format!("Earned from transaction - Rp {}", format_idr_amount(price)),
-        )
-        .await;
-    }
-}
-
-enum ProductRecheckTarget {
-    Vendor(RecheckProduct),
-    Validation,
-    Missing,
-}
-
-async fn find_product_for_recheck(
-    db: &mongodb::Database,
-    product_id: ObjectId,
-) -> ProductRecheckTarget {
-    let Some(document) = db
-        .collection::<Document>("products")
-        .find_one(doc! { "_id": product_id })
-        .projection(doc! { "code": 1, "vendor": 1, "validation": 1 })
-        .await
-        .ok()
-        .flatten()
-    else {
-        return ProductRecheckTarget::Missing;
-    };
-    if product_validation_config(&document).is_some() {
-        return ProductRecheckTarget::Validation;
-    }
-    let vendor = document.get_document("vendor").ok();
-    let code = read_string(&document, "code");
-    ProductRecheckTarget::Vendor(RecheckProduct {
-        code: code.clone(),
-        vendor_name: vendor
-            .map(|value| read_string(value, "name"))
-            .unwrap_or_default(),
-        vendor_sku: vendor
-            .map(|value| read_string(value, "sku"))
-            .filter(|value| !value.is_empty())
-            .unwrap_or(code),
-    })
-}
-
-fn bson_number_to_i64(value: &Bson) -> i64 {
-    match value {
-        Bson::Int32(value) => i64::from(*value),
-        Bson::Int64(value) => *value,
-        Bson::Double(value) => *value as i64,
-        Bson::String(value) => value.parse::<i64>().unwrap_or(0),
-        _ => 0,
-    }
-}
-
-enum StatusUpdateError {
-    Conflict,
-    UserNotFound,
-    InsufficientBalance(i64),
-    InsufficientPoints,
-    Internal,
-}
-
-impl StatusUpdateError {
-    fn into_response(self) -> Response {
-        match self {
-            StatusUpdateError::Conflict => status_message(
-                StatusCode::CONFLICT,
-                "Transaksi sedang diperbarui oleh proses lain. Muat ulang halaman lalu coba lagi.",
-            ),
-            StatusUpdateError::UserNotFound => {
-                status_message(StatusCode::NOT_FOUND, "User transaksi tidak ditemukan")
-            }
-            StatusUpdateError::InsufficientBalance(amount) => (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "message": format!(
-                        "Saldo user tidak cukup untuk memproses ulang transaksi. Dibutuhkan Rp{}.",
-                        format_idr_amount(amount)
-                    )
-                })),
-            )
-                .into_response(),
-            StatusUpdateError::InsufficientPoints => internal_error(),
-            StatusUpdateError::Internal => internal_error(),
-        }
-    }
-}
-
-fn format_idr_amount(amount: i64) -> String {
-    let mut digits = amount.abs().to_string();
-    let mut parts = Vec::new();
-    while digits.len() > 3 {
-        let split_at = digits.len() - 3;
-        parts.push(digits.split_off(split_at));
-    }
-    parts.push(digits);
-    parts.reverse();
-    let formatted = parts.join(".");
-    if amount < 0 {
-        format!("-{formatted}")
-    } else {
-        formatted
-    }
-}
-
-async fn populated_transaction_item(
-    db: &mongodb::Database,
-    transaction_id: ObjectId,
-) -> Option<ManualTransactionItem> {
-    let document = db
-        .collection::<Document>("transactions")
-        .aggregate(vec![
-            doc! { "$match": { "_id": transaction_id } },
-            lookup_stage("users", "user", "user"),
-            unwind_stage("$user"),
-            lookup_stage("products", "product", "product"),
-            unwind_stage("$product"),
-            lookup_stage("users", "statusUpdatedBy", "statusUpdatedBy"),
-            unwind_stage("$statusUpdatedBy"),
-            doc! { "$limit": 1 },
-        ])
-        .await
-        .ok()?
-        .try_collect::<Vec<_>>()
-        .await
-        .ok()?
-        .into_iter()
-        .next()?;
-    Some(manual_transaction_item_from_doc(document))
-}
-
-async fn load_sorted_docs(
-    db: &mongodb::Database,
-    collection: &str,
-    filter: Document,
-) -> Vec<Document> {
-    match db
-        .collection::<Document>(collection)
-        .find(filter)
-        .sort(doc! { "createdAt": -1 })
-        .await
-    {
-        Ok(cursor) => cursor.try_collect::<Vec<_>>().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
-    }
-}
-
-async fn transaction_users(
-    db: &mongodb::Database,
-    transactions: &[Document],
-) -> HashMap<String, Value> {
-    let mut ids = transactions
-        .iter()
-        .filter_map(|doc| doc.get_object_id("user").ok())
-        .collect::<Vec<_>>();
-    ids.sort_by_key(|id| id.to_hex());
-    ids.dedup();
-    if ids.is_empty() {
-        return HashMap::new();
-    }
-    match db
-        .collection::<Document>("users")
-        .find(doc! { "_id": { "$in": ids } })
-        .projection(doc! { "email": 1, "name": 1 })
-        .await
-    {
-        Ok(cursor) => cursor
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|doc| {
-                let id = doc
-                    .get_object_id("_id")
-                    .map(|id| id.to_hex())
-                    .unwrap_or_default();
-                (id, document_to_json(doc))
-            })
-            .collect(),
-        Err(_) => HashMap::new(),
-    }
-}
-
-async fn transaction_products(
-    db: &mongodb::Database,
-    transactions: &[Document],
-) -> HashMap<String, Value> {
-    let mut ids = transactions
-        .iter()
-        .filter_map(|doc| doc.get_object_id("product").ok())
-        .collect::<Vec<_>>();
-    ids.sort_by_key(|id| id.to_hex());
-    ids.dedup();
-    if ids.is_empty() {
-        return HashMap::new();
-    }
-    match db
-        .collection::<Document>("products")
-        .find(doc! { "_id": { "$in": ids } })
-        .projection(doc! { "code": 1, "name": 1, "category": 1, "brand": 1, "vendor": 1 })
-        .await
-    {
-        Ok(cursor) => cursor
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|doc| {
-                let id = doc
-                    .get_object_id("_id")
-                    .map(|id| id.to_hex())
-                    .unwrap_or_default();
-                (id, document_to_json(doc))
-            })
-            .collect(),
-        Err(_) => HashMap::new(),
-    }
-}
-
-fn balance_transaction_json(
-    document: Document,
-    users: &HashMap<String, Value>,
-    products: &HashMap<String, Value>,
-) -> Value {
-    let user_id = document
-        .get_object_id("user")
-        .map(|id| id.to_hex())
-        .unwrap_or_default();
-    let product_id = document
-        .get_object_id("product")
-        .map(|id| id.to_hex())
-        .unwrap_or_default();
-    let mut map = document_to_map(document);
-    map.insert(
-        "user".to_string(),
-        users
-            .get(&user_id)
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({ "_id": user_id })),
-    );
-    if let Some(product) = products.get(&product_id) {
-        map.insert("product".to_string(), product.clone());
-    }
-    map.insert("source".to_string(), Value::String("balance".to_string()));
-    Value::Object(map)
-}
-
-fn guest_transaction_json(
-    document: Document,
-    user_id: ObjectId,
-    products: &HashMap<String, Value>,
-) -> Value {
-    let id = document
-        .get_object_id("_id")
-        .map(|id| id.to_hex())
-        .unwrap_or_default();
-    let product_id = document
-        .get_object_id("product")
-        .map(|id| id.to_hex())
-        .unwrap_or_default();
-    let mut map = Map::new();
-    map.insert("_id".to_string(), Value::String(id));
-    map.insert(
-        "user".to_string(),
-        serde_json::json!({ "_id": user_id.to_hex() }),
-    );
-    if let Some(product) = products.get(&product_id) {
-        map.insert("product".to_string(), product.clone());
-    }
-    map.insert(
-        "target".to_string(),
-        bson_to_json(document.get("target").cloned().unwrap_or(Bson::Null)),
-    );
-    map.insert(
-        "amount".to_string(),
-        bson_to_json(document.get("totalAmount").cloned().unwrap_or(Bson::Null)),
-    );
-    map.insert(
-        "status".to_string(),
-        bson_to_json(
-            document
-                .get("transactionStatus")
-                .cloned()
-                .unwrap_or(Bson::Null),
-        ),
-    );
-    if let Some(value) = document.get("referenceId").cloned() {
-        map.insert("referenceId".to_string(), bson_to_json(value));
-    }
-    if let Some(value) = document.get("vendorTrxId").cloned() {
-        map.insert("vendorTrxId".to_string(), bson_to_json(value));
-    }
-    if let Some(value) = document.get("sn").cloned() {
-        map.insert("sn".to_string(), bson_to_json(value));
-    }
-    map.insert(
-        "paymentStatus".to_string(),
-        bson_to_json(document.get("paymentStatus").cloned().unwrap_or(Bson::Null)),
-    );
-    map.insert(
-        "invoiceNumber".to_string(),
-        bson_to_json(document.get("invoiceNumber").cloned().unwrap_or(Bson::Null)),
-    );
-    map.insert(
-        "source".to_string(),
-        Value::String("payment_gateway".to_string()),
-    );
-    map.insert(
-        "createdAt".to_string(),
-        bson_to_json(document.get("createdAt").cloned().unwrap_or(Bson::Null)),
-    );
-    map.insert(
-        "updatedAt".to_string(),
-        bson_to_json(document.get("updatedAt").cloned().unwrap_or(Bson::Null)),
-    );
-    Value::Object(map)
-}
-
-fn json_date(value: &Value, key: &str) -> String {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
-}
-
-fn user_brief_from_doc(document: &Document) -> Option<UserBrief> {
-    let id = document.get_object_id("_id").map(|id| id.to_hex()).ok()?;
-    Some(UserBrief {
-        id,
-        name: read_string(document, "name"),
-        email: read_string(document, "email"),
-        role: document.get_str("role").ok().map(ToString::to_string),
-    })
-}
-
-fn product_brief_from_doc(document: &Document) -> Option<ProductBrief> {
-    let id = document.get_object_id("_id").map(|id| id.to_hex()).ok()?;
-    Some(ProductBrief {
-        id,
-        name: read_string(document, "name"),
-        code: read_string(document, "code"),
-        category: read_string(document, "category"),
-        brand: read_string(document, "brand"),
-        vendor_name: read_string(document, "vendorName"),
-    })
-}
-
-fn date_string(document: &Document, key: &str) -> Option<String> {
-    document
-        .get_datetime(key)
-        .map(|value| {
-            value
-                .try_to_rfc3339_string()
-                .unwrap_or_else(|_| value.to_string())
-        })
-        .ok()
-}
-
-fn date_key(date: DateTime) -> String {
-    date.try_to_rfc3339_string()
-        .ok()
-        .and_then(|value| value.get(0..10).map(ToString::to_string))
-        .unwrap_or_else(|| "unknown-date".to_string())
-}
-
-fn identifier_transactions_unavailable() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({
-            "message": "Alokasi Ref ID membutuhkan transaksi database",
-            "error": {
-                "code": "IDENTIFIER_TRANSACTIONS_UNAVAILABLE",
-                "message": "Alokasi Ref ID membutuhkan transaksi database"
-            }
-        })),
-    )
-        .into_response()
-}
-
-fn identifier_index_unavailable() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({
-            "message": "Index identifier belum siap",
-            "error": {
-                "code": "IDENTIFIER_INDEX_UNAVAILABLE",
-                "message": "Index identifier belum siap"
-            }
-        })),
-    )
-        .into_response()
-}
-
-fn transaction_reference_commit_unknown() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({
-            "message": "Status alokasi Ref ID belum dapat dipastikan",
-            "error": {
-                "code": "TRANSACTION_REFERENCE_COMMIT_UNKNOWN",
-                "message": "Status alokasi Ref ID belum dapat dipastikan"
-            }
-        })),
-    )
-        .into_response()
 }
 
 fn ref_id_sequence_exhausted() -> Response {
@@ -3208,7 +497,7 @@ fn internal_error() -> Response {
 fn unavailable() -> Response {
     status_message(
         axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        "MONGO_URI is not configured",
+        "PostgreSQL unavailable",
     )
 }
 
@@ -3218,37 +507,4 @@ fn parse_positive_i64(value: Option<&str>, fallback: i64, max: i64) -> i64 {
         .filter(|value| *value > 0)
         .map(|value| value.min(max))
         .unwrap_or(fallback)
-}
-
-fn non_empty_or(value: String, fallback: &str) -> String {
-    if value.is_empty() {
-        fallback.to_string()
-    } else {
-        value
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn create_transaction_verifies_turnstile() {
-        let source = include_str!("transactions.rs");
-        let create_start = source
-            .find("pub async fn create_transaction")
-            .expect("create_transaction");
-        let create_end = source
-            .find("pub async fn manual_transactions")
-            .expect("manual_transactions");
-        let create = &source[create_start..create_end];
-        let enforce = create
-            .find("enforce_turnstile")
-            .expect("create_transaction must verify Turnstile");
-        let product_lookup = create
-            .find("products.find_one")
-            .expect("product lookup");
-        assert!(
-            enforce < product_lookup,
-            "enforce_turnstile must run before products.find_one"
-        );
-    }
 }

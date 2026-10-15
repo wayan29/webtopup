@@ -42,6 +42,12 @@ npm run api-v2:build
 
 For local gateway testing, Node and API v2 must share the same `API_V2_PROXY_SECRET`, `JWT_SECRET`, and Mongo configuration.
 
+Open API partner secrets are stored as encrypted PostgreSQL envelopes. Configure a distinct
+`OPEN_API_ENCRYPTION_KEY` for the Rust API before issuing keys. Generate a base64url, unpadded
+32-byte key with `openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n'` and store it in the
+deployment secret manager. Never commit the key or reuse JWT/session encryption keys. Missing or
+malformed values fail closed for credential issuance and signature verification.
+
 ## Endpoints
 
 Login is split into two audience-bound channels. The route decides the audience; nothing in the

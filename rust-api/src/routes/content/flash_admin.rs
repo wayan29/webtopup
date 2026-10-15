@@ -1,452 +1,71 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
-use axum::{
-    extract::{Path, State},
-    response::{IntoResponse, Response},
-    Json,
-};
-use futures_util::TryStreamExt;
-use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
+use axum::{extract::{Path, State}, response::{IntoResponse, Response}, Json};
+use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
+use serde_json::{json, Value};
+use sqlx::{postgres::PgRow, Postgres, Row, Transaction};
+use uuid::Uuid;
 
-use crate::{security::require_permission, state::AppState};
-
-use super::{
-    collect_flash_sale_product_ids, current_flash_sale_products, date_value, document_to_json,
-    enrich_flash_sales_for_admin, flash_sale_document, flash_sale_record_from_doc,
-    flash_sale_status_key, internal_error, normalized_products_bson, not_found,
-    object_id_from_bson, populated_flash_sale_document, product_snapshots,
-    sanitize_flash_sale_payload, status_message, unavailable, validate_flash_sale_products,
-    FlashSalePayload, FlashSaleProductPayload, FlashSaleResponse, MessageResponse,
-};
-
-pub async fn flash_sales_admin_all(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> Response {
-    if let Err(response) = require_permission(&headers, &state, "manageProducts").await {
-        return response;
-    }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-
-    let flash_sale_docs = match client
-        .database(&state.mongo_db)
-        .collection::<Document>("flashsales")
-        .find(doc! {})
-        .sort(doc! { "createdAt": -1 })
-        .await
-    {
-        Ok(cursor) => cursor.try_collect::<Vec<_>>().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
-    };
-    let product_ids = collect_flash_sale_product_ids(&flash_sale_docs);
-    let product_map = product_snapshots(client, &state.mongo_db, product_ids).await;
-    let records = flash_sale_docs
-        .into_iter()
-        .map(|document| flash_sale_record_from_doc(document, &product_map))
-        .collect::<Vec<_>>();
-
-    Json(enrich_flash_sales_for_admin(records)).into_response()
+use crate::{security::require_sql_permission, services::managed_asset_registry::{acquire_reference, release_reference}, services::managed_assets::{ensure_managed_field_for_update, ManagedFieldFolderPolicy}, state::AppState};
+use super::{internal_error, not_found, status_message, unavailable};
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlashSalePayload {
+    name: Option<Value>,
+    description: Option<Value>,
+    start_date: Option<Value>,
+    end_date: Option<Value>,
+    is_active: Option<Value>,
+    banner: Option<Value>,
+    products: Option<Vec<FlashSaleProductPayload>>,
 }
-
-pub async fn flash_sale_admin_detail(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Response {
-    if let Err(response) = require_permission(&headers, &state, "manageProducts").await {
-        return response;
-    }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let Ok(object_id) = ObjectId::parse_str(&id) else {
-        return not_found("Flash Sale not found");
-    };
-
-    let flash_sale = client
-        .database(&state.mongo_db)
-        .collection::<Document>("flashsales")
-        .find_one(doc! { "_id": object_id })
-        .await
-        .ok()
-        .flatten();
-    let Some(flash_sale) = flash_sale else {
-        return not_found("Flash Sale not found");
-    };
-
-    let product_ids = collect_flash_sale_product_ids(std::slice::from_ref(&flash_sale));
-    let product_map = product_snapshots(client, &state.mongo_db, product_ids).await;
-    Json(populated_flash_sale_document(flash_sale, &product_map)).into_response()
+#[derive(Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FlashSaleProductPayload {
+    product_id: Option<Value>,
+    discount_type: Option<Value>,
+    discount_value: Option<Value>,
+    stock: Option<Value>,
+    sold_count: Option<Value>,
 }
+#[derive(serde::Serialize)]
+struct FlashSaleResponse { message: &'static str, flash_sale: Value }
+#[derive(serde::Serialize)]
+struct MessageResponse { message: &'static str }
 
-pub async fn flash_sale_create(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<FlashSalePayload>,
-) -> Response {
-    if let Err(response) = require_permission(&headers, &state, "manageProducts").await {
-        return response;
-    }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let db = client.database(&state.mongo_db);
-    let sanitized = match sanitize_flash_sale_payload(&db, payload, None).await {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    let now = DateTime::now();
-    let banner = sanitized.banner.clone();
-    let document = flash_sale_document(sanitized, now, now);
-    let flash_sales = db.collection::<Document>("flashsales");
-    let insert_result = if let Some(path) = crate::services::managed_assets::effectively_changed_cover_path(None, &banner) {
-        if !state.mongo_transactions_enabled {
-            return crate::services::managed_assets::managed_asset_registry_unavailable_response();
-        }
-        let mut session = match crate::services::managed_assets::start_legacy_managed_write(client).await {
-            Ok(session) => session,
-            Err(_) => return crate::services::managed_assets::managed_asset_registry_unavailable_response(),
-        };
-        if crate::services::managed_assets::fence_legacy_managed_writes(&mut session, &db, &[path]).await.is_err() {
-            let _ = crate::services::managed_assets::abort_legacy_managed_write(
-                &mut session,
-                crate::services::managed_asset_registry::RegistryError::Unavailable,
-            ).await;
-            return crate::services::managed_assets::managed_asset_registry_unavailable_response();
-        }
-        let result = match flash_sales.insert_one(document).session(&mut session).await {
-            Ok(result) => result,
-            Err(_) => {
-                let _ = session.abort_transaction().await;
-                return internal_error();
-            }
-        };
-        if crate::services::managed_assets::commit_legacy_managed_write(&mut session).await.is_err() {
-            return crate::services::managed_assets::managed_asset_registry_unavailable_response();
-        }
-        result
-    } else {
-        match flash_sales.insert_one(document).await {
-            Ok(result) => result,
-            Err(_) => return internal_error(),
-        }
-    };
-    let Some(id) = insert_result.inserted_id.as_object_id() else {
-        return internal_error();
-    };
-    let Some(flash_sale) = flash_sales
-        .find_one(doc! { "_id": id })
-        .await
-        .ok()
-        .flatten()
-    else {
-        return not_found("Flash Sale not found");
-    };
-    (
-        axum::http::StatusCode::CREATED,
-        Json(FlashSaleResponse {
-            message: "Flash Sale created",
-            flash_sale: document_to_json(flash_sale),
-        }),
-    )
-        .into_response()
+fn failure(status: axum::http::StatusCode, message: &'static str) -> Response { status_message(status, message) }
+fn uuid(value:&str)->Option<Uuid>{Uuid::parse_str(value.trim()).ok()}
+fn text(value:Option<Value>)->Option<String>{match value?{Value::String(v)=>Some(v.trim().to_owned()),Value::Number(v)=>Some(v.to_string()),Value::Bool(v)=>Some(v.to_string()),_=>None}}
+fn number(value:Option<Value>)->Option<i64>{match value?{Value::Number(v)=>v.as_i64().or_else(||v.as_f64().filter(|x|x.fract()==0.).map(|x|x as i64)),Value::String(v)=>v.trim().parse().ok(),_=>None}}
+fn date(value:Option<Value>)->Option<DateTime<Utc>>{let value=text(value)?; DateTime::parse_from_rfc3339(&value).ok().map(|d|d.with_timezone(&Utc)).or_else(||{let naive=NaiveDateTime::parse_from_str(&value,"%Y-%m-%dT%H:%M").ok().or_else(||NaiveDateTime::parse_from_str(&value,"%Y-%m-%dT%H:%M:%S").ok())?; FixedOffset::east_opt(7*3600)?.from_local_datetime(&naive).single().map(|d|d.with_timezone(&Utc))})}
+fn product_id(value:Option<Value>)->Option<Uuid>{uuid(&text(value)?)}
+fn timestamp(row:&PgRow,key:&str)->String{row.get::<DateTime<Utc>,_>(key).to_rfc3339()}
+async fn sale_json(tx:&mut Transaction<'_,Postgres>, id:Uuid)->Result<Value,sqlx::Error>{
+ let r=sqlx::query("SELECT * FROM content_flash_sales WHERE id=$1").bind(id).fetch_one(&mut **tx).await?;
+ let rows=sqlx::query("SELECT fp.product_id,fp.discount_type,fp.discount_value,fp.stock,fp.sold_count,p.name,p.code,p.price_basic,p.price_gold,p.price_platinum,p.icon,p.status,p.cost_price::bigint AS cost_price FROM content_flash_products fp LEFT JOIN products p ON p.id=fp.product_id WHERE fp.flash_sale_id=$1 ORDER BY fp.product_id").bind(id).fetch_all(&mut **tx).await?;
+ let products:Vec<Value>=rows.into_iter().map(|p|{let pid:Uuid=p.get("product_id");let name:Option<String>=p.try_get("name").ok();json!({"productRefId":pid.to_string(),"productId":name.map(|n|json!({"_id":pid.to_string(),"name":n,"code":p.get::<Option<String>,_>("code").unwrap_or_default(),"price":{"basic":p.get::<Option<i64>,_>("price_basic").unwrap_or_default(),"gold":p.get::<Option<i64>,_>("price_gold").unwrap_or_default(),"platinum":p.get::<Option<i64>,_>("price_platinum").unwrap_or_default()},"icon":p.get::<Option<String>,_>("icon"),"status":p.get::<Option<bool>,_>("status").unwrap_or(false),"costPrice":p.get::<Option<i64>,_>("cost_price").unwrap_or_default()})),"discountType":p.get::<String,_>("discount_type"),"discountValue":p.get::<i64,_>("discount_value"),"stock":p.get::<i64,_>("stock"),"soldCount":p.get::<i64,_>("sold_count")})}).collect();
+ Ok(json!({"_id":id.to_string(),"name":r.get::<String,_>("name"),"description":r.get::<String,_>("description"),"startDate":timestamp(&r,"start_date"),"endDate":timestamp(&r,"end_date"),"isActive":r.get::<bool,_>("is_active"),"banner":r.get::<String,_>("banner"),"createdAt":timestamp(&r,"created_at"),"updatedAt":timestamp(&r,"updated_at"),"products":products}))
 }
+async fn validate_products(tx:&mut Transaction<'_,Postgres>,products:Vec<FlashSaleProductPayload>,start:DateTime<Utc>,end:DateTime<Utc>,active:bool,exclude:Option<Uuid>)->Result<Vec<(Uuid,String,i64,i64,i64)>,Response>{
+ if end<=start{return Err(failure(axum::http::StatusCode::BAD_REQUEST,"Tanggal selesai harus setelah tanggal mulai"));}
+ let mut ids=Vec::with_capacity(products.len());let mut values=Vec::new();
+ for (i,p) in products.into_iter().enumerate(){let id=product_id(p.product_id.clone()).ok_or_else(||(axum::http::StatusCode::BAD_REQUEST,Json(json!({"message":format!("Produk pada item #{} tidak valid",i+1)}))).into_response())?;if ids.contains(&id){return Err(failure(axum::http::StatusCode::BAD_REQUEST,"Satu produk tidak boleh muncul lebih dari sekali dalam flash sale yang sama"));}ids.push(id);let kind=text(p.discount_type).unwrap_or_default();let discount=number(p.discount_value).unwrap_or(0);let stock=number(p.stock).unwrap_or(0);let sold=number(p.sold_count).unwrap_or(0);values.push((id,kind,discount,stock,sold));}
+ for (i,(id,kind,discount,stock,sold)) in values.iter().enumerate(){let row=sqlx::query("SELECT name,price_basic,cost_price::bigint AS cost_price,status FROM products WHERE id=$1").bind(id).fetch_optional(&mut **tx).await.map_err(|_|internal_error())?.ok_or_else(||failure(axum::http::StatusCode::BAD_REQUEST,"Ada produk yang tidak ditemukan"))?;let name:String=row.get("name");if !row.get::<bool,_>("status"){return Err((axum::http::StatusCode::BAD_REQUEST,Json(json!({"message":format!("{} sedang nonaktif dan tidak bisa dipakai di flash sale",name)}))).into_response());}let price:i64=row.get("price_basic");let cost:i64=row.get("cost_price");if price<=0||(*kind!="percentage"&&*kind!="fixed")||*discount<=0||*stock<1||*sold<0||*sold>*stock{return Err((axum::http::StatusCode::BAD_REQUEST,Json(json!({"message":format!("Data promo untuk {} tidak valid",name)}))).into_response());}if (*kind=="percentage"&&*discount>100)||(*kind=="fixed"&&*discount>price){return Err((axum::http::StatusCode::BAD_REQUEST,Json(json!({"message":format!("Diskon untuk {} tidak valid",name)}))).into_response());}let promo=if *kind=="percentage"{price.saturating_mul(100-*discount)/100}else{price-*discount};if promo>=price||(cost>0&&promo<cost){return Err((axum::http::StatusCode::BAD_REQUEST,Json(json!({"message":format!("Harga promo {} tidak valid",name)}))).into_response());}let _=i;}
+ if active{let overlap=sqlx::query_scalar::<_,bool>("SELECT EXISTS(SELECT 1 FROM content_flash_sales s JOIN content_flash_products fp ON fp.flash_sale_id=s.id WHERE s.is_active AND s.start_date<$2 AND s.end_date>$1 AND ($3::uuid IS NULL OR s.id<>$3) AND fp.product_id=ANY($4))").bind(start).bind(end).bind(exclude).bind(&ids).fetch_one(&mut **tx).await.map_err(|_|internal_error())?;if overlap{return Err(failure(axum::http::StatusCode::BAD_REQUEST,"Produk sudah dipakai pada flash sale lain dalam periode tersebut"));}}
+ Ok(values)
+}
+async fn banner_ref(tx:&mut Transaction<'_,Postgres>,id:Uuid,old:&str,new:&str)->Result<(),Response>{if old==new{return Ok(());}if let Some(path)=(!old.is_empty()).then_some(old).filter(|p|p.starts_with("/uploads/")){release_reference(tx,path,&format!("flash_sales:{id}:banner")).await.map_err(|_|status_message(axum::http::StatusCode::SERVICE_UNAVAILABLE,"Managed asset registry unavailable"))?;}if new.starts_with("/uploads/"){acquire_reference(tx,new,&format!("flash_sales:{id}:banner")).await.map_err(|_|status_message(axum::http::StatusCode::SERVICE_UNAVAILABLE,"Managed asset registry unavailable"))?;}Ok(())}
+fn response_json(message:&'static str,value:Value,status:Option<axum::http::StatusCode>)->Response{let response=Json(FlashSaleResponse{message,flash_sale:value}).into_response();if let Some(code)=status{(code,response).into_response()}else{response}}
 
-pub async fn flash_sale_update(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(payload): Json<FlashSalePayload>,
-) -> Response {
-    if let Err(response) = require_permission(&headers, &state, "manageProducts").await {
-        return response;
-    }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let Ok(object_id) = ObjectId::parse_str(id.trim()) else {
-        return not_found("Flash Sale not found");
-    };
-    let db = client.database(&state.mongo_db);
-    let flash_sales = db.collection::<Document>("flashsales");
-    let Some(current) = flash_sales
-        .find_one(doc! { "_id": object_id })
-        .await
-        .ok()
-        .flatten()
-    else {
-        return not_found("Flash Sale not found");
-    };
-    let previous_banner = crate::utils::bson::read_string(&current, "banner");
-    let sanitized = match sanitize_flash_sale_payload(&db, payload, Some(&current)).await {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    let created_at = current
-        .get_datetime("createdAt")
-        .copied()
-        .unwrap_or_else(|_| DateTime::now());
-    let next_banner = sanitized.banner.clone();
-    let updated = flash_sale_document(sanitized, created_at, DateTime::now());
-    if let Some(path) = crate::services::managed_assets::effectively_changed_cover_path(
-        Some(&previous_banner),
-        &next_banner,
-    ) {
-        if !state.mongo_transactions_enabled {
-            return crate::services::managed_assets::managed_asset_registry_unavailable_response();
-        }
-        let mut session = match crate::services::managed_assets::start_legacy_managed_write(client).await {
-            Ok(session) => session,
-            Err(_) => return crate::services::managed_assets::managed_asset_registry_unavailable_response(),
-        };
-        if crate::services::managed_assets::fence_legacy_managed_writes(&mut session, &db, &[path]).await.is_err() {
-            let _ = crate::services::managed_assets::abort_legacy_managed_write(
-                &mut session,
-                crate::services::managed_asset_registry::RegistryError::Unavailable,
-            ).await;
-            return crate::services::managed_assets::managed_asset_registry_unavailable_response();
-        }
-        if flash_sales
-            .update_one(doc! { "_id": object_id }, doc! { "$set": updated })
-            .session(&mut session)
-            .await
-            .is_err()
-        {
-            let _ = session.abort_transaction().await;
-            return internal_error();
-        }
-        if crate::services::managed_assets::commit_legacy_managed_write(&mut session).await.is_err() {
-            return crate::services::managed_assets::managed_asset_registry_unavailable_response();
-        }
-    } else if flash_sales
-        .update_one(doc! { "_id": object_id }, doc! { "$set": updated })
-        .await
-        .is_err()
-    {
-        return internal_error();
-    }
-    let Some(flash_sale) = flash_sales
-        .find_one(doc! { "_id": object_id })
-        .await
-        .ok()
-        .flatten()
-    else {
-        return not_found("Flash Sale not found");
-    };
-    Json(FlashSaleResponse {
-        message: "Flash Sale updated",
-        flash_sale: document_to_json(flash_sale),
-    })
-    .into_response()
-}
+pub async fn flash_sales_admin_all(headers:axum::http::HeaderMap,State(state):State<Arc<AppState>>)->Response{if let Err(r)=require_sql_permission(&headers,&state,"manageProducts").await{return r;}let ids=match sqlx::query_scalar::<_,Uuid>("SELECT id FROM content_flash_sales ORDER BY created_at DESC").fetch_all(&state.pg_pool).await{Ok(v)=>v,Err(_)=>return internal_error()};let mut output=Vec::with_capacity(ids.len());for id in ids{let mut tx=match state.pg_pool.begin().await{Ok(v)=>v,Err(_)=>return unavailable()};let value=match sale_json(&mut tx,id).await{Ok(v)=>v,Err(_)=>return internal_error()};let products=value["products"].as_array().cloned().unwrap_or_default();let now=Utc::now();let start=DateTime::parse_from_rfc3339(value["startDate"].as_str().unwrap_or("")).map(|d|d.with_timezone(&Utc)).unwrap_or(now);let end=DateTime::parse_from_rfc3339(value["endDate"].as_str().unwrap_or("")).map(|d|d.with_timezone(&Utc)).unwrap_or(now);let live=value["isActive"].as_bool()==Some(true)&&start<=now&&end>now;let total:i64=products.iter().map(|p|p["stock"].as_i64().unwrap_or(0)).sum();let sold:i64=products.iter().map(|p|p["soldCount"].as_i64().unwrap_or(0)).sum();let remaining=total-sold;let status=if !value["isActive"].as_bool().unwrap_or(true){"inactive"}else if now<start{"upcoming"}else if now>=end{"ended"}else{"live"};let mut item=value.clone();item["statusKey"]=json!(status);item["statusLabel"]=json!(match status{"inactive"=>"Nonaktif","upcoming"=>"Akan Datang","ended"=>"Selesai",_=>"Berlangsung"});item["productCount"]=json!(products.len());item["summary"]=json!({"productCount":products.len(),"totalStock":total,"soldCount":sold,"remainingStock":remaining,"soldOutCount":products.iter().filter(|p|p["soldCount"].as_i64()==p["stock"].as_i64()).count(),"lowStockCount":products.iter().filter(|p|p["stock"].as_i64().unwrap_or(0)-p["soldCount"].as_i64().unwrap_or(0)<=5).count(),"missingProductCount":products.iter().filter(|p|p["productId"].is_null()).count(),"inactiveProductCount":0,"pricingIssueCount":0,"overlapCount":0});item["overlappingProducts"]=json!([]);item["canDelete"]=json!(!live);item["deleteBlockedReason"]=json!(if live{"Flash sale yang sedang berlangsung harus dinonaktifkan atau tunggu sampai selesai sebelum dihapus."}else{""});item["hasIssues"]=json!(false);output.push(item);let _=tx.rollback().await;}Json(output).into_response()}
 
-pub async fn flash_sale_delete(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Response {
-    if let Err(response) = require_permission(&headers, &state, "manageProducts").await {
-        return response;
-    }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let Ok(object_id) = ObjectId::parse_str(id.trim()) else {
-        return not_found("Flash Sale not found");
-    };
-    let flash_sales = client
-        .database(&state.mongo_db)
-        .collection::<Document>("flashsales");
-    let Some(flash_sale) = flash_sales
-        .find_one(doc! { "_id": object_id })
-        .await
-        .ok()
-        .flatten()
-    else {
-        return not_found("Flash Sale not found");
-    };
-    let record = flash_sale_record_from_doc(flash_sale, &HashMap::new());
-    if flash_sale_status_key(&record, DateTime::now().timestamp_millis()) == "live" {
-        return status_message(
-            axum::http::StatusCode::BAD_REQUEST,
-            "Flash sale yang sedang berlangsung tidak bisa dihapus. Nonaktifkan dulu atau tunggu sampai selesai.",
-        );
-    }
-    if flash_sales
-        .delete_one(doc! { "_id": object_id })
-        .await
-        .is_err()
-    {
-        return internal_error();
-    }
-    Json(MessageResponse {
-        message: "Flash Sale deleted",
-    })
-    .into_response()
-}
+pub async fn flash_sale_admin_detail(headers:axum::http::HeaderMap,State(state):State<Arc<AppState>>,Path(id):Path<String>)->Response{if let Err(r)=require_sql_permission(&headers,&state,"manageProducts").await{return r;}let Some(id)=uuid(&id)else{return not_found("Flash Sale not found")};let mut tx=match state.pg_pool.begin().await{Ok(v)=>v,Err(_)=>return unavailable()};match sale_json(&mut tx,id).await{Ok(v)=>Json(v).into_response(),Err(sqlx::Error::RowNotFound)=>not_found("Flash Sale not found"),Err(_)=>internal_error()}}
 
-pub async fn flash_sale_add_product(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(payload): Json<FlashSaleProductPayload>,
-) -> Response {
-    if let Err(response) = require_permission(&headers, &state, "manageProducts").await {
-        return response;
-    }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let Ok(object_id) = ObjectId::parse_str(id.trim()) else {
-        return not_found("Flash Sale not found");
-    };
-    let db = client.database(&state.mongo_db);
-    let flash_sales = db.collection::<Document>("flashsales");
-    let Some(current) = flash_sales
-        .find_one(doc! { "_id": object_id })
-        .await
-        .ok()
-        .flatten()
-    else {
-        return not_found("Flash Sale not found");
-    };
-    let products = current_flash_sale_products(&current)
-        .into_iter()
-        .chain(std::iter::once(payload))
-        .collect::<Vec<_>>();
-    let start_date = date_value(&current, "startDate");
-    let end_date = date_value(&current, "endDate");
-    let is_active = current.get_bool("isActive").unwrap_or(true);
-    let normalized = match validate_flash_sale_products(
-        &db,
-        products,
-        start_date,
-        end_date,
-        is_active,
-        Some(object_id),
-    )
-    .await
-    {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    if flash_sales
-        .update_one(
-            doc! { "_id": object_id },
-            doc! { "$set": { "products": normalized_products_bson(normalized), "updatedAt": DateTime::now() } },
-        )
-        .await
-        .is_err()
-    {
-        return internal_error();
-    }
-    let Some(flash_sale) = flash_sales
-        .find_one(doc! { "_id": object_id })
-        .await
-        .ok()
-        .flatten()
-    else {
-        return not_found("Flash Sale not found");
-    };
-    Json(FlashSaleResponse {
-        message: "Product added to flash sale",
-        flash_sale: document_to_json(flash_sale),
-    })
-    .into_response()
-}
+async fn save_sale(state:&AppState,id:Option<Uuid>,payload:FlashSalePayload)->Response{let mut tx=match state.pg_pool.begin().await{Ok(v)=>v,Err(_)=>return unavailable()};let old=if let Some(id)=id{match sqlx::query("SELECT * FROM content_flash_sales WHERE id=$1 FOR UPDATE").bind(id).fetch_optional(&mut *tx).await{Ok(Some(v))=>Some(v),Ok(None)=>return not_found("Flash Sale not found"),Err(_)=>return internal_error()}}else{None};let name=text(payload.name).or_else(||old.as_ref().map(|r|r.get("name"))).unwrap_or_default();if name.is_empty(){return status_message(axum::http::StatusCode::BAD_REQUEST,"Nama flash sale wajib diisi");}let description=text(payload.description).or_else(||old.as_ref().map(|r|r.get("description"))).unwrap_or_default();let start=payload.start_date.and_then(|value|date(Some(value))).or_else(||old.as_ref().map(|r|r.get("start_date"))).unwrap_or_else(Utc::now);let end=payload.end_date.and_then(|value|date(Some(value))).or_else(||old.as_ref().map(|r|r.get("end_date"))).unwrap_or(start);let active=payload.is_active.and_then(|v|if let Value::Bool(b)=v{Some(b)}else{Some(false)}).or_else(||old.as_ref().map(|r|r.get("is_active"))).unwrap_or(true);let banner=text(payload.banner).or_else(||old.as_ref().map(|r|r.get("banner"))).unwrap_or_default();let previous=old.as_ref().map(|r|r.get::<String,_>("banner")).unwrap_or_default();if let Err(r)=ensure_managed_field_for_update(&crate::routes::uploads::upload_root(),&banner,ManagedFieldFolderPolicy::Covers,previous!=banner){return r;}let inputs=if let Some(products)=payload.products{products}else if let Some(id)=id{match sqlx::query("SELECT product_id,discount_type,discount_value,stock,sold_count FROM content_flash_products WHERE flash_sale_id=$1 ORDER BY product_id").bind(id).fetch_all(&mut *tx).await{Ok(rows)=>rows.into_iter().map(|r|FlashSaleProductPayload{product_id:Some(json!(r.get::<Uuid,_>("product_id").to_string())),discount_type:Some(json!(r.get::<String,_>("discount_type"))),discount_value:Some(json!(r.get::<i64,_>("discount_value"))),stock:Some(json!(r.get::<i64,_>("stock"))),sold_count:Some(json!(r.get::<i64,_>("sold_count")))}).collect(),Err(_)=>return internal_error()}}else{vec![]};let values=match validate_products(&mut tx,inputs,start,end,active,id).await{Ok(v)=>v,Err(r)=>return r};let id=id.unwrap_or_else(Uuid::new_v4);if let Err(r)=banner_ref(&mut tx,id,&previous,&banner).await{return r;}let result=if old.is_some(){sqlx::query("UPDATE content_flash_sales SET name=$2,description=$3,start_date=$4,end_date=$5,is_active=$6,banner=$7,updated_at=now() WHERE id=$1").bind(id).bind(name).bind(description).bind(start).bind(end).bind(active).bind(banner).execute(&mut *tx).await}else{sqlx::query("INSERT INTO content_flash_sales(id,name,description,start_date,end_date,is_active,banner) VALUES($1,$2,$3,$4,$5,$6,$7)").bind(id).bind(name).bind(description).bind(start).bind(end).bind(active).bind(banner).execute(&mut *tx).await};if result.is_err(){return internal_error();}if sqlx::query("DELETE FROM content_flash_products WHERE flash_sale_id=$1").bind(id).execute(&mut *tx).await.is_err(){return internal_error();}for (pid,kind,discount,stock,sold) in values{if sqlx::query("INSERT INTO content_flash_products(flash_sale_id,product_id,discount_type,discount_value,stock,sold_count) VALUES($1,$2,$3,$4,$5,$6)").bind(id).bind(pid).bind(kind).bind(discount).bind(stock).bind(sold).execute(&mut *tx).await.is_err(){return internal_error();}}let value=match sale_json(&mut tx,id).await{Ok(v)=>v,Err(_)=>return internal_error()};if tx.commit().await.is_err(){return internal_error();}response_json(if old.is_some(){"Flash Sale updated"}else{"Flash Sale created"},value,if old.is_some(){None}else{Some(axum::http::StatusCode::CREATED)})}
+pub async fn flash_sale_create(headers:axum::http::HeaderMap,State(state):State<Arc<AppState>>,Json(payload):Json<FlashSalePayload>)->Response{if let Err(r)=require_sql_permission(&headers,&state,"manageProducts").await{return r;}save_sale(&state,None,payload).await}
+pub async fn flash_sale_update(headers:axum::http::HeaderMap,State(state):State<Arc<AppState>>,Path(id):Path<String>,Json(payload):Json<FlashSalePayload>)->Response{if let Err(r)=require_sql_permission(&headers,&state,"manageProducts").await{return r;}let Some(id)=uuid(&id)else{return not_found("Flash Sale not found")};save_sale(&state,Some(id),payload).await}
 
-pub async fn flash_sale_remove_product(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Path((id, product_id)): Path<(String, String)>,
-) -> Response {
-    if let Err(response) = require_permission(&headers, &state, "manageProducts").await {
-        return response;
-    }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let Ok(object_id) = ObjectId::parse_str(id.trim()) else {
-        return not_found("Flash Sale not found");
-    };
-    let db = client.database(&state.mongo_db);
-    let flash_sales = db.collection::<Document>("flashsales");
-    let Some(current) = flash_sales
-        .find_one(doc! { "_id": object_id })
-        .await
-        .ok()
-        .flatten()
-    else {
-        return not_found("Flash Sale not found");
-    };
-    let record = flash_sale_record_from_doc(current.clone(), &HashMap::new());
-    if flash_sale_status_key(&record, DateTime::now().timestamp_millis()) == "live" {
-        return status_message(
-            axum::http::StatusCode::BAD_REQUEST,
-            "Produk tidak bisa dihapus saat flash sale sedang berlangsung",
-        );
-    }
-    let product_object_id = ObjectId::parse_str(product_id.trim()).ok();
-    let mut found_product = false;
-    let mut has_sales = false;
-    let products = current
-        .get_array("products")
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|item| {
-            let Some(document) = item.as_document() else {
-                return true;
-            };
-            let Some(id) = object_id_from_bson(document.get("productId")) else {
-                return true;
-            };
-            let matches = product_object_id
-                .map(|target| target == id)
-                .unwrap_or(false);
-            if matches {
-                found_product = true;
-                has_sales = document
-                    .get_i64("soldCount")
-                    .or_else(|_| document.get_i32("soldCount").map(i64::from))
-                    .unwrap_or(0)
-                    > 0;
-            }
-            !matches
-        })
-        .collect::<Vec<_>>();
-    if !found_product {
-        return not_found("Produk tidak ditemukan di flash sale");
-    }
-    if has_sales {
-        return status_message(
-            axum::http::StatusCode::BAD_REQUEST,
-            "Produk sudah memiliki penjualan promo dan tidak bisa dihapus",
-        );
-    }
-    if flash_sales
-        .update_one(
-            doc! { "_id": object_id },
-            doc! { "$set": { "products": products, "updatedAt": DateTime::now() } },
-        )
-        .await
-        .is_err()
-    {
-        return internal_error();
-    }
-    let Some(flash_sale) = flash_sales
-        .find_one(doc! { "_id": object_id })
-        .await
-        .ok()
-        .flatten()
-    else {
-        return not_found("Flash Sale not found");
-    };
-    Json(FlashSaleResponse {
-        message: "Product removed from flash sale",
-        flash_sale: document_to_json(flash_sale),
-    })
-    .into_response()
-}
+pub async fn flash_sale_delete(headers:axum::http::HeaderMap,State(state):State<Arc<AppState>>,Path(id):Path<String>)->Response{if let Err(r)=require_sql_permission(&headers,&state,"manageProducts").await{return r;}let Some(id)=uuid(&id)else{return not_found("Flash Sale not found")};let mut tx=match state.pg_pool.begin().await{Ok(v)=>v,Err(_)=>return unavailable()};let row=match sqlx::query("SELECT banner,start_date,end_date,is_active FROM content_flash_sales WHERE id=$1 FOR UPDATE").bind(id).fetch_optional(&mut *tx).await{Ok(Some(v))=>v,Ok(None)=>return not_found("Flash Sale not found"),Err(_)=>return internal_error()};let live=row.get::<bool,_>("is_active")&&row.get::<DateTime<Utc>,_>("start_date")<=Utc::now()&&row.get::<DateTime<Utc>,_>("end_date")>Utc::now();if live{return status_message(axum::http::StatusCode::BAD_REQUEST,"Flash sale yang sedang berlangsung tidak bisa dihapus. Nonaktifkan dulu atau tunggu sampai selesai.");}let banner:String=row.get("banner");if let Err(r)=banner_ref(&mut tx,id,&banner,"").await{return r;}if sqlx::query("DELETE FROM content_flash_sales WHERE id=$1").bind(id).execute(&mut *tx).await.is_err()||tx.commit().await.is_err(){return internal_error();}Json(MessageResponse{message:"Flash Sale deleted"}).into_response()}
+
+pub async fn flash_sale_add_product(headers:axum::http::HeaderMap,State(state):State<Arc<AppState>>,Path(id):Path<String>,Json(payload):Json<FlashSaleProductPayload>)->Response{if let Err(r)=require_sql_permission(&headers,&state,"manageProducts").await{return r;}let Some(id)=uuid(&id)else{return not_found("Flash Sale not found")};let mut tx=match state.pg_pool.begin().await{Ok(v)=>v,Err(_)=>return unavailable()};let sale=match sqlx::query("SELECT start_date,end_date,is_active FROM content_flash_sales WHERE id=$1 FOR UPDATE").bind(id).fetch_optional(&mut *tx).await{Ok(Some(v))=>v,Ok(None)=>return not_found("Flash Sale not found"),Err(_)=>return internal_error()};let products=match sqlx::query("SELECT product_id,discount_type,discount_value,stock,sold_count FROM content_flash_products WHERE flash_sale_id=$1").bind(id).fetch_all(&mut *tx).await{Ok(rows)=>rows.into_iter().map(|r|FlashSaleProductPayload{product_id:Some(json!(r.get::<Uuid,_>("product_id").to_string())),discount_type:Some(json!(r.get::<String,_>("discount_type"))),discount_value:Some(json!(r.get::<i64,_>("discount_value"))),stock:Some(json!(r.get::<i64,_>("stock"))),sold_count:Some(json!(r.get::<i64,_>("sold_count")))}).chain(std::iter::once(payload)).collect(),Err(_)=>return internal_error()};let products=match validate_products(&mut tx,products,sale.get("start_date"),sale.get("end_date"),sale.get("is_active"),Some(id)).await{Ok(v)=>v,Err(r)=>return r};if sqlx::query("DELETE FROM content_flash_products WHERE flash_sale_id=$1").bind(id).execute(&mut *tx).await.is_err(){return internal_error();}for (pid,k,d,s,n) in products{if sqlx::query("INSERT INTO content_flash_products(flash_sale_id,product_id,discount_type,discount_value,stock,sold_count) VALUES($1,$2,$3,$4,$5,$6)").bind(id).bind(pid).bind(k).bind(d).bind(s).bind(n).execute(&mut *tx).await.is_err(){return internal_error();}}let value=match sale_json(&mut tx,id).await{Ok(v)=>v,Err(_)=>return internal_error()};if tx.commit().await.is_err(){return internal_error();}response_json("Product added to flash sale",value,None)}
+pub async fn flash_sale_remove_product(headers:axum::http::HeaderMap,State(state):State<Arc<AppState>>,Path((id,product_id)):Path<(String,String)>)->Response{if let Err(r)=require_sql_permission(&headers,&state,"manageProducts").await{return r;}let(Some(id),Some(pid))=(uuid(&id),uuid(&product_id))else{return not_found("Flash Sale not found")};let mut tx=match state.pg_pool.begin().await{Ok(v)=>v,Err(_)=>return unavailable()};let sale=match sqlx::query("SELECT is_active,start_date,end_date FROM content_flash_sales WHERE id=$1 FOR UPDATE").bind(id).fetch_optional(&mut *tx).await{Ok(Some(v))=>v,Ok(None)=>return not_found("Flash Sale not found"),Err(_)=>return internal_error()};if sale.get::<bool,_>("is_active")&&sale.get::<DateTime<Utc>,_>("start_date")<=Utc::now()&&sale.get::<DateTime<Utc>,_>("end_date")>Utc::now(){return status_message(axum::http::StatusCode::BAD_REQUEST,"Produk tidak bisa dihapus saat flash sale sedang berlangsung");}let sold=match sqlx::query_scalar::<_,i64>("SELECT sold_count FROM content_flash_products WHERE flash_sale_id=$1 AND product_id=$2 FOR UPDATE").bind(id).bind(pid).fetch_optional(&mut *tx).await{Ok(Some(v))=>v,Ok(None)=>return not_found("Produk tidak ditemukan di flash sale"),Err(_)=>return internal_error()};if sold>0{return status_message(axum::http::StatusCode::BAD_REQUEST,"Produk sudah memiliki penjualan promo dan tidak bisa dihapus");}if sqlx::query("DELETE FROM content_flash_products WHERE flash_sale_id=$1 AND product_id=$2").bind(id).bind(pid).execute(&mut *tx).await.is_err(){return internal_error();}let value=match sale_json(&mut tx,id).await{Ok(v)=>v,Err(_)=>return internal_error()};if tx.commit().await.is_err(){return internal_error();}response_json("Product removed from flash sale",value,None)}

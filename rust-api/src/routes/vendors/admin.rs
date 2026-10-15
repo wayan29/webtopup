@@ -1,316 +1,67 @@
 use std::sync::Arc;
 
-use axum::{
-    extract::{Path, State},
-    response::{IntoResponse, Response},
-    Json,
-};
-use futures_util::TryStreamExt;
-use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
+use axum::{extract::{Path, State}, response::{IntoResponse, Response}, Json};
+use serde_json::Value;
+use sqlx::Row;
 
-use crate::{
-    security::{require_proxy_context, ErrorResponse},
-    state::AppState,
-    utils::bson::{read_i64, read_string},
-};
+use crate::{security::require_proxy_context, state::AppState};
 
-use super::{
-    internal_error,
-    json::{config_to_json, date_string, normalize_non_negative_number, value_to_bson},
-    status_message,
-    types::VendorItem,
-    types::VendorPayload,
-    unavailable,
-};
+use super::{internal_error, status_message, types::{VendorItem, VendorPayload}};
 
-pub async fn admin_all(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> Response {
-    if let Err(response) = require_proxy_context(&headers, &state) {
-        return response;
-    }
-
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-
-    let db = client.database(&state.mongo_db);
-    let vendor_docs = match db
-        .collection::<Document>("vendors")
-        .find(doc! {})
-        .sort(doc! { "createdAt": -1 })
-        .await
-    {
-        Ok(cursor) => cursor.try_collect::<Vec<_>>().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
-    };
-
-    let items = vendor_docs
-        .into_iter()
-        .map(vendor_item_from_doc)
-        .collect::<Vec<_>>();
-    Json(items).into_response()
+pub async fn admin_all(headers: axum::http::HeaderMap, State(state): State<Arc<AppState>>) -> Response {
+    if let Err(response) = require_proxy_context(&headers, &state) { return response; }
+    let rows = match sqlx::query("SELECT id,name,slug,api_base_url,config,low_balance_threshold,status,created_at,updated_at FROM vendors ORDER BY created_at DESC,id")
+        .fetch_all(&state.pg_pool).await { Ok(rows) => rows, Err(_) => return internal_error() };
+    Json(rows.into_iter().map(vendor_item_from_row).collect::<Vec<_>>()).into_response()
 }
 
-pub async fn admin_detail(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Response {
-    if let Err(response) = require_proxy_context(&headers, &state) {
-        return response;
-    }
-
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let Ok(object_id) = ObjectId::parse_str(&id) else {
-        return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                message: "Internal Server Error",
-            }),
-        )
-            .into_response();
-    };
-
-    match client
-        .database(&state.mongo_db)
-        .collection::<Document>("vendors")
-        .find_one(doc! { "_id": object_id })
-        .await
-        .ok()
-        .flatten()
-    {
-        Some(document) => Json(vendor_item_from_doc(document)).into_response(),
-        None => (
-            axum::http::StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                message: "Vendor not found",
-            }),
-        )
-            .into_response(),
+pub async fn admin_detail(headers: axum::http::HeaderMap, State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    if let Err(response) = require_proxy_context(&headers, &state) { return response; }
+    let Ok(id) = id.parse::<uuid::Uuid>() else { return status_message(axum::http::StatusCode::NOT_FOUND, "Vendor not found") };
+    match sqlx::query("SELECT id,name,slug,api_base_url,config,low_balance_threshold,status,created_at,updated_at FROM vendors WHERE id=$1").bind(id).fetch_optional(&state.pg_pool).await {
+        Ok(Some(row)) => Json(vendor_item_from_row(row)).into_response(),
+        Ok(None) => status_message(axum::http::StatusCode::NOT_FOUND, "Vendor not found"),
+        Err(_) => internal_error(),
     }
 }
 
-pub async fn create_vendor(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<VendorPayload>,
-) -> Response {
-    if let Err(response) = require_proxy_context(&headers, &state) {
-        return response;
-    }
-
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let vendors = client
-        .database(&state.mongo_db)
-        .collection::<Document>("vendors");
+pub async fn create_vendor(headers: axum::http::HeaderMap, State(state): State<Arc<AppState>>, Json(payload): Json<VendorPayload>) -> Response {
+    if let Err(response) = require_proxy_context(&headers, &state) { return response; }
     let name = payload.name.unwrap_or_default();
-
-    if vendors
-        .find_one(doc! { "name": &name })
-        .projection(doc! { "_id": 1 })
-        .await
-        .ok()
-        .flatten()
-        .is_some()
-    {
-        return status_message(axum::http::StatusCode::BAD_REQUEST, "Vendor already exists");
+    let slug = slugify(&name);
+    let config = payload.config.unwrap_or_else(|| serde_json::json!({}));
+    let threshold = payload.low_balance_threshold.as_ref().and_then(json_i64).unwrap_or(0).max(0);
+    let row = sqlx::query("INSERT INTO vendors(name,slug,api_base_url,config,low_balance_threshold,status) VALUES($1,$2,$3,$4,$5,$6) RETURNING id,name,slug,api_base_url,config,low_balance_threshold,status,created_at,updated_at")
+        .bind(&name).bind(slug).bind(payload.api_base_url.unwrap_or_default()).bind(config).bind(threshold).bind(payload.status.unwrap_or(true)).fetch_one(&state.pg_pool).await;
+    match row {
+        Ok(row) => (axum::http::StatusCode::CREATED, Json(serde_json::json!({"message":"Vendor created successfully","vendor":vendor_item_from_row(row)}))).into_response(),
+        Err(error) if error.to_string().contains("unique") => status_message(axum::http::StatusCode::BAD_REQUEST,"Vendor already exists"),
+        Err(_) => internal_error(),
     }
-
-    let now = DateTime::now();
-    let mut document = Document::new();
-    document.insert("name", name);
-    document.insert("apiBaseUrl", payload.api_base_url.unwrap_or_default());
-    document.insert(
-        "config",
-        value_to_bson(payload.config.unwrap_or_else(|| serde_json::json!({}))),
-    );
-    document.insert(
-        "lowBalanceThreshold",
-        normalize_non_negative_number(payload.low_balance_threshold.as_ref(), 0),
-    );
-    document.insert("status", payload.status.unwrap_or(true));
-    document.insert("createdAt", now);
-    document.insert("updatedAt", now);
-    document.insert("__v", 0);
-
-    let inserted_id = match vendors.insert_one(document).await {
-        Ok(result) => result.inserted_id.as_object_id().map(|id| id.to_hex()),
-        Err(error) => {
-            if is_duplicate_key(&error) {
-                return status_message(
-                    axum::http::StatusCode::BAD_REQUEST,
-                    "Vendor already exists",
-                );
-            }
-            return internal_error();
-        }
-    };
-    let vendor = match inserted_id
-        .as_deref()
-        .and_then(|id| ObjectId::parse_str(id).ok())
-    {
-        Some(id) => vendors
-            .find_one(doc! { "_id": id })
-            .await
-            .ok()
-            .flatten()
-            .map(vendor_item_from_doc),
-        None => None,
-    };
-
-    (
-        axum::http::StatusCode::CREATED,
-        Json(serde_json::json!({
-            "message": "Vendor created successfully",
-            "vendor": vendor,
-        })),
-    )
-        .into_response()
 }
 
-pub async fn update_vendor(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(payload): Json<VendorPayload>,
-) -> Response {
-    if let Err(response) = require_proxy_context(&headers, &state) {
-        return response;
-    }
-
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let Ok(object_id) = ObjectId::parse_str(&id) else {
-        return internal_error();
-    };
-    let vendors = client
-        .database(&state.mongo_db)
-        .collection::<Document>("vendors");
-    let existing = match vendors.find_one(doc! { "_id": object_id }).await {
-        Ok(Some(document)) => document,
-        Ok(None) => return status_message(axum::http::StatusCode::NOT_FOUND, "Vendor not found"),
-        Err(_) => return internal_error(),
-    };
-
-    let mut update = Document::new();
-    if let Some(name) = payload.name {
-        update.insert("name", name);
-    }
-    if let Some(api_base_url) = payload.api_base_url {
-        update.insert("apiBaseUrl", api_base_url);
-    }
-    if let Some(config) = payload.config {
-        update.insert("config", value_to_bson(config));
-    }
-    if payload.low_balance_threshold.is_some() {
-        update.insert(
-            "lowBalanceThreshold",
-            normalize_non_negative_number(
-                payload.low_balance_threshold.as_ref(),
-                read_i64(&existing, "lowBalanceThreshold"),
-            ),
-        );
-    }
-    if let Some(status) = payload.status {
-        update.insert("status", status);
-    }
-    update.insert("updatedAt", DateTime::now());
-
-    if let Err(error) = vendors
-        .update_one(doc! { "_id": object_id }, doc! { "$set": update })
-        .await
-    {
-        if is_duplicate_key(&error) {
-            return status_message(axum::http::StatusCode::BAD_REQUEST, "Vendor already exists");
-        }
-        return internal_error();
-    }
-    let vendor = vendors
-        .find_one(doc! { "_id": object_id })
-        .await
-        .ok()
-        .flatten()
-        .map(vendor_item_from_doc);
-
-    Json(serde_json::json!({
-        "message": "Vendor updated successfully",
-        "vendor": vendor,
-    }))
-    .into_response()
+pub async fn update_vendor(headers: axum::http::HeaderMap, State(state): State<Arc<AppState>>, Path(id): Path<String>, Json(payload): Json<VendorPayload>) -> Response {
+    if let Err(response) = require_proxy_context(&headers, &state) { return response; }
+    let Ok(id) = id.parse::<uuid::Uuid>() else { return internal_error() };
+    let existing = match sqlx::query("SELECT name,api_base_url,config,low_balance_threshold,status FROM vendors WHERE id=$1").bind(id).fetch_optional(&state.pg_pool).await { Ok(Some(r))=>r, Ok(None)=>return status_message(axum::http::StatusCode::NOT_FOUND,"Vendor not found"), Err(_)=>return internal_error() };
+    let name = payload.name.unwrap_or_else(|| existing.get("name"));
+    let result = sqlx::query("UPDATE vendors SET name=$2,slug=$3,api_base_url=$4,config=$5,low_balance_threshold=$6,status=$7,updated_at=now() WHERE id=$1")
+        .bind(id).bind(&name).bind(slugify(&name)).bind(payload.api_base_url.unwrap_or_else(|| existing.get("api_base_url"))).bind(payload.config.unwrap_or_else(|| existing.get("config"))).bind(payload.low_balance_threshold.as_ref().and_then(json_i64).unwrap_or_else(|| existing.get("low_balance_threshold")).max(0)).bind(payload.status.unwrap_or_else(|| existing.get("status"))).execute(&state.pg_pool).await;
+    match result { Ok(_) => match sqlx::query("SELECT id,name,slug,api_base_url,config,low_balance_threshold,status,created_at,updated_at FROM vendors WHERE id=$1").bind(id).fetch_one(&state.pg_pool).await { Ok(row)=>Json(serde_json::json!({"message":"Vendor updated successfully","vendor":vendor_item_from_row(row)})).into_response(),Err(_)=>internal_error() }, Err(error) if error.to_string().contains("unique")=>status_message(axum::http::StatusCode::BAD_REQUEST,"Vendor already exists"),Err(_)=>internal_error() }
 }
 
-pub async fn delete_vendor(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Response {
-    if let Err(response) = require_proxy_context(&headers, &state) {
-        return response;
-    }
-
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let Ok(object_id) = ObjectId::parse_str(&id) else {
-        return internal_error();
-    };
-    let db = client.database(&state.mongo_db);
-    let vendors = db.collection::<Document>("vendors");
-    let vendor = match vendors.find_one(doc! { "_id": object_id }).await {
-        Ok(Some(document)) => document,
-        Ok(None) => return status_message(axum::http::StatusCode::NOT_FOUND, "Vendor not found"),
-        Err(_) => return internal_error(),
-    };
-    let products_count = db
-        .collection::<Document>("products")
-        .count_documents(doc! { "vendor.name": read_string(&vendor, "name") })
-        .await
-        .unwrap_or(0);
-    if products_count > 0 {
-        return (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "message": format!("Cannot delete vendor. {products_count} products are using this vendor.")
-            })),
-        )
-            .into_response();
-    }
-
-    if vendors.delete_one(doc! { "_id": object_id }).await.is_err() {
-        return internal_error();
-    }
-
-    Json(serde_json::json!({ "message": "Vendor deleted successfully" })).into_response()
+pub async fn delete_vendor(headers: axum::http::HeaderMap, State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    if let Err(response) = require_proxy_context(&headers, &state) { return response; }
+    let Ok(id) = id.parse::<uuid::Uuid>() else { return internal_error() };
+    let row = match sqlx::query("SELECT name FROM vendors WHERE id=$1").bind(id).fetch_optional(&state.pg_pool).await { Ok(Some(row))=>row,Ok(None)=>return status_message(axum::http::StatusCode::NOT_FOUND,"Vendor not found"),Err(_)=>return internal_error() };
+    let name: String = row.get("name");
+    let count = match sqlx::query_scalar::<_,i64>("SELECT count(*) FROM products WHERE vendor_name=$1").bind(&name).fetch_one(&state.pg_pool).await { Ok(count)=>count,Err(_)=>return internal_error() };
+    if count > 0 { return (axum::http::StatusCode::BAD_REQUEST,Json(serde_json::json!({"message":format!("Cannot delete vendor. {count} products are using this vendor.")}))).into_response(); }
+    match sqlx::query("DELETE FROM vendors WHERE id=$1").bind(id).execute(&state.pg_pool).await { Ok(_)=>Json(serde_json::json!({"message":"Vendor deleted successfully"})).into_response(),Err(_)=>internal_error() }
 }
 
-fn is_duplicate_key(error: &mongodb::error::Error) -> bool {
-    error.to_string().contains("E11000") || error.to_string().contains("duplicate key")
-}
-
-fn vendor_item_from_doc(document: Document) -> VendorItem {
-    VendorItem {
-        id: document
-            .get_object_id("_id")
-            .map(|id| id.to_hex())
-            .unwrap_or_default(),
-        name: read_string(&document, "name"),
-        api_base_url: read_string(&document, "apiBaseUrl"),
-        config: document
-            .get_document("config")
-            .map(config_to_json)
-            .unwrap_or_else(|_| serde_json::json!({})),
-        low_balance_threshold: read_i64(&document, "lowBalanceThreshold"),
-        status: document.get_bool("status").unwrap_or(true),
-        created_at: date_string(&document, "createdAt"),
-        updated_at: date_string(&document, "updatedAt"),
-        version: read_i64(&document, "__v"),
-        slug: document.get_str("slug").map(ToString::to_string).ok(),
-    }
+fn json_i64(value: &Value) -> Option<i64> { value.as_i64().or_else(|| value.as_str()?.parse().ok()) }
+fn slugify(name: &str) -> String { name.trim().to_ascii_lowercase().split_whitespace().collect::<Vec<_>>().join("-") }
+fn vendor_item_from_row(row: sqlx::postgres::PgRow) -> VendorItem {
+    VendorItem { id:row.get::<uuid::Uuid,_>("id").to_string(), name:row.get("name"), api_base_url:row.get("api_base_url"), config:row.get("config"), low_balance_threshold:row.get("low_balance_threshold"), status:row.get("status"), created_at:row.get::<chrono::DateTime<chrono::Utc>,_>("created_at").to_rfc3339(), updated_at:row.get::<chrono::DateTime<chrono::Utc>,_>("updated_at").to_rfc3339(), version:0, slug:Some(row.get("slug")) }
 }

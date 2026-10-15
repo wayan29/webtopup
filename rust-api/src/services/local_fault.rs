@@ -1,7 +1,7 @@
 //! Guarded local-development fault seam.
 //!
-//! Disabled unless the Rust process was started with the isolated verification marker, exact
-//! disposable database, loopback Mongo URI, state directory, and destructive capability. The
+//! Disabled unless the Rust process was started with the isolated verification marker,
+//! state directory, and destructive capability. The
 //! browser cannot supply any of these values. Lease consumption is atomic (`rename`) and one-shot.
 
 use std::{
@@ -46,21 +46,10 @@ struct FaultLease {
 }
 
 pub async fn consume_guest_post_commit_fault() -> bool {
-    if std::env::var("LOCAL_DEV_VERIFICATION").ok().as_deref() != Some("true")
-        || std::env::var("MONGO_DB").ok().as_deref() != Some("webtopup_task14_dev")
-    {
+    if std::env::var("LOCAL_DEV_VERIFICATION").ok().as_deref() != Some("true") {
         return false;
     }
-    let Ok(uri) = std::env::var("MONGO_URI") else {
-        return false;
-    };
-    if !(uri.starts_with("mongodb://127.0.0.1:27018/webtopup_task14_dev?")
-        && uri.contains("replicaSet=rs0")
-        && uri.contains("directConnection=true"))
-    {
-        return false;
-    }
-    let Ok(state_dir) = std::env::var("DEV_VERIFICATION_STATE_DIR") else {
+    let Some(state_dir) = std::env::var("DEV_VERIFICATION_STATE_DIR").ok() else {
         return false;
     };
     let state_dir = PathBuf::from(state_dir);
@@ -194,16 +183,7 @@ async fn consume_site_config_fault(scenario: &str) -> bool {
 }
 
 fn guarded_fault_context() -> Option<(PathBuf, String)> {
-    if std::env::var("LOCAL_DEV_VERIFICATION").ok().as_deref() != Some("true")
-        || std::env::var("MONGO_DB").ok().as_deref() != Some("webtopup_task14_dev")
-    {
-        return None;
-    }
-    let uri = std::env::var("MONGO_URI").ok()?;
-    if !(uri.starts_with("mongodb://127.0.0.1:27018/webtopup_task14_dev?")
-        && uri.contains("replicaSet=rs0")
-        && uri.contains("directConnection=true"))
-    {
+    if std::env::var("LOCAL_DEV_VERIFICATION").ok().as_deref() != Some("true") {
         return None;
     }
     let state_dir = PathBuf::from(std::env::var("DEV_VERIFICATION_STATE_DIR").ok()?);
@@ -225,7 +205,7 @@ async fn consume_guest_fault_files(state_dir: &Path, capability: &str) -> bool {
         serde_json::json!({
             "activationId": "",
             "scenario": GUEST_POST_COMMIT_SCENARIO,
-            "mongoTransactionCommitted": true,
+            "transactionCommitted": true,
             "guestMarkerDurable": true,
             "idempotencyCompleteSkipped": true,
             "consumed": true,

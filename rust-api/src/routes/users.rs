@@ -4,9 +4,8 @@ mod avatar_media;
 mod balance;
 mod mappers;
 mod me;
-mod queries;
+// User queries are implemented in the SQL-backed route handlers.
 mod responses;
-mod session;
 mod staff;
 mod types;
 mod validation;

@@ -2,13 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
-use mongodb::{bson::doc, Client, ClientSession, Database};
 use serde::Serialize;
+use crate::services::managed_asset_registry::RegistryError;
 
-use crate::services::{
-    idempotency::{commit_mongo_transaction_with_unknown_retry, TransactionCommitOutcome},
-    managed_asset_registry::{increment_legacy_acquisition_fence, RegistryError},
-};
 
 const MANAGED_FOLDERS: &[&str] = &["icons", "covers", "popups", "instructions"];
 
@@ -297,57 +293,6 @@ fn changed_cover_paths<'a>(changed_paths: &'a [&'a str]) -> Result<Vec<&'a str>,
     Ok(result)
 }
 
-/// Fence legacy non-slider writes in the same transaction as their domain write.
-///
-/// This deliberately creates no reference rows and never changes `referenceCount`; it only
-/// serializes acquisition against registry deletion by incrementing the monotonic fence version.
-pub async fn fence_legacy_managed_writes(
-    session: &mut ClientSession,
-    db: &Database,
-    changed_paths: &[&str],
-) -> Result<(), RegistryError> {
-    for path in changed_cover_paths(changed_paths)? {
-        increment_legacy_acquisition_fence(session, db, path).await?;
-    }
-    Ok(())
-}
-
-/// Start the narrow transaction used by a legacy writer when it is persisting a changed cover.
-pub async fn start_legacy_managed_write(client: &Client) -> Result<ClientSession, RegistryError> {
-    let mut session = client
-        .start_session()
-        .await
-        .map_err(|_| RegistryError::Unavailable)?;
-    session
-        .start_transaction()
-        .await
-        .map_err(|_| RegistryError::Unavailable)?;
-    Ok(session)
-}
-
-/// Abort a legacy writer transaction, preserving the original registry error only when rollback
-/// itself is acknowledged.
-pub async fn abort_legacy_managed_write(
-    session: &mut ClientSession,
-    error: RegistryError,
-) -> RegistryError {
-    match session.abort_transaction().await {
-        Ok(()) => error,
-        Err(_) => RegistryError::TransactionAbortFailed,
-    }
-}
-
-/// Commit only the transaction that already contains the domain write and cover fence. An
-/// ambiguous commit never becomes a success response; Task 7/readiness reconciliation owns it.
-pub async fn commit_legacy_managed_write(
-    session: &mut ClientSession,
-) -> Result<(), RegistryError> {
-    match commit_mongo_transaction_with_unknown_retry(session).await {
-        TransactionCommitOutcome::Committed => Ok(()),
-        TransactionCommitOutcome::Ambiguous => Err(RegistryError::AmbiguousCommit),
-        TransactionCommitOutcome::FailedDefinitely => Err(RegistryError::Unavailable),
-    }
-}
 
 pub fn managed_asset_registry_unavailable_response() -> axum::response::Response {
     use axum::{response::IntoResponse, Json};
@@ -493,75 +438,6 @@ pub const ENSURE_MANAGED_FIELDS_SOURCE_INVENTORY: &[(&str, &str, ManagedFieldFol
     ("sliders", "image", ManagedFieldFolderPolicy::Covers),
 ];
 
-pub async fn count_asset_references(
-    db: &Database,
-    url: &str,
-) -> Result<Vec<AssetReferenceSummary>, mongodb::error::Error> {
-    let mut summaries = Vec::new();
-    for (collection, resource, field) in SCALAR_REFERENCES {
-        let filter = if *collection == "settings" && *field == "value" {
-            doc! {
-                "key": { "$in": SETTINGS_IMAGE_KEYS },
-                "value": url,
-            }
-        } else {
-            doc! { *field: url }
-        };
-        let count = db
-            .collection::<mongodb::bson::Document>(collection)
-            .count_documents(filter)
-            .await?;
-        append_reference_summary(&mut summaries, resource, count);
-    }
-    Ok(summaries)
-}
-
-/// Run the complete legacy reference inventory on the transaction snapshot. This must be called
-/// again whenever the deletion transaction is retried; a scan from a prior attempt is never
-/// reusable because Task 5 writers fence through the same managed asset document.
-pub async fn count_asset_references_in_session(
-    session: &mut ClientSession,
-    db: &Database,
-    url: &str,
-) -> Result<Vec<AssetReferenceSummary>, mongodb::error::Error> {
-    let mut summaries = Vec::new();
-    for (collection, resource, field) in SCALAR_REFERENCES {
-        let filter = if *collection == "settings" && *field == "value" {
-            doc! {
-                "key": { "$in": SETTINGS_IMAGE_KEYS },
-                "value": url,
-            }
-        } else {
-            doc! { *field: url }
-        };
-        let count = db
-            .collection::<mongodb::bson::Document>(collection)
-            .count_documents(filter)
-            .session(&mut *session)
-            .await?;
-        append_reference_summary(&mut summaries, resource, count);
-    }
-    Ok(summaries)
-}
-
-fn append_reference_summary(
-    summaries: &mut Vec<AssetReferenceSummary>,
-    resource: &'static str,
-    count: u64,
-) {
-    if count == 0 {
-        return;
-    }
-    // Aggregate counts for the same resource label (e.g. operators has two fields).
-    if let Some(existing) = summaries
-        .iter_mut()
-        .find(|item| item.resource == resource)
-    {
-        existing.count = existing.count.saturating_add(count);
-    } else {
-        summaries.push(AssetReferenceSummary { resource, count });
-    }
-}
 
 fn is_safe_managed_filename(filename: &str) -> bool {
     if filename.is_empty()
@@ -703,30 +579,29 @@ mod tests {
     }
 
     #[test]
-    fn legacy_fence_does_not_mutate_reference_rows_or_reference_count() {
-        let source = include_str!("managed_assets.rs");
-        let fence = source
-            .split("pub async fn fence_legacy_managed_writes")
+    fn sql_reference_acquire_fences_on_state_without_inventing_references() {
+        let source = include_str!("managed_asset_registry.rs");
+        let acquire = source
+            .split("pub async fn acquire_reference")
             .nth(1)
-            .and_then(|rest| rest.split("/// Start the narrow transaction").next())
-            .expect("legacy fence source contract");
-        assert!(fence.contains("increment_legacy_acquisition_fence"));
-        assert!(!fence.contains("referenceCount"));
-        assert!(!fence.contains("managedassetreferences"));
+            .and_then(|rest| rest.split("pub async fn release_reference").next())
+            .expect("registry acquire source contract");
+        assert!(acquire.contains("FOR UPDATE"));
+        assert!(acquire.contains("AlreadyDeleting"));
+        assert!(acquire.contains("INSERT INTO asset_references"));
     }
 
     #[test]
-    fn legacy_fence_cannot_persist_after_asset_enters_deleting() {
+    fn sql_deletion_locks_state_and_journals_the_unlink_intent() {
         let source = include_str!("managed_asset_registry.rs");
-        let fence = source
-            .split("pub async fn increment_legacy_acquisition_fence")
+        let deletion = source
+            .split("pub async fn prepare_deletion")
             .nth(1)
-            .and_then(|rest| rest.split("pub async fn begin_asset_deletion").next())
-            .expect("registry fence source contract");
-        assert!(fence.contains("\"folder\": \"covers\""));
-        assert!(fence.contains("\"state\": AVAILABLE"));
-        assert!(fence.contains("acquisitionFenceVersion"));
-        assert!(fence.contains("modified_count != 1"));
+            .expect("registry deletion source contract");
+        assert!(deletion.contains("FOR UPDATE"));
+        assert!(deletion.contains("AlreadyDeleting"));
+        assert!(deletion.contains("state='deleting'"));
+        assert!(deletion.contains("managed_asset_journal"));
     }
 
     #[test]

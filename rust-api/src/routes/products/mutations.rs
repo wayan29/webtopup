@@ -2,25 +2,18 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
+    http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
-use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
+use serde_json::json;
+use uuid::Uuid;
 
-use crate::{
-    security::require_permission,
-    services::product_id::{
-        allocate_product_id, classify_duplicate_key_constraint, is_duplicate_key,
-        should_retry_duplicate_product_id_attempt, DuplicateKeyConstraint,
-        MAX_PRODUCT_ID_INSERT_ATTEMPTS,
-    },
-    state::AppState,
-    utils::bson::read_i64,
-};
+use crate::{security::require_sql_permission, state::AppState};
 
 use super::{
-    build_product_payload, internal_error, object_id, populated_product_json, status_message,
-    unavailable, ProductMutationResponse, ProductNormalizedPayload, ProductPayload,
+    internal_error, lock_catalog, mappers, payload::build_product_payload, status_message,
+    ProductPayload,
 };
 
 pub async fn create_product(
@@ -28,56 +21,77 @@ pub async fn create_product(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<ProductPayload>,
 ) -> Response {
-    if let Err(response) = require_permission(&headers, &state, "manageProducts").await {
+    if let Err(response) = require_sql_permission(&headers, &state, "manageProducts").await {
         return response;
     }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
+    let mut tx = match state.pg_pool.begin().await {
+        Ok(tx) => tx,
+        Err(_) => return internal_error(),
     };
-    let db = client.database(&state.mongo_db);
-    let normalized = match build_product_payload(&db, &payload.0, None).await {
+    if lock_catalog(&mut tx).await.is_err() {
+        return internal_error();
+    }
+    let normalized = match build_product_payload(&mut tx, &payload.0, None).await {
         Ok(payload) => payload,
         Err(response) => return response,
     };
-    let products = db.collection::<Document>("products");
-    if products
-        .find_one(doc! { "code": &normalized.code })
-        .projection(doc! { "_id": 1 })
+    match sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM products WHERE code=$1)")
+        .bind(&normalized.code)
+        .fetch_one(&mut *tx)
         .await
-        .ok()
-        .flatten()
-        .is_some()
     {
-        return duplicate_code(&normalized.code);
+        Ok(true) => return duplicate_code(&normalized.code),
+        Ok(false) => {}
+        Err(_) => return internal_error(),
     }
-    let sort_order = max_sort_order(&products, &normalized).await + 1;
-    let now = DateTime::now();
-    let inserted_id = match insert_product_with_allocated_id(
-        &db,
-        &products,
-        &normalized,
-        sort_order,
-        now,
+    let sort_order = match normalized.sort_order {
+        Some(order) => order,
+        None => match sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(max(sort_order),0)+1 FROM products WHERE product_type_id=$1",
+        )
+        .bind(normalized.product_type_id)
+        .fetch_one(&mut *tx)
+        .await
+        {
+            Ok(value) => value,
+            Err(_) => return internal_error(),
+        },
+    };
+    let inserted = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO products(name,code,category,category_id,operator_id,product_type_id,payment_type,brand,cost_price,price_basic,price_gold,price_platinum,reward_points,icon,vendor_name,vendor_sku,status,sort_order) \
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING id",
     )
-    .await
-    {
+    .bind(&normalized.name)
+    .bind(&normalized.code)
+    .bind(&normalized.category)
+    .bind(normalized.category_id)
+    .bind(normalized.operator_id)
+    .bind(normalized.product_type_id)
+    .bind(&normalized.payment_type)
+    .bind(&normalized.brand)
+    .bind(normalized.cost_price)
+    .bind(normalized.price.basic)
+    .bind(normalized.price.gold)
+    .bind(normalized.price.platinum)
+    .bind(normalized.reward_points)
+    .bind(&normalized.icon)
+    .bind(&normalized.vendor.name)
+    .bind(&normalized.vendor.sku)
+    .bind(normalized.status)
+    .bind(sort_order)
+    .fetch_one(&mut *tx)
+    .await;
+    let id = match inserted {
         Ok(id) => id,
-        Err(response) => return response,
+        Err(error) => return insert_error(error, &normalized.code),
     };
-    let product = match inserted_id
-        .as_deref()
-        .and_then(|id| ObjectId::parse_str(id).ok())
-    {
-        Some(id) => populated_product_json(&db, id).await,
-        None => None,
-    };
+    let product = mappers::load(&mut tx, id, true).await.ok().flatten();
+    if tx.commit().await.is_err() {
+        return internal_error();
+    }
     (
-        axum::http::StatusCode::CREATED,
-        Json(ProductMutationResponse {
-            message: "Product created",
-            product,
-            product_id: None,
-        }),
+        StatusCode::CREATED,
+        Json(json!({"message":"Product created","product":product})),
     )
         .into_response()
 }
@@ -88,53 +102,80 @@ pub async fn update_product(
     Path(id): Path<String>,
     Json(payload): Json<ProductPayload>,
 ) -> Response {
-    if let Err(response) = require_permission(&headers, &state, "manageProducts").await {
+    if let Err(response) = require_sql_permission(&headers, &state, "manageProducts").await {
         return response;
     }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let Some(object_id) = object_id(Some(&id)) else {
+    let Some(id) = Uuid::parse_str(id.trim()).ok() else {
         return internal_error();
     };
-    let db = client.database(&state.mongo_db);
-    let products = db.collection::<Document>("products");
-    let existing = match products.find_one(doc! { "_id": object_id }).await {
-        Ok(Some(document)) => document,
-        Ok(None) => return status_message(axum::http::StatusCode::NOT_FOUND, "Product not found"),
+    let mut tx = match state.pg_pool.begin().await {
+        Ok(tx) => tx,
         Err(_) => return internal_error(),
     };
-    let normalized = match build_product_payload(&db, &payload.0, Some(&existing)).await {
+    let existing_row = match sqlx::query(&format!("{} WHERE p.id=$1", mappers::PRODUCT_SELECT))
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await
+    {
+        Ok(row) => row,
+        Err(_) => return internal_error(),
+    };
+    let Some(existing_row) = existing_row else {
+        return status_message(StatusCode::NOT_FOUND, "Product not found");
+    };
+    let existing = mappers::document(&existing_row, false, false);
+    let normalized = match build_product_payload(&mut tx, &payload.0, Some(&existing)).await {
         Ok(payload) => payload,
         Err(response) => return response,
     };
-    if products
-        .find_one(doc! { "code": &normalized.code, "_id": { "$ne": object_id } })
-        .projection(doc! { "_id": 1 })
-        .await
-        .ok()
-        .flatten()
-        .is_some()
+    match sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM products WHERE code=$1 AND id<>$2)",
+    )
+    .bind(&normalized.code)
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await
     {
-        return duplicate_code(&normalized.code);
+        Ok(true) => return duplicate_code(&normalized.code),
+        Ok(false) => {}
+        Err(_) => return internal_error(),
     }
-    let update = normalized.into_update_document(DateTime::now());
-    if let Err(error) = products
-        .update_one(doc! { "_id": object_id }, doc! { "$set": update })
-        .await
-    {
-        if is_duplicate_key(&error) {
-            return duplicate_code("");
+    let updated = sqlx::query(
+        "UPDATE products SET name=$2,code=$3,category=$4,category_id=$5,operator_id=$6,product_type_id=$7,payment_type=$8,brand=$9,cost_price=$10,price_basic=$11,price_gold=$12,price_platinum=$13,reward_points=$14,icon=$15,vendor_name=$16,vendor_sku=$17,status=$18,sort_order=COALESCE($19,sort_order),updated_at=now() WHERE id=$1",
+    )
+    .bind(id)
+    .bind(&normalized.name)
+    .bind(&normalized.code)
+    .bind(&normalized.category)
+    .bind(normalized.category_id)
+    .bind(normalized.operator_id)
+    .bind(normalized.product_type_id)
+    .bind(&normalized.payment_type)
+    .bind(&normalized.brand)
+    .bind(normalized.cost_price)
+    .bind(normalized.price.basic)
+    .bind(normalized.price.gold)
+    .bind(normalized.price.platinum)
+    .bind(normalized.reward_points)
+    .bind(&normalized.icon)
+    .bind(&normalized.vendor.name)
+    .bind(&normalized.vendor.sku)
+    .bind(normalized.status)
+    .bind(normalized.sort_order)
+    .execute(&mut *tx)
+    .await;
+    match updated {
+        Ok(result) if result.rows_affected() == 0 => {
+            return status_message(StatusCode::NOT_FOUND, "Product not found")
         }
+        Ok(_) => {}
+        Err(error) => return insert_error(error, ""),
+    }
+    let product = mappers::load(&mut tx, id, true).await.ok().flatten();
+    if tx.commit().await.is_err() {
         return internal_error();
     }
-    let product = populated_product_json(&db, object_id).await;
-    Json(ProductMutationResponse {
-        message: "Product updated",
-        product,
-        product_id: None,
-    })
-    .into_response()
+    Json(json!({"message":"Product updated","product":product})).into_response()
 }
 
 pub async fn delete_product(
@@ -142,134 +183,79 @@ pub async fn delete_product(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(response) = require_permission(&headers, &state, "manageProducts").await {
+    if let Err(response) = require_sql_permission(&headers, &state, "manageProducts").await {
         return response;
     }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let Some(object_id) = object_id(Some(&id)) else {
+    let Some(id) = Uuid::parse_str(id.trim()).ok() else {
         return internal_error();
     };
-    let products = client
-        .database(&state.mongo_db)
-        .collection::<Document>("products");
-    let product = match products.find_one(doc! { "_id": object_id }).await {
-        Ok(Some(document)) => document,
-        Ok(None) => return status_message(axum::http::StatusCode::NOT_FOUND, "Product not found"),
+    let mut tx = match state.pg_pool.begin().await {
+        Ok(tx) => tx,
         Err(_) => return internal_error(),
     };
-    if !product.get_bool("status").unwrap_or(true) {
-        if products
-            .delete_one(doc! { "_id": object_id })
+    let existing = match sqlx::query_as::<_, (bool,)>(
+        "SELECT status FROM products WHERE id=$1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await
+    {
+        Ok(Some(row)) => row.0,
+        Ok(None) => return status_message(StatusCode::NOT_FOUND, "Product not found"),
+        Err(_) => return internal_error(),
+    };
+    if !existing {
+        if sqlx::query("DELETE FROM products WHERE id=$1")
+            .bind(id)
+            .execute(&mut *tx)
             .await
             .is_err()
         {
             return internal_error();
         }
-        return Json(ProductMutationResponse {
-            message: "Product removed permanently",
-            product: None,
-            product_id: Some(id),
-        })
+        if tx.commit().await.is_err() {
+            return internal_error();
+        }
+        return Json(json!({
+            "message": "Product removed permanently",
+            "productId": id.to_string(),
+        }))
         .into_response();
     }
-    let now = DateTime::now();
-    if products
-        .update_one(
-            doc! { "_id": object_id },
-            doc! { "$set": { "status": false, "updatedAt": now } },
-        )
+    if sqlx::query("UPDATE products SET status=false,updated_at=now() WHERE id=$1")
+        .bind(id)
+        .execute(&mut *tx)
         .await
         .is_err()
     {
         return internal_error();
     }
-    let product = populated_product_json(&client.database(&state.mongo_db), object_id).await;
-    Json(ProductMutationResponse {
-        message: "Product deactivated (soft delete)",
-        product,
-        product_id: None,
-    })
+    let product = mappers::load(&mut tx, id, true).await.ok().flatten();
+    if tx.commit().await.is_err() {
+        return internal_error();
+    }
+    Json(json!({
+        "message": "Product deactivated (soft delete)",
+        "product": product,
+    }))
     .into_response()
 }
 
-async fn insert_product_with_allocated_id(
-    db: &mongodb::Database,
-    products: &mongodb::Collection<Document>,
-    normalized: &ProductNormalizedPayload,
-    sort_order: i64,
-    now: DateTime,
-) -> Result<Option<String>, Response> {
-    for attempt in 0..MAX_PRODUCT_ID_INSERT_ATTEMPTS {
-        let product_id = match allocate_product_id(db).await {
-            Ok(value) => value,
-            Err(_) => return Err(internal_error()),
-        };
-        let document = normalized
-            .clone()
-            .into_document(product_id, sort_order, now, now);
-        match products.insert_one(document).await {
-            Ok(result) => {
-                return Ok(result.inserted_id.as_object_id().map(|id| id.to_hex()));
-            }
-            Err(error) => {
-                if is_duplicate_key(&error) {
-                    if let Some(response) =
-                        product_insert_duplicate_error(&error, attempt, &normalized.code)
-                    {
-                        return Err(response);
-                    }
-                    continue;
-                }
-                return Err(internal_error());
-            }
-        }
-    }
-    Err(internal_error())
-}
-
-async fn max_sort_order(
-    products: &mongodb::Collection<Document>,
-    payload: &ProductNormalizedPayload,
-) -> i64 {
-    products
-        .find_one(doc! { "productTypeId": payload.product_type_id })
-        .projection(doc! { "sortOrder": 1 })
-        .sort(doc! { "sortOrder": -1 })
-        .await
-        .ok()
-        .flatten()
-        .map(|document| read_i64(&document, "sortOrder"))
-        .unwrap_or_default()
-}
-
-fn product_insert_duplicate_error(
-    error: &mongodb::error::Error,
-    attempt: usize,
-    code: &str,
-) -> Option<Response> {
-    match classify_duplicate_key_constraint(error) {
-        DuplicateKeyConstraint::ProductId => {
-            if should_retry_duplicate_product_id_attempt(attempt) {
-                None
-            } else {
-                tracing::error!(%attempt, "productId duplicate after max insert attempts");
-                Some(internal_error())
-            }
-        }
-        DuplicateKeyConstraint::Code => Some(duplicate_code(code)),
-        DuplicateKeyConstraint::Unknown => {
-            tracing::error!(error = %error, "unknown duplicate key on product insert");
-            Some(internal_error())
-        }
+fn insert_error(error: sqlx::Error, code: &str) -> Response {
+    if error
+        .as_database_error()
+        .is_some_and(|error| error.is_unique_violation())
+    {
+        duplicate_code(code)
+    } else {
+        internal_error()
     }
 }
 
 fn duplicate_code(code: &str) -> Response {
     (
-        axum::http::StatusCode::CONFLICT,
-        Json(serde_json::json!({
+        StatusCode::CONFLICT,
+        Json(json!({
             "message": "Kode produk sudah digunakan, gunakan kode unik lain",
             "field": "code",
             "duplicate": code,

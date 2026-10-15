@@ -3,10 +3,9 @@ mod prepaid;
 mod settings;
 mod types;
 
-pub use admin::{admin_orders, delete_mapping, logs, mappings, save_mapping};
+pub use admin::{admin_orders, delete_mapping, logs, mappings, save_mapping, SaveIrsMappingPayload};
 pub use prepaid::prepaid;
 pub use settings::{save_settings, settings};
-pub(crate) use settings::stored_config;
 
 use axum::{
     http::HeaderMap,
@@ -14,7 +13,6 @@ use axum::{
     response::Response,
     Json,
 };
-use mongodb::bson::Document;
 
 use crate::{security::ErrorResponse, utils::bson::read_string};
 
@@ -68,17 +66,6 @@ pub(super) fn ip_matches_rule(client_ip: &str, rule: &str) -> bool {
     (u32::from(client) & mask) == (u32::from(range) & mask)
 }
 
-pub(super) fn string_array(document: &Document, key: &str) -> Vec<String> {
-    document
-        .get_array(key)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(ToString::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
-}
 
 pub(super) fn status_message(status: axum::http::StatusCode, message: &'static str) -> Response {
     (status, Json(ErrorResponse { message })).into_response()
@@ -112,18 +99,3 @@ impl EmptyStringFallback for String {
     }
 }
 
-pub(super) fn document_id(document: &Document) -> String {
-    document
-        .get_object_id("_id")
-        .map(|id| id.to_hex())
-        .unwrap_or_default()
-}
-
-pub(super) fn date_string(document: &Document, key: &str) -> String {
-    match document.get(key) {
-        Some(mongodb::bson::Bson::DateTime(value)) => value
-            .try_to_rfc3339_string()
-            .unwrap_or_else(|_| value.to_string()),
-        _ => read_string(document, key),
-    }
-}

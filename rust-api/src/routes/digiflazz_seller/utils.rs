@@ -1,34 +1,6 @@
-use mongodb::bson::{Bson, DateTime, Document};
 use serde_json::Value;
 
-use crate::utils::bson::read_string;
-
 const DEFAULT_ALLOWED_IP: &str = "52.74.250.133";
-
-pub(super) fn allowed_ips(value: Option<&Bson>) -> Vec<String> {
-    let items = match value {
-        Some(Bson::Array(values)) => values
-            .iter()
-            .filter_map(|value| value.as_str().map(str::trim).map(ToString::to_string))
-            .collect::<Vec<_>>(),
-        Some(Bson::String(value)) => value
-            .split([',', ';', '\n'])
-            .map(str::trim)
-            .map(ToString::to_string)
-            .collect::<Vec<_>>(),
-        _ => Vec::new(),
-    }
-    .into_iter()
-    .filter(|value| !value.is_empty())
-    .collect::<Vec<_>>();
-
-    if items.is_empty() {
-        vec![DEFAULT_ALLOWED_IP.to_string()]
-    } else {
-        items
-    }
-}
-
 pub(super) fn text_from_value(value: &Value) -> String {
     match value {
         Value::String(value) => value.trim().to_string(),
@@ -154,14 +126,6 @@ pub(super) fn is_valid_pulsa_code(value: &str) -> bool {
         })
 }
 
-pub(super) fn insert_optional_i64(document: &mut Document, key: &str, value: Option<i64>) {
-    if let Some(value) = value {
-        document.insert(key, value);
-    } else {
-        document.insert(key, Bson::Null);
-    }
-}
-
 pub(super) fn join_url(base_url: &str, path: &str) -> String {
     if base_url.is_empty() {
         return String::new();
@@ -178,69 +142,3 @@ pub(super) fn normalize_url(value: String) -> String {
     value.trim_end_matches('/').to_string()
 }
 
-pub(super) fn document_id(document: &Document) -> String {
-    document
-        .get_object_id("_id")
-        .map(|id| id.to_hex())
-        .unwrap_or_default()
-}
-
-pub(super) fn document_string(document: &Document, key: &str) -> String {
-    read_string(document, key).trim().to_string()
-}
-
-pub(super) fn optional_bool(document: &Document, key: &str) -> Option<bool> {
-    document.get_bool(key).ok()
-}
-
-pub(super) fn optional_i64(document: &Document, key: &str) -> Option<i64> {
-    match document.get(key) {
-        Some(Bson::Int32(value)) => Some(i64::from(*value)),
-        Some(Bson::Int64(value)) => Some(*value),
-        Some(Bson::Double(value)) => Some(*value as i64),
-        _ => None,
-    }
-}
-
-pub(super) fn optional_date_or_string(document: &Document, key: &str) -> Option<String> {
-    match document.get(key) {
-        Some(Bson::DateTime(value)) => Some(date_to_string(value)),
-        Some(Bson::String(value)) if !value.is_empty() => Some(value.clone()),
-        _ => None,
-    }
-}
-
-pub(super) fn date_string(document: &Document, key: &str) -> String {
-    optional_date_string(document, key).unwrap_or_default()
-}
-
-pub(super) fn optional_date_string(document: &Document, key: &str) -> Option<String> {
-    document.get_datetime(key).ok().map(date_to_string)
-}
-
-pub(super) fn date_to_string(value: &DateTime) -> String {
-    value
-        .try_to_rfc3339_string()
-        .unwrap_or_else(|_| value.to_string())
-}
-
-pub(super) fn date_key(date: DateTime) -> String {
-    date.try_to_rfc3339_string()
-        .ok()
-        .and_then(|value| value.get(0..10).map(ToString::to_string))
-        .unwrap_or_else(|| "unknown-date".to_string())
-}
-
-pub(super) trait EmptyStringFallback {
-    fn if_empty(self, fallback: &str) -> String;
-}
-
-impl EmptyStringFallback for String {
-    fn if_empty(self, fallback: &str) -> String {
-        if self.is_empty() {
-            fallback.to_string()
-        } else {
-            self
-        }
-    }
-}

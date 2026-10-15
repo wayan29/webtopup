@@ -30,6 +30,6 @@ pub(super) fn internal_error() -> Response {
 pub(super) fn unavailable() -> Response {
     status_message(
         axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        "MONGO_URI is not configured",
+        "Database unavailable",
     )
 }

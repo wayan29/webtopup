@@ -1,27 +1,24 @@
-//! Consistent revisioned slider reads and public freshness helpers.
-//!
-//! Slider mutations are deliberately not part of this module yet.  The read snapshots therefore
-//! do not advertise a mutation capability marker while the legacy mutation handlers remain in
-//! place for compatibility.
+//! Versioned slider reads from `content_sliders` and `content_revisions`.
+
+use std::{fmt::Write, time::{SystemTime, UNIX_EPOCH}};
 
 use axum::http::{HeaderMap, HeaderValue, Method, Uri};
-use futures_util::TryStreamExt;
+use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use subtle::ConstantTimeEq;
-use std::fmt::Write as _;
-use std::time::{SystemTime, UNIX_EPOCH};
-use mongodb::{bson::{doc, oid::ObjectId, Bson, Document}, Client, Database};
-use serde::Serialize;
+use uuid::Uuid;
 
-use super::{
-    public_slider_from_document, PublicSliderItem, MAX_CURRENT_SLIDERS, MAX_PUBLIC_SLIDERS,
-    SLIDER_MUTATION_CONTRACT,
-};
 use crate::{
     security::require_proxy_context,
     services::correlation::validate_trace_id,
     state::AppState,
+};
+
+use super::{
+    PublicSliderItem, MAX_CURRENT_SLIDERS, MAX_PUBLIC_SLIDERS, SLIDER_MUTATION_CONTRACT,
+    normalize_slider_link,
 };
 
 pub const SLIDER_CAPABILITY_VERSION_HEADER: &str = "x-webtopup-slider-contract-version";
@@ -29,19 +26,12 @@ pub const SLIDER_CAPABILITY_TIMESTAMP_HEADER: &str = "x-webtopup-slider-contract
 pub const SLIDER_CAPABILITY_ASSERTION_HEADER: &str = "x-webtopup-slider-contract-assertion";
 const SLIDER_CAPABILITY_INPUT_VERSION: &str = "slider-contract-capability/v1";
 const SLIDER_CAPABILITY_MAX_CLOCK_SKEW_MS: i128 = 30_000;
-use crate::utils::bson::{read_i64, read_string};
-
-/// Dedicated collection containing the one global slider revision document.
-pub const SLIDER_METADATA_COLLECTION: &str = "slidermetadata";
-const GLOBAL_METADATA_ID: &str = "global";
 const SNAPSHOT_ATTEMPTS: usize = 3;
+pub const SLIDER_METADATA_COLLECTION: &str = "content_revisions";
 
-/// Errors returned while obtaining a self-consistent slider read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SliderSnapshotError {
-    /// The database was unavailable or contained an unusable revision value.
     Unavailable,
-    /// The revision changed during every bounded read attempt.
     Unstable,
 }
 
@@ -54,9 +44,7 @@ impl SliderSnapshotError {
     }
 }
 
-/// Administrative slider data.  This intentionally exposes operational read metadata but no
-/// mutation contract or idempotency/registry internals.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SliderAdminItem {
     #[serde(rename = "_id")]
@@ -71,10 +59,10 @@ pub struct SliderAdminItem {
     pub updated_at: String,
     pub archived_at: Option<String>,
     pub archived_by: Option<String>,
+    pub revision: i64,
 }
 
-/// Capacity and current usage metadata included with every admin snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SliderLimits {
     pub total: i64,
@@ -85,9 +73,7 @@ pub struct SliderLimits {
     pub remaining_active: i64,
 }
 
-/// A versioned administrative snapshot.  The mutation contract is omitted unless the request
-/// crossed the authenticated, exact-path gateway capability handshake and local readiness is true.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SliderAdminSnapshot {
     pub revision: i64,
     pub sliders: Vec<SliderAdminItem>,
@@ -96,319 +82,93 @@ pub struct SliderAdminSnapshot {
     pub mutation_contract: Option<String>,
 }
 
-/// Load the global slider revision.  A missing metadata document is the initial revision zero.
-pub async fn load_slider_revision(
-    client: &Client,
-    db_name: &str,
-) -> Result<i64, SliderSnapshotError> {
-    let document = client
-        .database(db_name)
-        .collection::<Document>(SLIDER_METADATA_COLLECTION)
-        .find_one(doc! { "_id": GLOBAL_METADATA_ID })
+#[derive(Debug, Clone)]
+pub(super) struct SliderRow {
+    pub id: Uuid,
+    pub name: String,
+    pub image: String,
+    pub link: String,
+    pub sort_order: i64,
+    pub status: bool,
+    pub lifecycle: String,
+    pub revision: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub archived_at: Option<DateTime<Utc>>,
+    pub archived_by: Option<Uuid>,
+}
+
+pub(super) fn mongoose_timestamp(value: DateTime<Utc>) -> String {
+    value.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
+fn admin_item(row: &SliderRow) -> SliderAdminItem {
+    SliderAdminItem {
+        id: row.id.to_string(),
+        name: row.name.clone(),
+        image: row.image.clone(),
+        link: row.link.clone(),
+        sort_order: row.sort_order,
+        status: row.status,
+        lifecycle: row.lifecycle.clone(),
+        created_at: mongoose_timestamp(row.created_at),
+        updated_at: mongoose_timestamp(row.updated_at),
+        archived_at: row.archived_at.map(mongoose_timestamp),
+        archived_by: row.archived_by.map(|value| value.to_string()),
+        revision: row.revision,
+    }
+}
+
+fn public_item(row: &SliderRow) -> PublicSliderItem {
+    let mut link = row.link.clone();
+    if normalize_slider_link(&link).is_err() {
+        link.clear();
+    }
+    PublicSliderItem { id: row.id.to_string(), name: row.name.clone(), image: row.image.clone(), link }
+}
+
+fn row_from(row: &sqlx::postgres::PgRow) -> SliderRow {
+    SliderRow {
+        id: row.get("id"),
+        name: row.get("name"),
+        image: row.get("image"),
+        link: row.get("link"),
+        sort_order: row.get("sort_order"),
+        status: row.get("status"),
+        lifecycle: row.get("lifecycle"),
+        revision: row.get("revision"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        archived_at: row.get("archived_at"),
+        archived_by: row.get("archived_by"),
+    }
+}
+
+const ROW_SQL: &str = "SELECT id, name, image, link, sort_order, status, lifecycle, revision, created_at, updated_at, archived_at, archived_by FROM content_sliders";
+
+pub async fn load_slider_revision(pool: &PgPool) -> Result<i64, SliderSnapshotError> {
+    sqlx::query_scalar("SELECT revision FROM content_revisions WHERE domain='sliders'")
+        .fetch_optional(pool)
         .await
-        .map_err(|_| SliderSnapshotError::Unavailable)?;
-
-    let Some(document) = document else {
-        return Ok(0);
-    };
-
-    let revision = match document.get("revision") {
-        None => 0,
-        Some(Bson::Int32(value)) => i64::from(*value),
-        Some(Bson::Int64(value)) => *value,
-        Some(Bson::Double(value)) if value.is_finite() && value.fract() == 0.0 => *value as i64,
-        Some(Bson::String(value)) => value
-            .trim()
-            .parse::<i64>()
-            .map_err(|_| SliderSnapshotError::Unavailable)?,
-        _ => return Err(SliderSnapshotError::Unavailable),
-    };
-
-    if revision < 0 {
-        return Err(SliderSnapshotError::Unavailable);
-    }
-    Ok(revision)
-}
-
-/// Load all current/non-archived sliders and the corresponding capacity metadata.
-pub async fn load_current_snapshot(
-    client: &Client,
-    db_name: &str,
-) -> Result<SliderAdminSnapshot, SliderSnapshotError> {
-    load_admin_snapshot(client, db_name, current_filter()).await
-}
-
-/// Load archived sliders while keeping capacity metadata for the current collection.
-pub async fn load_archived_snapshot(
-    client: &Client,
-    db_name: &str,
-) -> Result<SliderAdminSnapshot, SliderSnapshotError> {
-    load_admin_snapshot(client, db_name, archived_filter()).await
-}
-
-/// Load the public array and its authoritative global revision.
-///
-/// Public links are sanitized at read time: historical HTTP/unsafe links remain in storage for
-/// diagnosis, but are disclosed as an empty link rather than becoming an interactive anchor.
-pub async fn load_public_snapshot(
-    client: &Client,
-    db_name: &str,
-) -> Result<(i64, Vec<PublicSliderItem>), SliderSnapshotError> {
-    for _ in 0..SNAPSHOT_ATTEMPTS {
-        let before = load_slider_revision(client, db_name).await?;
-        let documents = load_documents(
-            client.database(db_name),
-            public_filter(),
-            Some(MAX_PUBLIC_SLIDERS),
-        )
-        .await?;
-        let after = load_slider_revision(client, db_name).await?;
-        if before == after {
-            return Ok((
-                before,
-                documents.iter().map(public_item_from_document).collect(),
-            ));
-        }
-    }
-    Err(SliderSnapshotError::Unstable)
-}
-
-/// Return a strong ETag derived only from the global revision.
-pub fn slider_etag(revision: i64) -> String {
-    format!("\"sliders-{revision}\"")
-}
-
-/// Build the exact UTF-8 capability MAC input shared by the Node gateway and Rust API.
-/// There are four ASCII LF separators and no trailing LF.
-pub fn slider_capability_mac_input(
-    method: &Method,
-    path: &str,
-    timestamp: &str,
-    correlation_id: &str,
-) -> String {
-    [
-        SLIDER_CAPABILITY_INPUT_VERSION,
-        method.as_str(),
-        path,
-        timestamp,
-        correlation_id,
-    ]
-    .join("\n")
-}
-
-fn slider_capability_assertion(secret: &str, input: &str) -> String {
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-        .expect("HMAC accepts keys of every length");
-    mac.update(input.as_bytes());
-    let digest = mac.finalize().into_bytes();
-    let mut encoded = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(&mut encoded, "{byte:02x}").expect("String write cannot fail");
-    }
-    encoded
-}
-
-fn trusted_gateway_correlation_id(headers: &HeaderMap) -> Option<&str> {
-    let value = headers
-        .get(crate::services::correlation::GATEWAY_CORRELATION_HEADER)?
-        .to_str()
-        .ok()?;
-    // Correlation IDs are selected and lower-case at Node's trusted boundary. Do not trim or
-    // normalize here: the signed value must be byte-identical to the trusted request header.
-    if validate_trace_id(value) && value.bytes().all(|byte| !byte.is_ascii_uppercase()) {
-        Some(value)
-    } else {
-        None
-    }
-}
-
-fn valid_decimal_timestamp(value: &str) -> Option<i128> {
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    value.parse::<i128>().ok()
-}
-
-fn timestamp_is_fresh(timestamp: &str) -> bool {
-    let Some(timestamp) = valid_decimal_timestamp(timestamp) else {
-        return false;
-    };
-    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
-        return false;
-    };
-    let now = now.as_millis() as i128;
-    (timestamp - now).abs() <= SLIDER_CAPABILITY_MAX_CLOCK_SKEW_MS
-}
-
-/// Validate a Node-issued capability assertion after the normal proxy and permission boundary.
-/// This function never trusts or parses a browser capability header as authorization on its own.
-pub fn slider_capability_marker(
-    headers: &HeaderMap,
-    state: &AppState,
-    method: &Method,
-    uri: &Uri,
-) -> bool {
-    if !state.slider_mutation_readiness.mutation_ready
-        || method != Method::GET
-        || uri.query().is_some()
-        || !matches!(uri.path(), "/v2/sliders/admin/all" | "/v2/sliders/admin/archived")
-        || require_proxy_context(headers, state).is_err()
-    {
-        return false;
-    }
-    let Some(version) = headers
-        .get(SLIDER_CAPABILITY_VERSION_HEADER)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return false;
-    };
-    if version != SLIDER_MUTATION_CONTRACT {
-        return false;
-    }
-    let Some(timestamp) = headers
-        .get(SLIDER_CAPABILITY_TIMESTAMP_HEADER)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return false;
-    };
-    if !timestamp_is_fresh(timestamp) {
-        return false;
-    }
-    let Some(assertion) = headers
-        .get(SLIDER_CAPABILITY_ASSERTION_HEADER)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return false;
-    };
-    if assertion.len() != 64 || !assertion.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) {
-        return false;
-    }
-    let Some(correlation_id) = trusted_gateway_correlation_id(headers) else {
-        return false;
-    };
-    let input = slider_capability_mac_input(method, uri.path(), timestamp, correlation_id);
-    let expected = slider_capability_assertion(&state.proxy_secret, &input);
-    expected.as_bytes().ct_eq(assertion.as_bytes()).into()
-}
-
-/// Match an exact strong member of an HTTP `If-None-Match` entity-tag list.
-///
-/// Weak tags, wildcard, unquoted values, malformed members, and zero-padded revisions are never
-/// treated as a match.  A malformed member invalidates the complete list so malformed input
-/// cannot broaden a cache validator.
-pub fn matches_slider_etag(value: Option<&HeaderValue>, revision: i64) -> bool {
-    let Some(raw) = value.and_then(|value| value.to_str().ok()) else {
-        return false;
-    };
-    let Some(members) = split_entity_tag_list(raw) else {
-        return false;
-    };
-    if members.is_empty() || members.iter().any(|member| !valid_entity_tag(member)) {
-        return false;
-    }
-    let expected = slider_etag(revision);
-    members.iter().any(|member| *member == expected)
-}
-
-fn split_entity_tag_list(raw: &str) -> Option<Vec<&str>> {
-    let bytes = raw.as_bytes();
-    let mut members = Vec::new();
-    let mut start = 0;
-    let mut in_quotes = false;
-    for (index, byte) in bytes.iter().copied().enumerate() {
-        if byte == b'"' {
-            in_quotes = !in_quotes;
-        } else if !in_quotes && byte == b',' {
-            members.push(raw[start..index].trim());
-            start = index + 1;
-        }
-    }
-    if in_quotes {
-        return None;
-    }
-    members.push(raw[start..].trim());
-    Some(members)
-}
-
-fn valid_entity_tag(value: &str) -> bool {
-    if value == "*" {
-        return true;
-    }
-    let candidate = value.strip_prefix("W/").unwrap_or(value);
-    if candidate.len() < 2 || !candidate.starts_with('"') || !candidate.ends_with('"') {
-        return false;
-    }
-    candidate[1..candidate.len() - 1]
-        .bytes()
-        .all(|byte| byte == 0x21 || (0x23..=0x7e).contains(&byte) || byte >= 0x80)
-}
-
-async fn load_admin_snapshot(
-    client: &Client,
-    db_name: &str,
-    filter: Document,
-) -> Result<SliderAdminSnapshot, SliderSnapshotError> {
-    for _ in 0..SNAPSHOT_ATTEMPTS {
-        let before = load_slider_revision(client, db_name).await?;
-        let documents = load_documents(client.database(db_name), filter.clone(), None).await?;
-        let current_documents = if filter == archived_filter() {
-            load_documents(client.database(db_name), current_filter(), None).await?
-        } else {
-            documents.clone()
-        };
-        let after = load_slider_revision(client, db_name).await?;
-        if before == after {
-            return Ok(SliderAdminSnapshot {
-                revision: before,
-                sliders: documents.iter().map(admin_item_from_document).collect(),
-                limits: limits_from_documents(&current_documents),
-                mutation_contract: None,
-            });
-        }
-    }
-    Err(SliderSnapshotError::Unstable)
-}
-
-async fn load_documents(
-    database: Database,
-    filter: Document,
-    limit: Option<i64>,
-) -> Result<Vec<Document>, SliderSnapshotError> {
-    let collection = database.collection::<Document>("sliders");
-    let mut find = collection
-        .find(filter)
-        .sort(doc! { "sortOrder": 1, "_id": 1 });
-    if let Some(limit) = limit {
-        find = find.limit(limit);
-    }
-    find.await
         .map_err(|_| SliderSnapshotError::Unavailable)?
-        .try_collect::<Vec<_>>()
+        .ok_or(SliderSnapshotError::Unavailable)
+}
+
+async fn load_rows(pool: &PgPool, lifecycle: &str) -> Result<Vec<SliderRow>, SliderSnapshotError> {
+    let sql = format!("{ROW_SQL} WHERE lifecycle=$1 ORDER BY sort_order, id");
+    Ok(sqlx::query(&sql)
+        .bind(lifecycle)
+        .fetch_all(pool)
         .await
-        .map_err(|_| SliderSnapshotError::Unavailable)
-}
-
-fn current_filter() -> Document {
-    doc! { "lifecycle": { "$ne": "archived" } }
-}
-
-fn archived_filter() -> Document {
-    doc! { "lifecycle": "archived" }
-}
-
-fn public_filter() -> Document {
-    doc! {
-        "lifecycle": { "$ne": "archived" },
-        "status": true,
-    }
-}
-
-fn limits_from_documents(documents: &[Document]) -> SliderLimits {
-    let current_total = documents.len() as i64;
-    let current_active = documents
+        .map_err(|_| SliderSnapshotError::Unavailable)?
         .iter()
-        .filter(|document| document.get_bool("status").unwrap_or(true))
-        .count() as i64;
+        .map(row_from)
+        .collect())
+}
+
+fn limits(current: &[SliderRow]) -> SliderLimits {
+    let current_total = current.len() as i64;
+    let current_active = current.iter().filter(|row| row.status).count() as i64;
     SliderLimits {
         total: MAX_CURRENT_SLIDERS,
         active: MAX_PUBLIC_SLIDERS,
@@ -419,261 +179,134 @@ fn limits_from_documents(documents: &[Document]) -> SliderLimits {
     }
 }
 
-/// Build the same admin snapshot shape used by the read endpoint from an already-consistent
-/// transaction snapshot. Mutation conflicts use this helper so their frozen body contains the
-/// latest sliders and capacity metadata, not just the scalar revision.
-pub(crate) fn admin_snapshot_from_documents(
-    revision: i64,
-    documents: &[Document],
-) -> SliderAdminSnapshot {
-    SliderAdminSnapshot {
-        revision,
-        sliders: documents.iter().map(admin_item_from_document).collect(),
-        limits: limits_from_documents(documents),
-        mutation_contract: None,
-    }
-}
-
-fn admin_item_from_document(document: &Document) -> SliderAdminItem {
-    SliderAdminItem {
-        id: document
-            .get_object_id("_id")
-            .map(|id| id.to_hex())
-            .or_else(|_| document.get_str("_id").map(ToString::to_string))
-            .unwrap_or_default(),
-        name: read_string(document, "name"),
-        image: read_string(document, "image"),
-        link: read_string(document, "link"),
-        sort_order: read_i64(document, "sortOrder"),
-        status: document.get_bool("status").unwrap_or(true),
-        lifecycle: document
-            .get_str("lifecycle")
-            .unwrap_or("active")
-            .to_string(),
-        created_at: optional_date_or_string(document, "createdAt").unwrap_or_default(),
-        updated_at: optional_date_or_string(document, "updatedAt").unwrap_or_default(),
-        archived_at: optional_date_or_string(document, "archivedAt"),
-        archived_by: optional_object_id_or_string(document, "archivedBy"),
-    }
-}
-
-fn public_item_from_document(document: &Document) -> PublicSliderItem {
-    let mut item = public_slider_from_document(document);
-    if super::normalize_slider_link(&item.link).is_err() {
-        item.link.clear();
-    }
-    item
-}
-
-fn optional_date_or_string(document: &Document, key: &str) -> Option<String> {
-    if let Ok(value) = document.get_datetime(key) {
-        return value.try_to_rfc3339_string().ok();
-    }
-    document
-        .get_str(key)
-        .ok()
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
-
-fn optional_object_id_or_string(document: &Document, key: &str) -> Option<String> {
-    document
-        .get_object_id(key)
-        .map(|id| id.to_hex())
-        .or_else(|_| document.get_str(key).map(ToString::to_string))
-        .ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use mongodb::bson::doc;
-    use std::collections::BTreeSet;
-
-    fn public_fixture() -> Document {
-        doc! {
-            "_id": ObjectId::new(),
-            "name": "Promo",
-            "image": "/uploads/covers/1710000000000-deadbeef.webp",
-            "link": "/promo",
-            "sortOrder": 0_i64,
-            "status": true,
-            "lifecycle": "active",
-            "createdAt": "hidden",
-            "updatedAt": "hidden",
-            "archivedAt": "hidden",
-            "archivedBy": ObjectId::new(),
+async fn load_admin(pool: &PgPool, lifecycle: &str) -> Result<SliderAdminSnapshot, SliderSnapshotError> {
+    for _ in 0..SNAPSHOT_ATTEMPTS {
+        let before = load_slider_revision(pool).await?;
+        let current = load_rows(pool, "active").await?;
+        let listed = if lifecycle == "active" { current.clone() } else { load_rows(pool, lifecycle).await? };
+        let after = load_slider_revision(pool).await?;
+        if before == after {
+            return Ok(SliderAdminSnapshot {
+                revision: before,
+                limits: limits(&current),
+                sliders: listed.iter().map(admin_item).collect(),
+                mutation_contract: None,
+            });
         }
     }
+    Err(SliderSnapshotError::Unstable)
+}
 
-    #[test]
-    fn exact_strong_slider_etag_list_matching() {
-        let current = HeaderValue::from_static("\"other,tag\", \"sliders-14\"");
-        assert!(matches_slider_etag(Some(&current), 14));
-        let literal_backslash = HeaderValue::from_static(r#""ends-with\", "sliders-14""#);
-        assert!(matches_slider_etag(Some(&literal_backslash), 14));
-        for raw in [
-            "W/\"sliders-14\"",
-            "*",
-            "\"sliders-014\"",
-            "sliders-14",
-            "\"sliders-15\"",
-        ] {
-            assert!(!matches_slider_etag(
-                Some(&HeaderValue::from_str(raw).unwrap()),
-                14
-            ));
+pub async fn load_current_snapshot(pool: &PgPool) -> Result<SliderAdminSnapshot, SliderSnapshotError> {
+    load_admin(pool, "active").await
+}
+
+pub async fn load_archived_snapshot(pool: &PgPool) -> Result<SliderAdminSnapshot, SliderSnapshotError> {
+    load_admin(pool, "archived").await
+}
+
+pub async fn load_public_snapshot(pool: &PgPool) -> Result<(i64, Vec<PublicSliderItem>), SliderSnapshotError> {
+    for _ in 0..SNAPSHOT_ATTEMPTS {
+        let before = load_slider_revision(pool).await?;
+        let mut rows = load_rows(pool, "active").await?;
+        rows.retain(|row| row.status);
+        rows.truncate(MAX_PUBLIC_SLIDERS as usize);
+        let after = load_slider_revision(pool).await?;
+        if before == after {
+            return Ok((before, rows.iter().map(public_item).collect()));
         }
     }
+    Err(SliderSnapshotError::Unstable)
+}
 
-    #[test]
-    fn malformed_entity_tag_list_does_not_broaden_a_match() {
-        for raw in [
-            "\"sliders-14\", malformed",
-            "\"sliders-14\", \"unterminated",
-            "\"sliders-14\",",
-        ] {
-            assert!(!matches_slider_etag(
-                Some(&HeaderValue::from_str(raw).unwrap()),
-                14
-            ));
-        }
+pub(super) async fn lock_rows(tx: &mut Transaction<'_, Postgres>) -> Result<(i64, Vec<SliderRow>), sqlx::Error> {
+    let revision: i64 = sqlx::query_scalar("SELECT revision FROM content_revisions WHERE domain='sliders' FOR UPDATE")
+        .fetch_one(&mut **tx)
+        .await?;
+    let rows = sqlx::query(&format!("{ROW_SQL} ORDER BY lifecycle, sort_order, id FOR UPDATE"))
+        .fetch_all(&mut **tx)
+        .await?
+        .iter()
+        .map(row_from)
+        .collect();
+    Ok((revision, rows))
+}
+
+pub fn slider_etag(revision: i64) -> String {
+    format!("\"sliders-{revision}\"")
+}
+
+pub fn slider_capability_mac_input(method: &Method, path: &str, timestamp: &str, correlation_id: &str) -> String {
+    [SLIDER_CAPABILITY_INPUT_VERSION, method.as_str(), path, timestamp, correlation_id].join("\n")
+}
+
+fn slider_capability_assertion(secret: &str, input: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of every length");
+    mac.update(input.as_bytes());
+    let digest = mac.finalize().into_bytes();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("String write cannot fail");
     }
+    encoded
+}
 
-    #[test]
-    fn public_dto_omits_internal_slider_fields() {
-        let json = serde_json::to_value(public_slider_from_document(&public_fixture())).unwrap();
-        assert_eq!(
-            json.as_object().unwrap().keys().cloned().collect::<BTreeSet<_>>(),
-            BTreeSet::from(["_id".into(), "image".into(), "link".into(), "name".into()])
-        );
+fn trusted_gateway_correlation_id(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(crate::services::correlation::GATEWAY_CORRELATION_HEADER)?.to_str().ok()?;
+    if validate_trace_id(value) && value.bytes().all(|byte| !byte.is_ascii_uppercase()) { Some(value) } else { None }
+}
+fn valid_decimal_timestamp(value: &str) -> Option<i128> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) { None } else { value.parse().ok() }
+}
+
+fn timestamp_is_fresh(timestamp: &str) -> bool {
+    let Some(timestamp) = valid_decimal_timestamp(timestamp) else { return false; };
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else { return false; };
+    (timestamp - now.as_millis() as i128).abs() <= SLIDER_CAPABILITY_MAX_CLOCK_SKEW_MS
+}
+
+pub fn slider_capability_marker(headers: &HeaderMap, state: &AppState, method: &Method, uri: &Uri) -> bool {
+    if !state.slider_mutation_readiness.mutation_ready
+        || method != Method::GET
+        || uri.query().is_some()
+        || !matches!(uri.path(), "/v2/sliders/admin/all" | "/v2/sliders/admin/archived")
+        || require_proxy_context(headers, state).is_err()
+    {
+        return false;
     }
+    let Some(version) = headers.get(SLIDER_CAPABILITY_VERSION_HEADER).and_then(|value| value.to_str().ok()) else { return false; };
+    if version != SLIDER_MUTATION_CONTRACT { return false; }
+    let Some(timestamp) = headers.get(SLIDER_CAPABILITY_TIMESTAMP_HEADER).and_then(|value| value.to_str().ok()) else { return false; };
+    if !timestamp_is_fresh(timestamp) { return false; }
+    let Some(assertion) = headers.get(SLIDER_CAPABILITY_ASSERTION_HEADER).and_then(|value| value.to_str().ok()) else { return false; };
+    if assertion.len() != 64 || !assertion.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) { return false; }
+    let Some(correlation_id) = trusted_gateway_correlation_id(headers) else { return false; };
+    let input = slider_capability_mac_input(method, uri.path(), timestamp, correlation_id);
+    slider_capability_assertion(&state.proxy_secret, &input).as_bytes().ct_eq(assertion.as_bytes()).into()
+}
 
-    #[test]
-    fn legacy_missing_lifecycle_is_current_and_invalid_public_links_are_empty() {
-        let mut legacy = public_fixture();
-        legacy.remove("lifecycle");
-        assert_eq!(admin_item_from_document(&legacy).lifecycle, "active");
+pub fn matches_slider_etag(value: Option<&HeaderValue>, revision: i64) -> bool {
+    let Some(raw) = value.and_then(|value| value.to_str().ok()) else { return false; };
+    let Some(members) = split_entity_tag_list(raw) else { return false; };
+    if members.is_empty() || members.iter().any(|member| !valid_entity_tag(member)) { return false; }
+    let expected = slider_etag(revision);
+    members.iter().any(|member| *member == expected)
+}
 
-        legacy.insert("link", "http://legacy.example/promo");
-        assert!(public_item_from_document(&legacy).link.is_empty());
+fn split_entity_tag_list(raw: &str) -> Option<Vec<&str>> {
+    let mut members = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    for (index, byte) in raw.bytes().enumerate() {
+        if byte == b'"' { in_quotes = !in_quotes; }
+        else if !in_quotes && byte == b',' { members.push(raw[start..index].trim()); start = index + 1; }
     }
+    if in_quotes { return None; }
+    members.push(raw[start..].trim());
+    Some(members)
+}
 
-    #[test]
-    fn stable_reads_use_at_most_three_before_after_attempts() {
-        assert_eq!(stable_revision_from_sequence(&[1, 2, 2, 2]).unwrap(), 2);
-        assert_eq!(
-            stable_revision_from_sequence(&[1, 2, 2, 3, 3, 4]).unwrap_err(),
-            SliderSnapshotError::Unstable
-        );
-    }
-
-    #[test]
-    fn slider_capability_marker_requires_exact_new_new_ready_handshake() {
-        let secret = "slider-capability-test-secret-at-least-32-chars";
-        let state = crate::security::test_app_state_with_proxy_secret(secret);
-        let mut state = match std::sync::Arc::try_unwrap(state) { Ok(value) => value, Err(_) => panic!("unique test state") };
-        state.slider_mutation_readiness = crate::services::slider_readiness::SliderMutationReadiness {
-            transaction_capable: true,
-            exact_indexes_ready: true,
-            registry_ready: true,
-            readiness_clean: true,
-            mutation_ready: true,
-        };
-        let state = std::sync::Arc::new(state);
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
-            .to_string();
-        let correlation = "4bf92f3577b34da6a3ce929d0e0e4736";
-        let path = "/v2/sliders/admin/all";
-        let input = slider_capability_mac_input(&Method::GET, path, &timestamp, correlation);
-        let assertion = slider_capability_assertion(secret, &input);
-        let mut headers = HeaderMap::new();
-        headers.insert("x-api-v2-proxy-secret", HeaderValue::from_str(secret).unwrap());
-        headers.insert("x-webtopup-correlation-id", HeaderValue::from_static(correlation));
-        headers.insert(SLIDER_CAPABILITY_VERSION_HEADER, HeaderValue::from_static(SLIDER_MUTATION_CONTRACT));
-        headers.insert(SLIDER_CAPABILITY_TIMESTAMP_HEADER, HeaderValue::from_str(&timestamp).unwrap());
-        headers.insert(SLIDER_CAPABILITY_ASSERTION_HEADER, HeaderValue::from_str(&assertion).unwrap());
-        assert!(slider_capability_marker(
-            &headers,
-            &state,
-            &Method::GET,
-            &Uri::from_static(path),
-        ));
-
-        let mut forged = headers.clone();
-        forged.insert(SLIDER_CAPABILITY_ASSERTION_HEADER, HeaderValue::from_static("00"));
-        assert!(!slider_capability_marker(&forged, &state, &Method::GET, &Uri::from_static(path)));
-
-        let mut not_ready = (*state).clone();
-        not_ready.slider_mutation_readiness = Default::default();
-        let not_ready = std::sync::Arc::new(not_ready);
-        assert!(!slider_capability_marker(&headers, &not_ready, &Method::GET, &Uri::from_static(path)));
-    }
-
-    #[test]
-    fn slider_capability_marker_rejects_expiry_wrong_method_path_and_cross_path_assertions() {
-        let secret = "slider-capability-test-secret-at-least-32-chars";
-        let state = crate::security::test_app_state_with_proxy_secret(secret);
-        let mut state = match std::sync::Arc::try_unwrap(state) { Ok(value) => value, Err(_) => panic!("unique test state") };
-        state.slider_mutation_readiness = crate::services::slider_readiness::SliderMutationReadiness {
-            transaction_capable: true,
-            exact_indexes_ready: true,
-            registry_ready: true,
-            readiness_clean: true,
-            mutation_ready: true,
-        };
-        let state = std::sync::Arc::new(state);
-        let correlation = "4bf92f3577b34da6a3ce929d0e0e4736";
-        let timestamp = (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() - 31_000).to_string();
-        let signed_path = "/v2/sliders/admin/all";
-        let actual_path = "/v2/sliders/admin/archived";
-        let assertion = slider_capability_assertion(
-            secret,
-            &slider_capability_mac_input(&Method::GET, signed_path, &timestamp, correlation),
-        );
-        let mut headers = HeaderMap::new();
-        headers.insert("x-api-v2-proxy-secret", HeaderValue::from_str(secret).unwrap());
-        headers.insert("x-webtopup-correlation-id", HeaderValue::from_static(correlation));
-        headers.insert(SLIDER_CAPABILITY_VERSION_HEADER, HeaderValue::from_static(SLIDER_MUTATION_CONTRACT));
-        headers.insert(SLIDER_CAPABILITY_TIMESTAMP_HEADER, HeaderValue::from_str(&timestamp).unwrap());
-        headers.insert(SLIDER_CAPABILITY_ASSERTION_HEADER, HeaderValue::from_str(&assertion).unwrap());
-        assert!(!slider_capability_marker(&headers, &state, &Method::GET, &Uri::from_static(actual_path)));
-        assert!(!slider_capability_marker(&headers, &state, &Method::POST, &Uri::from_static(signed_path)));
-        assert!(!slider_capability_marker(&headers, &state, &Method::GET, &Uri::from_static("/v2/sliders/admin/all?path=/v2/sliders/admin/archived")));
-    }
-
-    #[test]
-    fn admin_snapshot_is_read_only_until_capability_gates_are_complete() {
-        let snapshot = SliderAdminSnapshot {
-            revision: 3,
-            sliders: Vec::new(),
-            limits: limits_from_documents(&[]),
-            mutation_contract: None,
-        };
-        let json = serde_json::to_value(snapshot).unwrap();
-        assert!(!json
-            .as_object()
-            .unwrap()
-            .contains_key("mutationContract"));
-    }
-
-    fn stable_revision_from_sequence(
-        sequence: &[i64],
-    ) -> Result<i64, SliderSnapshotError> {
-        let mut offset = 0;
-        for _ in 0..SNAPSHOT_ATTEMPTS {
-            let before = sequence.get(offset).ok_or(SliderSnapshotError::Unstable)?;
-            let after = sequence
-                .get(offset + 1)
-                .ok_or(SliderSnapshotError::Unstable)?;
-            offset += 2;
-            if before == after {
-                return Ok(*before);
-            }
-        }
-        Err(SliderSnapshotError::Unstable)
-    }
+fn valid_entity_tag(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' && bytes[1..bytes.len() - 1].iter().all(|byte| byte.is_ascii() && *byte != b'"')
 }

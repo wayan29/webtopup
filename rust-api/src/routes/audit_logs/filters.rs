@@ -1,79 +1,46 @@
 use axum::{response::IntoResponse, response::Response, Json};
-use chrono::{Duration, NaiveDate};
-use mongodb::bson::{doc, DateTime, Document};
+use chrono::{Duration, NaiveDate, DateTime, Utc};
+use sqlx::{PgPool, postgres::PgRow};
 
-use crate::{security::ErrorResponse, utils::bson::escape_regex};
-
+use crate::security::ErrorResponse;
 use super::types::AuditLogsQuery;
 
-pub fn build_audit_filter(query: &AuditLogsQuery) -> Result<Document, Response> {
-    let mut filter = Document::new();
+pub struct AuditFilter { pub start: Option<DateTime<Utc>>, pub end: Option<DateTime<Utc>>, pub action: Option<String>, pub resource: Option<String>, pub search: Option<String> }
 
+impl AuditFilter {
+    pub async fn fetch(&self, pool: &PgPool, limit: i64, offset: i64) -> Result<Vec<PgRow>, sqlx::Error> {
+        let mut query = sqlx::QueryBuilder::new("SELECT id,actor,action,correlation,payload,created_at FROM audit_events WHERE TRUE");
+        self.append(&mut query);
+        query.push(" ORDER BY created_at DESC,id DESC LIMIT ").push_bind(limit).push(" OFFSET ").push_bind(offset).build().fetch_all(pool).await
+    }
+    pub async fn count(&self, pool: &PgPool) -> Result<i64, sqlx::Error> {
+        let mut query = sqlx::QueryBuilder::new("SELECT COUNT(*) FROM audit_events WHERE TRUE");
+        self.append(&mut query);
+        query.build_query_scalar().fetch_one(pool).await
+    }
+    fn append<'a>(&'a self, query: &mut sqlx::QueryBuilder<'a, sqlx::Postgres>) {
+        if let Some(start) = &self.start { query.push(" AND created_at >= ").push_bind(start.to_owned()); }
+        if let Some(end) = &self.end { query.push(" AND created_at <= ").push_bind(end.to_owned()); }
+        if let Some(action) = &self.action { query.push(" AND action = ").push_bind(action); }
+        if let Some(resource) = &self.resource { query.push(" AND payload->>'resource' = ").push_bind(resource); }
+        if let Some(search) = &self.search {
+            let pattern = format!("%{}%", search.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+            query.push(" AND (actor ILIKE ").push_bind(pattern.clone()).push(" ESCAPE E'\\\\' OR action ILIKE ").push_bind(pattern.clone()).push(" ESCAPE E'\\\\' OR payload->>'actorName' ILIKE ").push_bind(pattern.clone()).push(" ESCAPE E'\\\\' OR payload->>'actorEmail' ILIKE ").push_bind(pattern.clone()).push(" ESCAPE E'\\\\' OR payload->>'resource' ILIKE ").push_bind(pattern.clone()).push(" ESCAPE E'\\\\' OR payload->>'path' ILIKE ").push_bind(pattern.clone()).push(" ESCAPE E'\\\\' OR payload->>'ip' ILIKE ").push_bind(pattern.clone()).push(" ESCAPE E'\\\\' OR correlation ILIKE ").push_bind(pattern).push(" ESCAPE E'\\\\')");
+        }
+    }
+}
+
+pub fn build_audit_filter(query: &AuditLogsQuery) -> Result<AuditFilter, Response> {
     let start = parse_date_boundary(query.start_date.as_deref(), false)?;
     let end = parse_date_boundary(query.end_date.as_deref(), true)?;
-    if let (Some(start), Some(end)) = (&start, &end) {
-        if start > end {
-            return Err(bad_request(
-                "Tanggal mulai tidak boleh lebih besar dari tanggal akhir",
-            ));
-        }
-    }
-    if start.is_some() || end.is_some() {
-        let mut created_at = Document::new();
-        if let Some(start) = start {
-            created_at.insert("$gte", start);
-        }
-        if let Some(end) = end {
-            created_at.insert("$lte", end);
-        }
-        filter.insert("createdAt", created_at);
-    }
-
-    if let Some(action_raw) = query.action.as_deref() {
-        let action = action_raw.trim();
-        if !action.is_empty() {
-            if !matches!(action, "create" | "update" | "delete" | "execute") {
-                return Err(bad_request("Aksi audit tidak valid"));
-            }
-            filter.insert("action", action);
-        }
-    }
-
-    if let Some(resource_raw) = query.resource.as_deref() {
-        let resource = resource_raw.trim();
-        if !resource.is_empty() {
-            if resource.chars().count() > 120 {
-                return Err(bad_request("Resource harus 1–120 karakter atau dikosongkan"));
-            }
-            filter.insert("resource", resource);
-        }
-    }
-
-    if let Some(search_raw) = query.search.as_deref() {
-        let search = search_raw.trim();
-        if !search.is_empty() {
-            let length = search.chars().count();
-            if length < 2 || length > 120 {
-                return Err(bad_request(
-                    "Pencarian harus 2–120 karakter atau dikosongkan",
-                ));
-            }
-            let regex = doc! { "$regex": escape_regex(search), "$options": "i" };
-            filter.insert(
-                "$or",
-                vec![
-                    doc! { "actorName": regex.clone() },
-                    doc! { "actorEmail": regex.clone() },
-                    doc! { "resource": regex.clone() },
-                    doc! { "path": regex.clone() },
-                    doc! { "ip": regex.clone() },
-                    doc! { "metadata.traceId": regex },
-                ],
-            );
-        }
-    }
-
-    Ok(filter)
+    if let (Some(start), Some(end)) = (&start, &end) { if start > end { return Err(bad_request("Tanggal mulai tidak boleh lebih besar dari tanggal akhir")); } }
+    let action = query.action.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
+    if action.as_deref().is_some_and(|v| !matches!(v, "create" | "update" | "delete" | "execute")) { return Err(bad_request("Aksi audit tidak valid")); }
+    let resource = query.resource.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
+    if resource.as_ref().is_some_and(|v| v.chars().count() > 120) { return Err(bad_request("Resource harus 1–120 karakter atau dikosongkan")); }
+    let search = query.search.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
+    if search.as_ref().is_some_and(|v| !(2..=120).contains(&v.chars().count())) { return Err(bad_request("Pencarian harus 2–120 karakter atau dikosongkan")); }
+    Ok(AuditFilter { start, end, action, resource, search })
 }
 
 pub fn parse_positive_i64(
@@ -97,7 +64,7 @@ pub fn parse_positive_i64(
 fn parse_date_boundary(
     value: Option<&str>,
     end_of_day: bool,
-) -> Result<Option<DateTime>, Response> {
+)-> Result<Option<DateTime<Utc>>, Response> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
@@ -112,8 +79,8 @@ fn parse_date_boundary(
         format!("{}T17:00:00.000Z", local_date - Duration::days(1))
     };
 
-    match DateTime::parse_rfc3339_str(&date_text) {
-        Ok(date) => Ok(Some(date)),
+    match chrono::DateTime::parse_from_rfc3339(&date_text) {
+        Ok(date) => Ok(Some(date.with_timezone(&Utc))),
         Err(_) => Err(bad_request("Format tanggal audit tidak valid")),
     }
 }
@@ -192,23 +159,10 @@ mod tests {
     }
 
     #[test]
-    fn search_filter_includes_trace_id_and_valid_action() {
-        let filter = build_audit_filter(&query(
-            Some("trace-123"),
-            Some("update"),
-            Some("Products"),
-            None,
-            None,
-        ))
-        .unwrap();
-        assert_eq!(filter.get_str("action").unwrap(), "update");
-        assert_eq!(filter.get_str("resource").unwrap(), "Products");
-        let ors = filter.get_array("$or").unwrap();
-        assert!(ors.iter().any(|entry| {
-            entry
-                .as_document()
-                .and_then(|document| document.get("metadata.traceId"))
-                .is_some()
-        }));
+    fn search_filter_includes_fields_and_valid_action() {
+        let filter = build_audit_filter(&query(Some("trace-123"), Some("update"), Some("Products"), None, None)).unwrap();
+        assert_eq!(filter.action.as_deref(), Some("update"));
+        assert_eq!(filter.resource.as_deref(), Some("Products"));
+        assert_eq!(filter.search.as_deref(), Some("trace-123"));
     }
 }

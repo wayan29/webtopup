@@ -1,13 +1,9 @@
-use std::collections::HashMap;
-
 use axum::{response::IntoResponse, Json};
 
+use serde_json::Value;
 pub(super) const MAX_ADMIN_USERS_PAGE: i64 = 10_000;
 pub(super) const MAX_BALANCE_ADJUSTMENT_AMOUNT: f64 = 100_000_000.0;
-use mongodb::bson::{doc, Document};
-use serde_json::Value;
-
-use crate::{security::ErrorResponse, utils::bson::escape_regex};
+use crate::security::ErrorResponse;
 
 pub(super) const COMMON_PASSWORDS: [&str; 7] = [
     "password",
@@ -18,56 +14,6 @@ pub(super) const COMMON_PASSWORDS: [&str; 7] = [
     "qwerty123",
     "admin123",
 ];
-
-pub(super) fn build_filter(query: &HashMap<String, String>) -> Document {
-    let mut filter = doc! { "role": "member" };
-
-    if let Some(search) = query
-        .get("search")
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-    {
-        let pattern = escape_regex(search);
-        filter.insert(
-            "$or",
-            vec![
-                doc! { "name": { "$regex": &pattern, "$options": "i" } },
-                doc! { "email": { "$regex": &pattern, "$options": "i" } },
-            ],
-        );
-    }
-
-    if let Some(level) = query.get("level").map(String::as_str) {
-        if matches!(level, "basic" | "gold" | "platinum") {
-            filter.insert("level", level);
-        }
-    }
-
-    match query.get("status").map(String::as_str) {
-        Some("active") => {
-            filter.insert("active", true);
-        }
-        Some("inactive") => {
-            filter.insert("active", false);
-        }
-        _ => {}
-    }
-
-    filter
-}
-
-pub(super) fn build_sort(query: &HashMap<String, String>) -> Document {
-    let sort_by = match query.get("sortBy").map(String::as_str) {
-        Some("updatedAt" | "name" | "email" | "balance") => query.get("sortBy").unwrap().as_str(),
-        _ => "createdAt",
-    };
-    let sort_order = if query.get("sortOrder").map(String::as_str) == Some("asc") {
-        1
-    } else {
-        -1
-    };
-    doc! { sort_by: sort_order }
-}
 
 pub(super) fn normalize_email(value: &str) -> String {
     value.trim().to_lowercase()

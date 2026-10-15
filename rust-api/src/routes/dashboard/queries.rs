@@ -1,184 +1,36 @@
-use futures_util::TryStreamExt;
-use mongodb::bson::{doc, DateTime, Document};
-
-use crate::utils::{bson::read_i64, dates::start_of_today_utc};
+use sqlx::{PgPool, Row};
 
 use super::types::{
     DepositOpsSummary, PromoOpsSummary, StuckOpsSummary, TransactionTodaySummary, VendorOpsSummary,
 };
 
-pub async fn transaction_today_summary(db: &mongodb::Database) -> TransactionTodaySummary {
-    let pipeline = vec![
-        doc! { "$match": { "createdAt": { "$gte": start_of_today_utc() } } },
-        doc! {
-            "$group": {
-                "_id": null,
-                "total": { "$sum": 1 },
-                "success": { "$sum": { "$cond": [{ "$eq": ["$status", "success"] }, 1, 0] } },
-                "pending": { "$sum": { "$cond": [{ "$in": ["$status", ["pending", "processing"]] }, 1, 0] } },
-                "failed": { "$sum": { "$cond": [{ "$eq": ["$status", "failed"] }, 1, 0] } },
-                "omset": { "$sum": { "$cond": [{ "$eq": ["$status", "success"] }, "$amount", 0] } }
-            }
-        },
-    ];
-
-    first_document(
-        db.collection::<Document>("transactions")
-            .aggregate(pipeline)
-            .await,
-    )
-    .await
-    .map(|item| {
-        let total = read_i64(&item, "total");
-        let success = read_i64(&item, "success");
-        TransactionTodaySummary {
-            total,
-            success,
-            pending: read_i64(&item, "pending"),
-            failed: read_i64(&item, "failed"),
-            omset: read_i64(&item, "omset"),
-            success_rate: if total > 0 {
-                ((success as f64 / total as f64) * 100.0).round() as i64
-            } else {
-                0
-            },
+pub async fn ops_snapshot_queries(
+    pool: &PgPool,
+) -> (
+    TransactionTodaySummary,
+    DepositOpsSummary,
+    VendorOpsSummary,
+    StuckOpsSummary,
+    PromoOpsSummary,
+) {
+    let transactions_today = match sqlx::query(
+        "SELECT COUNT(*)::bigint AS total, COUNT(*) FILTER (WHERE status='success')::bigint AS success, COUNT(*) FILTER (WHERE status IN ('pending','processing'))::bigint AS pending, COUNT(*) FILTER (WHERE status='failed')::bigint AS failed, COALESCE(SUM(amount) FILTER (WHERE status='success'),0)::bigint AS omset FROM financial_transactions WHERE created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'",
+    ).fetch_one(pool).await {
+        Ok(row) => {
+            let total: i64 = row.get("total");
+            let success: i64 = row.get("success");
+            TransactionTodaySummary { total, success, pending: row.get("pending"), failed: row.get("failed"), omset: row.get("omset"), success_rate: if total > 0 { ((success as f64 / total as f64) * 100.0).round() as i64 } else { 0 } }
         }
-    })
-    .unwrap_or_default()
-}
-
-pub async fn deposit_ops_summary(db: &mongodb::Database) -> DepositOpsSummary {
-    let pipeline = vec![
-        doc! { "$match": { "status": "pending" } },
-        doc! {
-            "$group": {
-                "_id": null,
-                "pending": { "$sum": 1 },
-                "pendingAmountTotal": { "$sum": "$amount" },
-                "pendingTransferTotal": { "$sum": { "$ifNull": ["$totalAmount", "$amount"] } }
-            }
-        },
-    ];
-
-    first_document(
-        db.collection::<Document>("deposits")
-            .aggregate(pipeline)
-            .await,
-    )
-    .await
-    .map(|item| DepositOpsSummary {
-        pending: read_i64(&item, "pending"),
-        pending_amount_total: read_i64(&item, "pendingAmountTotal"),
-        pending_transfer_total: read_i64(&item, "pendingTransferTotal"),
-    })
-    .unwrap_or_default()
-}
-
-pub async fn vendor_ops_summary(db: &mongodb::Database) -> VendorOpsSummary {
-    let pipeline = vec![doc! {
-        "$group": {
-            "_id": null,
-            "total": { "$sum": 1 },
-            "active": { "$sum": { "$cond": [{ "$eq": ["$status", true] }, 1, 0] } },
-            "inactive": { "$sum": { "$cond": [{ "$eq": ["$status", false] }, 1, 0] } },
-            "lowBalanceConfigured": { "$sum": { "$cond": [{ "$gt": [{ "$ifNull": ["$lowBalanceThreshold", 0] }, 0] }, 1, 0] } }
-        }
-    }];
-
-    first_document(
-        db.collection::<Document>("vendors")
-            .aggregate(pipeline)
-            .await,
-    )
-    .await
-    .map(|item| VendorOpsSummary {
-        total: read_i64(&item, "total"),
-        active: read_i64(&item, "active"),
-        inactive: read_i64(&item, "inactive"),
-        low_balance_configured: read_i64(&item, "lowBalanceConfigured"),
-    })
-    .unwrap_or_default()
-}
-
-pub async fn stuck_ops_summary(db: &mongodb::Database, threshold_minutes: i64) -> StuckOpsSummary {
-    let cutoff =
-        DateTime::from_millis(DateTime::now().timestamp_millis() - threshold_minutes * 60 * 1000);
-    let total = db
-        .collection::<Document>("transactions")
-        .count_documents(doc! {
-            "status": { "$in": ["pending", "processing"] },
-            "updatedAt": { "$lte": cutoff }
-        })
-        .await
-        .unwrap_or(0) as i64;
-
-    StuckOpsSummary {
-        threshold_minutes,
-        total,
-    }
-}
-
-pub async fn promo_ops_summary(db: &mongodb::Database) -> PromoOpsSummary {
-    let idle_cutoff =
-        DateTime::from_millis(DateTime::now().timestamp_millis() - 30 * 24 * 60 * 60 * 1000);
-    let vouchers = db.collection::<Document>("vouchers");
-    let idle_vouchers = vouchers
-        .count_documents(doc! {
-            "isRedeemed": false,
-            "isArchived": false,
-            "$or": [
-                { "kind": "balance" },
-                { "kind": { "$exists": false } },
-            ],
-            "createdAt": { "$lte": idle_cutoff },
-        })
-        .await
-        .unwrap_or(0) as i64;
-    let discount_vouchers_open = vouchers
-        .count_documents(doc! {
-            "kind": "discount",
-            "isArchived": false,
-            "$expr": { "$lt": ["$usedCount", "$maxUses"] },
-        })
-        .await
-        .unwrap_or(0) as i64;
-    let giveaways = db.collection::<Document>("balancegiveaways");
-    let giveaways_total = giveaways.count_documents(doc! {}).await.unwrap_or(0) as i64;
-    let giveaways_amount_total = first_document(
-        giveaways
-            .aggregate(vec![doc! {
-                "$group": {
-                    "_id": null,
-                    "total": { "$sum": "$allocatedTotal" },
-                }
-            }])
-            .await,
-    )
-    .await
-    .map(|doc| read_i64(&doc, "total"))
-    .unwrap_or(0);
-    let now = DateTime::now();
-    let flash_sales_live = db
-        .collection::<Document>("flashsales")
-        .count_documents(doc! {
-            "isActive": true,
-            "startDate": { "$lte": now },
-            "endDate": { "$gte": now },
-        })
-        .await
-        .unwrap_or(0) as i64;
-    PromoOpsSummary {
-        idle_vouchers,
-        giveaways_total,
-        giveaways_amount_total,
-        flash_sales_live,
-        discount_vouchers_open,
-    }
-}
-
-async fn first_document(
-    cursor_result: mongodb::error::Result<mongodb::Cursor<Document>>,
-) -> Option<Document> {
-    let mut cursor = cursor_result.ok()?;
-    cursor.try_next().await.ok().flatten()
+        Err(_) => TransactionTodaySummary::default(),
+    };
+    let deposits = sqlx::query("SELECT COUNT(*)::bigint AS pending, COALESCE(SUM(amount),0)::bigint AS amount, COALESCE(SUM(COALESCE(total_amount,amount)),0)::bigint AS total FROM deposits WHERE status='pending'")
+        .fetch_one(pool).await.map(|row| DepositOpsSummary { pending: row.get("pending"), pending_amount_total: row.get("amount"), pending_transfer_total: row.get("total") }).unwrap_or_default();
+    let vendors = sqlx::query("SELECT COUNT(*)::bigint AS total, COUNT(*) FILTER (WHERE status)::bigint AS active, COUNT(*) FILTER (WHERE NOT status)::bigint AS inactive, COUNT(*) FILTER (WHERE low_balance_threshold>0)::bigint AS low_balance FROM vendors")
+        .fetch_one(pool).await.map(|row| VendorOpsSummary { total: row.get("total"), active: row.get("active"), inactive: row.get("inactive"), low_balance_configured: row.get("low_balance") }).unwrap_or_default();
+    let stuck = sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::bigint FROM financial_transactions WHERE status IN ('pending','processing') AND updated_at <= now()-interval '15 minutes'")
+        .fetch_one(pool).await.unwrap_or(0);
+    // Giveaway aggregates remain None until SQL has an authoritative giveaway entity and credit-event table.
+    let promo = sqlx::query("SELECT COUNT(*) FILTER(WHERE kind='balance' AND NOT is_redeemed AND NOT is_archived AND created_at<=now()-interval '30 days')::bigint idle,COUNT(*) FILTER(WHERE kind='discount' AND NOT is_archived AND used_count<max_uses)::bigint discount_open,(SELECT COUNT(*)::bigint FROM content_flash_sales WHERE is_active AND start_date<=now() AND end_date>=now()) flash_live FROM vouchers")
+        .fetch_one(pool).await.map(|row| PromoOpsSummary { idle_vouchers: row.get("idle"), discount_vouchers_open: row.get("discount_open"), flash_sales_live: row.get("flash_live"), ..PromoOpsSummary::default() }).unwrap_or_default();
+    (transactions_today, deposits, vendors, StuckOpsSummary { threshold_minutes: 15, total: stuck }, promo)
 }

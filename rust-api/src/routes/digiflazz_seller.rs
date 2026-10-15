@@ -6,14 +6,13 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use futures_util::TryStreamExt;
-use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime, Document};
+use sqlx::Row;
 use serde_json::Value;
 
 use crate::{
     security::{require_proxy_context, ErrorResponse},
     state::AppState,
-    utils::bson::{escape_regex, read_i64},
+    services::seller_secrecy,
 };
 
 const SELLER_ORDER_EXPORT_LIMIT: i64 = 5000;
@@ -39,688 +38,106 @@ pub use settings::{save_settings, settings};
 use types::*;
 use utils::*;
 
-const RETRY_HEALTH_KEY: &str = "digiflazzSellerRetryQueueHealth";
+const RETRY_HEALTH_KEY: &str = "digiflazz_retry_health";
 
 pub async fn retry_callback(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(response) = require_proxy_context(&headers, &state) {
-        return response;
-    }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let Ok(order_id) = ObjectId::parse_str(&id) else {
-        return status_message(axum::http::StatusCode::BAD_REQUEST, "Order tidak valid");
-    };
-    let db = client.database(&state.mongo_db);
-    let order = match db
-        .collection::<Document>("digiflazzsellerorders")
-        .find_one(doc! { "_id": order_id })
-        .await
-    {
-        Ok(Some(order)) => order,
-        Ok(None) => {
-            return status_message(axum::http::StatusCode::NOT_FOUND, "Order tidak ditemukan")
-        }
+    if let Err(response) = require_proxy_context(&headers, &state) { return response; }
+    let order = match sqlx::query("SELECT to_jsonb(o) || jsonb_build_object('callback_attempt_count', c.attempt_count, 'callback_delivered_at', c.delivered_at, 'callback_next_retry_at', c.next_retry_at, 'callback_last_attempt_at', c.last_attempt_at, 'callback_last_status_code', c.last_status_code, 'callback_last_message', c.last_error) AS data FROM seller_orders o LEFT JOIN seller_callbacks c ON c.channel=o.channel AND c.ref_id=o.reference_id WHERE o.id::text=$1 OR o.reference_id=$1 ORDER BY o.created_at DESC LIMIT 1")
+        .bind(&id).fetch_optional(&state.pg_pool).await {
+        Ok(Some(row)) => row.try_get::<Value,_>("data").unwrap_or_default(),
+        Ok(None) => return status_message(StatusCode::NOT_FOUND, "Order tidak ditemukan"),
         Err(_) => return internal_error(),
     };
-    Json(send_seller_callback(&db, &order).await).into_response()
+    Json(send_seller_callback(&state, &order).await).into_response()
 }
 
-pub async fn retry_pending_callbacks(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<LimitPayload>,
-) -> Response {
-    if let Err(response) = require_proxy_context(&headers, &state) {
-        return response;
-    }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let db = client.database(&state.mongo_db);
+pub async fn retry_pending_callbacks(headers: axum::http::HeaderMap, State(state): State<Arc<AppState>>, Json(payload): Json<LimitPayload>) -> Response {
+    if let Err(response) = require_proxy_context(&headers, &state) { return response; }
     let limit = parse_limit_value(payload.limit.as_ref(), 25, 50);
-    let orders = match db
-        .collection::<Document>("digiflazzsellerorders")
-        .find(doc! { "status": { "$ne": "pending" }, "$and": [callback_pending_query()] })
-        .sort(doc! { "updatedAt": 1 })
-        .limit(limit)
-        .await
-    {
-        Ok(cursor) => cursor.try_collect::<Vec<_>>().await.unwrap_or_default(),
-        Err(_) => return internal_error(),
-    };
-    Json(callback_retry_response(&db, orders).await).into_response()
+    let rows = match sqlx::query("SELECT to_jsonb(o) || jsonb_build_object('callback_attempt_count',c.attempt_count,'callback_delivered_at',c.delivered_at,'callback_next_retry_at',c.next_retry_at,'callback_last_attempt_at',c.last_attempt_at,'callback_last_status_code',c.last_status_code,'callback_last_message',c.last_error) AS data FROM seller_orders o JOIN seller_callbacks c ON c.channel=o.channel AND c.ref_id=o.reference_id WHERE o.channel='digiflazz' AND o.status<>'pending' AND c.delivered_at IS NULL ORDER BY o.updated_at LIMIT $1")
+        .bind(limit).fetch_all(&state.pg_pool).await { Ok(rows)=>rows, Err(_)=>return internal_error() };
+    let orders=rows.into_iter().filter_map(|r| r.try_get::<Value,_>("data").ok()).collect();
+    Json(callback_retry_response(&state, orders).await).into_response()
 }
 
-pub async fn process_due_callback_retries(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<LimitPayload>,
-) -> Response {
-    if let Err(response) = require_proxy_context(&headers, &state) {
-        return response;
-    }
-    process_due_callback_retries_inner(&state, payload, "admin").await
+pub async fn process_due_callback_retries(headers: axum::http::HeaderMap, State(state): State<Arc<AppState>>, Json(payload): Json<LimitPayload>) -> Response {
+    if let Err(response)=require_proxy_context(&headers,&state){return response;} process_due_callback_retries_inner(&state,payload,"admin").await
+}
+pub async fn process_due_callback_retries_scheduler(headers: axum::http::HeaderMap, State(state): State<Arc<AppState>>, Json(payload): Json<LimitPayload>) -> Response {
+    let configured=std::env::var("DIGIFLAZZ_SELLER_RETRY_QUEUE_TOKEN").unwrap_or_default();
+    let provided=headers.get("x-scheduler-token").and_then(|v|v.to_str().ok()).unwrap_or("");
+    if configured.trim().len()<16 || provided.trim()!=configured.trim(){return (StatusCode::UNAUTHORIZED,Json(ErrorResponse{message:"Unauthorized scheduler token"})).into_response();}
+    process_due_callback_retries_inner(&state,payload,"scheduler").await
+}
+async fn process_due_callback_retries_inner(state:&AppState,payload:LimitPayload,source:&str)->Response {
+    let limit=parse_limit_value(payload.limit.as_ref(),20,50);
+    let rows=match sqlx::query("SELECT to_jsonb(o) || jsonb_build_object('callback_attempt_count',c.attempt_count,'callback_delivered_at',c.delivered_at,'callback_next_retry_at',c.next_retry_at,'callback_last_attempt_at',c.last_attempt_at,'callback_last_status_code',c.last_status_code,'callback_last_message',c.last_error) AS data FROM seller_orders o JOIN seller_callbacks c ON c.channel=o.channel AND c.ref_id=o.reference_id WHERE o.channel='digiflazz' AND c.delivered_at IS NULL AND c.next_retry_at<=now() ORDER BY c.next_retry_at,o.updated_at LIMIT $1").bind(limit).fetch_all(&state.pg_pool).await {Ok(r)=>r,Err(_)=>return internal_error()};
+    let orders=rows.into_iter().filter_map(|r|r.try_get::<Value,_>("data").ok()).collect();
+    let result=callback_retry_response(state,orders).await;
+    let remaining=sqlx::query_scalar::<_,i64>("SELECT count(*) FROM seller_callbacks WHERE channel='digiflazz' AND delivered_at IS NULL AND next_retry_at<=now()").fetch_one(&state.pg_pool).await.unwrap_or(0);
+    let last_error=if result.failed_count>0{format!("{} callback gagal diproses",result.failed_count)}else{String::new()};
+    let health=save_retry_queue_health(state,source,result.processed as i64,result.success_count as i64,result.failed_count as i64,remaining,&last_error).await;
+    Json(SellerCallbackDueRetryResponse{processed:result.processed,success_count:result.success_count,failed_count:result.failed_count,remaining_due:remaining,health,results:result.results}).into_response()
 }
 
-pub async fn process_due_callback_retries_scheduler(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<LimitPayload>,
-) -> Response {
-    let configured_token = std::env::var("DIGIFLAZZ_SELLER_RETRY_QUEUE_TOKEN")
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let provided_token = headers
-        .get("x-scheduler-token")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if configured_token.len() < 16
-        || provided_token.is_empty()
-        || configured_token != provided_token
-    {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse {
-                message: "Unauthorized scheduler token",
-            }),
-        )
-            .into_response();
-    }
-    process_due_callback_retries_inner(&state, payload, "scheduler").await
+pub async fn process_sql_seller_callbacks(headers:axum::http::HeaderMap,State(state):State<Arc<AppState>>,Json(payload):Json<LimitPayload>)->Response{process_due_callback_retries_scheduler(headers,State(state),Json(payload)).await}
+pub async fn claim_seller_callback(State(state):State<Arc<AppState>>,axum::extract::Path((channel,ref_id)):axum::extract::Path<(String,String)>)->Response{sql_seller_claim(&state,&channel,&ref_id,false).await}
+pub async fn fail_seller_callback(State(state):State<Arc<AppState>>,axum::extract::Path((channel,ref_id)):axum::extract::Path<(String,String)>)->Response{sql_seller_claim(&state,&channel,&ref_id,true).await}
+async fn sql_seller_claim(state:&AppState,channel:&str,ref_id:&str,fail:bool)->Response{
+    let sql=if fail{"UPDATE seller_callbacks SET delivered_at=now(),last_error='failed',lease_token=NULL,lease_until=NULL WHERE channel=$1 AND ref_id=$2 AND delivered_at IS NULL RETURNING ref_id"}else{"UPDATE seller_callbacks SET lease_token=gen_random_uuid(),lease_until=now()+interval '2 minutes' WHERE channel=$1 AND ref_id=$2 AND delivered_at IS NULL AND (lease_until IS NULL OR lease_until<now()) RETURNING ref_id"};
+    match sqlx::query(sql).bind(channel).bind(ref_id).fetch_optional(&state.pg_pool).await{Ok(Some(_))=>Json(serde_json::json!({"status":if fail{"failed"}else{"claimed"}})).into_response(),Ok(None)=>status_conflict(),Err(_)=>internal_error()}
 }
+fn status_conflict()->Response{(StatusCode::CONFLICT,Json(serde_json::json!({"message":"Seller ref already claimed"}))).into_response()}
 
-async fn process_due_callback_retries_inner(
-    state: &AppState,
-    payload: LimitPayload,
-    source: &str,
-) -> Response {
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let db = client.database(&state.mongo_db);
-    let limit = parse_limit_value(payload.limit.as_ref(), 20, 50);
-    let orders = match db
-        .collection::<Document>("digiflazzsellerorders")
-        .find(callback_due_retry_query())
-        .sort(doc! { "callbackNextRetryAt": 1, "updatedAt": 1 })
-        .limit(limit)
-        .await
-    {
-        Ok(cursor) => cursor.try_collect::<Vec<_>>().await.unwrap_or_default(),
-        Err(_) => {
-            let health = save_retry_queue_health(
-                &db,
-                source,
-                0,
-                0,
-                0,
-                0,
-                "Gagal memproses queue retry callback",
-            )
-            .await;
-            return Json(SellerCallbackDueRetryResponse {
-                processed: 0,
-                success_count: 0,
-                failed_count: 0,
-                remaining_due: 0,
-                health,
-                results: Vec::new(),
-            })
-            .into_response();
-        }
-    };
-    let response = callback_retry_response(&db, orders).await;
-    let remaining_due =
-        count_documents(&db, "digiflazzsellerorders", callback_due_retry_query()).await;
-    let last_error = if response.failed_count > 0 {
-        format!("{} callback gagal diproses", response.failed_count)
-    } else {
-        String::new()
-    };
-    let health = save_retry_queue_health(
-        &db,
-        source,
-        response.processed as i64,
-        response.success_count as i64,
-        response.failed_count as i64,
-        remaining_due,
-        &last_error,
-    )
-    .await;
-    Json(SellerCallbackDueRetryResponse {
-        processed: response.processed,
-        success_count: response.success_count,
-        failed_count: response.failed_count,
-        remaining_due,
-        health,
-        results: response.results,
-    })
-    .into_response()
+async fn callback_retry_response(state:&AppState,orders:Vec<Value>)->SellerCallbackRetryResponse{
+    let mut results=Vec::with_capacity(orders.len());
+    for order in orders {let id=order.get("id").and_then(Value::as_str).unwrap_or_default().to_string();let ref_id=order.get("reference_id").and_then(Value::as_str).unwrap_or_default().to_string();let action=send_seller_callback(state,&order).await;
+    let next=sqlx::query_scalar::<_,Option<chrono::DateTime<chrono::Utc>>>("SELECT next_retry_at FROM seller_callbacks WHERE channel='digiflazz' AND ref_id=$1").bind(&ref_id).fetch_optional(&state.pg_pool).await.ok().flatten().flatten().map(|d|d.to_rfc3339());
+    results.push(SellerCallbackRetryItem{order_id:id,ref_id,success:action.success,message:action.message,next_retry_at:next});}
+    let success_count=results.iter().filter(|r|r.success).count();SellerCallbackRetryResponse{processed:results.len(),success_count,failed_count:results.len()-success_count,results}
 }
-
-async fn callback_retry_response(
-    db: &mongodb::Database,
-    orders: Vec<Document>,
-) -> SellerCallbackRetryResponse {
-    let mut results = Vec::new();
-    for order in orders {
-        let order_id = document_id(&order);
-        let ref_id = document_string(&order, "refId");
-        let result = send_seller_callback(db, &order).await;
-        let updated = db
-            .collection::<Document>("digiflazzsellerorders")
-            .find_one(
-                order
-                    .get_object_id("_id")
-                    .map(|id| doc! { "_id": id })
-                    .unwrap_or_default(),
-            )
-            .await
-            .ok()
-            .flatten();
-        results.push(SellerCallbackRetryItem {
-            order_id,
-            ref_id,
-            success: result.success,
-            message: result.message,
-            next_retry_at: updated
-                .as_ref()
-                .and_then(|doc| optional_date_string(doc, "callbackNextRetryAt")),
-        });
-    }
-    let success_count = results.iter().filter(|item| item.success).count();
-    SellerCallbackRetryResponse {
-        processed: results.len(),
-        success_count,
-        failed_count: results.len().saturating_sub(success_count),
-        results,
-    }
+async fn save_retry_queue_health(state:&AppState,source:&str,processed:i64,success_count:i64,failed_count:i64,remaining_due:i64,last_error:&str)->RetryQueueHealth{
+    let status=if failed_count>0{"partial"}else{"success"};let now=chrono::Utc::now();
+    let data=serde_json::json!({"status":status,"source":source,"lastRunAt":now.to_rfc3339(),"processed":processed,"successCount":success_count,"failedCount":failed_count,"remainingDue":remaining_due,"lastError":last_error});
+    let _=sqlx::query("INSERT INTO seller_settings(channel,data) VALUES($1,$2) ON CONFLICT(channel) DO UPDATE SET data=seller_settings.data || EXCLUDED.data").bind("digiflazz_retry_health").bind(&data).execute(&state.pg_pool).await;
+    RetryQueueHealth{status:status.into(),source:source.into(),last_run_at:Some(now.to_rfc3339()),processed,success_count,failed_count,remaining_due,last_error:last_error.into()}
 }
+fn parse_limit_value(value:Option<&Value>,fallback:i64,max:i64)->i64{value.and_then(|v|v.as_i64().or_else(||v.as_str()?.parse().ok())).filter(|v|*v>0).map(|v|v.min(max)).unwrap_or(fallback)}
 
-async fn save_retry_queue_health(
-    db: &mongodb::Database,
-    source: &str,
-    processed: i64,
-    success_count: i64,
-    failed_count: i64,
-    remaining_due: i64,
-    last_error: &str,
-) -> RetryQueueHealth {
-    let status = if failed_count > 0 {
-        "partial"
-    } else {
-        "success"
-    };
-    let value = doc! {
-        "status": status,
-        "source": source,
-        "lastRunAt": DateTime::now(),
-        "processed": processed,
-        "successCount": success_count,
-        "failedCount": failed_count,
-        "remainingDue": remaining_due,
-        "lastError": last_error,
-    };
-    let _ = db
-        .collection::<Document>("settings")
-        .update_one(
-            doc! { "key": RETRY_HEALTH_KEY },
-            doc! { "$set": { "key": RETRY_HEALTH_KEY, "value": &value, "description": "Status terakhir scheduler retry callback Digiflazz Seller" } },
-        )
-        .upsert(true)
-        .await;
-    RetryQueueHealth {
-        status: document_string(&value, "status"),
-        source: document_string(&value, "source"),
-        last_run_at: optional_date_string(&value, "lastRunAt"),
-        processed,
-        success_count,
-        failed_count,
-        remaining_due,
-        last_error: last_error.to_string(),
-    }
+pub async fn orders(headers:axum::http::HeaderMap,State(state):State<Arc<AppState>>)->Response{
+    if let Err(response)=require_proxy_context(&headers,&state){return response;}
+    let rows=match sqlx::query("SELECT to_jsonb(o)||jsonb_build_object('callback_attempt_count',c.attempt_count,'callback_delivered_at',c.delivered_at,'callback_next_retry_at',c.next_retry_at,'callback_last_attempt_at',c.last_attempt_at,'callback_last_status_code',c.last_status_code,'callback_last_message',c.last_error) AS data FROM seller_orders o LEFT JOIN seller_callbacks c ON c.channel=o.channel AND c.ref_id=o.reference_id WHERE o.channel='digiflazz' ORDER BY o.created_at DESC LIMIT 50").fetch_all(&state.pg_pool).await{Ok(r)=>r,Err(_)=>return internal_error()};
+    let items=rows.into_iter().filter_map(|r|r.try_get::<Value,_>("data").ok()).map(seller_order_from_value).collect::<Vec<_>>();Json(items).into_response()
 }
-
-fn parse_limit_value(value: Option<&Value>, fallback: i64, max: i64) -> i64 {
-    value
-        .map(text_from_value)
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .map(|value| (value.floor() as i64).min(max))
-        .unwrap_or(fallback)
+pub async fn admin_orders(headers:axum::http::HeaderMap,State(state):State<Arc<AppState>>,Query(query):Query<HashMap<String,String>>)->Response{
+    if let Err(response)=require_proxy_context(&headers,&state){return response;}
+    let (where_sql,binds)=match build_admin_orders_filter(&query){Ok(v)=>v,Err(r)=>return r};
+    let page=parse_positive_i64(query.get("page"),1,100_000);let limit=parse_positive_i64(query.get("limit"),20,100);let offset=(page-1)*limit;
+    let sql=format!("SELECT to_jsonb(o)||jsonb_build_object('callback_attempt_count',c.attempt_count,'callback_delivered_at',c.delivered_at,'callback_next_retry_at',c.next_retry_at,'callback_last_attempt_at',c.last_attempt_at,'callback_last_status_code',c.last_status_code,'callback_last_message',c.last_error,'product_data',jsonb_build_object('id',p.id,'name',p.name,'code',p.code,'brand',p.brand,'category',cat.name,'active',true,'vendor_name',o.snapshot->>'vendorName','vendor_sku',o.snapshot->>'vendorSku')) AS data FROM seller_orders o LEFT JOIN seller_callbacks c ON c.channel=o.channel AND c.ref_id=o.reference_id LEFT JOIN products p ON p.id=o.product_id LEFT JOIN operators op ON op.id=p.operator_id LEFT JOIN categories cat ON cat.id=op.category_id WHERE o.channel='digiflazz' AND {where_sql} ORDER BY o.created_at DESC LIMIT ${} OFFSET ${}",binds.len()+1,binds.len()+2);
+    let mut q=sqlx::query(&sql);for b in &binds{q=q.bind(b);}let rows=match q.bind(limit).bind(offset).fetch_all(&state.pg_pool).await{Ok(r)=>r,Err(_)=>return internal_error()};
+    let count_sql=format!("SELECT count(*)::bigint total,count(*) FILTER(WHERE o.status='pending')::bigint pending,count(*) FILTER(WHERE o.status='success')::bigint success,count(*) FILTER(WHERE o.status='failed')::bigint failed,count(*) FILTER(WHERE c.delivered_at IS NULL)::bigint callback_pending,count(*) FILTER(WHERE c.delivered_at IS NULL AND c.next_retry_at<=now())::bigint callback_due_retry,coalesce(sum(o.amount),0)::bigint amount_total FROM seller_orders o LEFT JOIN seller_callbacks c ON c.channel=o.channel AND c.ref_id=o.reference_id LEFT JOIN products p ON p.id=o.product_id LEFT JOIN operators op ON op.id=p.operator_id LEFT JOIN categories cat ON cat.id=op.category_id WHERE o.channel='digiflazz' AND {where_sql}");
+    let mut q=sqlx::query(&count_sql);for b in &binds{q=q.bind(b);}let summary=match q.fetch_one(&state.pg_pool).await{Ok(r)=>SellerAdminOrdersSummary{total:r.try_get("total").unwrap_or(0),pending:r.try_get("pending").unwrap_or(0),success:r.try_get("success").unwrap_or(0),failed:r.try_get("failed").unwrap_or(0),callback_pending:r.try_get("callback_pending").unwrap_or(0),callback_due_retry:r.try_get("callback_due_retry").unwrap_or(0),amount_total:r.try_get("amount_total").unwrap_or(0)},Err(_)=>return internal_error()};
+    let total_pages=if summary.total>0{(summary.total+limit-1)/limit}else{1};Json(SellerAdminOrdersResponse{items:rows.into_iter().filter_map(|r|r.try_get::<Value,_>("data").ok()).map(seller_admin_order_from_value).collect(),meta:SellerAdminOrdersMeta{page,limit,total:summary.total,total_pages},summary}).into_response()
 }
-
-pub async fn orders(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> Response {
-    if let Err(response) = require_proxy_context(&headers, &state) {
-        return response;
-    }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let db = client.database(&state.mongo_db);
-    let docs = match db
-        .collection::<Document>("digiflazzsellerorders")
-        .find(doc! {})
-        .sort(doc! { "createdAt": -1 })
-        .limit(50)
-        .await
-    {
-        Ok(cursor) => match cursor.try_collect::<Vec<_>>().await {
-            Ok(docs) => docs,
-            Err(_) => return internal_error(),
-        },
-        Err(_) => return internal_error(),
-    };
-    let product_map = seller_order_products(&db, &docs).await;
-
-    Json(
-        docs.into_iter()
-            .map(|doc| seller_order_from_doc(doc, &product_map))
-            .collect::<Vec<_>>(),
-    )
-    .into_response()
+pub async fn admin_orders_export(headers:axum::http::HeaderMap,State(state):State<Arc<AppState>>,Query(query):Query<HashMap<String,String>>)->Response{
+    if let Err(response)=require_proxy_context(&headers,&state){return response;}let(where_sql,binds)=match build_admin_orders_filter(&query){Ok(v)=>v,Err(r)=>return r};
+    let sql=format!("SELECT to_jsonb(o)||jsonb_build_object('callback_attempt_count',c.attempt_count,'callback_delivered_at',c.delivered_at,'callback_next_retry_at',c.next_retry_at,'callback_last_attempt_at',c.last_attempt_at,'callback_last_status_code',c.last_status_code,'callback_last_message',c.last_error,'product_data',jsonb_build_object('id',p.id,'name',p.name,'code',p.code,'brand',p.brand,'category',cat.name,'active',true,'vendor_name',o.snapshot->>'vendorName','vendor_sku',o.snapshot->>'vendorSku')) AS data FROM seller_orders o LEFT JOIN seller_callbacks c ON c.channel=o.channel AND c.ref_id=o.reference_id LEFT JOIN products p ON p.id=o.product_id LEFT JOIN operators op ON op.id=p.operator_id LEFT JOIN categories cat ON cat.id=op.category_id WHERE o.channel='digiflazz' AND {where_sql} ORDER BY o.created_at DESC LIMIT {SELLER_ORDER_EXPORT_LIMIT}");let mut q=sqlx::query(&sql);for b in &binds{q=q.bind(b);}let rows=match q.fetch_all(&state.pg_pool).await{Ok(r)=>r,Err(_)=>return internal_error()};let items=rows.into_iter().filter_map(|r|r.try_get::<Value,_>("data").ok()).map(seller_admin_order_from_value).collect::<Vec<_>>();let csv=build_seller_orders_csv(&items);let mut h=HeaderMap::new();h.insert(header::CONTENT_TYPE,HeaderValue::from_static("text/csv; charset=utf-8"));let filename=format!("digiflazz-seller-orders-{}.csv",chrono::Utc::now().format("%Y%m%d"));if let Ok(v)=HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")){h.insert(header::CONTENT_DISPOSITION,v);}(StatusCode::OK,h,format!("\u{FEFF}{csv}")).into_response()
 }
-
-pub async fn admin_orders(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<HashMap<String, String>>,
-) -> Response {
-    if let Err(response) = require_proxy_context(&headers, &state) {
-        return response;
-    }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let db = client.database(&state.mongo_db);
-    let filter = match build_admin_orders_filter(&db, &query).await {
-        Ok(filter) => filter,
-        Err(response) => return response,
-    };
-    let page = parse_positive_i64(query.get("page"), 1, 100_000);
-    let limit = parse_positive_i64(query.get("limit"), 20, 100);
-    let skip = u64::try_from((page - 1) * limit).unwrap_or(0);
-    let collection = db.collection::<Document>("digiflazzsellerorders");
-    let docs = match collection
-        .find(filter.clone())
-        .sort(doc! { "createdAt": -1 })
-        .skip(skip)
-        .limit(limit)
-        .await
-    {
-        Ok(cursor) => match cursor.try_collect::<Vec<_>>().await {
-            Ok(docs) => docs,
-            Err(_) => return internal_error(),
-        },
-        Err(_) => return internal_error(),
-    };
-    let product_map = seller_order_products(&db, &docs).await;
-    let summary = admin_orders_summary(&collection, filter).await;
-    let total_pages = if summary.total > 0 {
-        ((summary.total as f64) / (limit as f64)).ceil() as i64
-    } else {
-        1
-    };
-
-    Json(SellerAdminOrdersResponse {
-        items: docs
-            .into_iter()
-            .map(|doc| seller_admin_order_from_doc(doc, &product_map))
-            .collect(),
-        meta: SellerAdminOrdersMeta {
-            page,
-            limit,
-            total: summary.total,
-            total_pages,
-        },
-        summary,
-    })
-    .into_response()
+fn build_admin_orders_filter(query:&HashMap<String,String>)->Result<(String,Vec<String>),Response>{
+    let mut clauses=Vec::new();let mut binds=Vec::new();let status=query.get("status").map(|s|s.trim()).unwrap_or("");if !status.is_empty(){if !matches!(status,"pending"|"success"|"failed"){return Err(status_message(StatusCode::BAD_REQUEST,"Status transaksi seller tidak valid"));}binds.push(status.to_owned());clauses.push(format!("o.status=${}",binds.len()));}
+    let callback=query.get("callback").map(|s|s.trim()).unwrap_or("");if !callback.is_empty()&&!matches!(callback,"pending"|"due"|"delivered"){return Err(status_message(StatusCode::BAD_REQUEST,"Filter callback seller tidak valid"));}match callback{"pending"=>clauses.push("c.delivered_at IS NULL".into()),"due"=>clauses.push("c.delivered_at IS NULL AND c.next_retry_at<=now()".into()),"delivered"=>clauses.push("c.delivered_at IS NOT NULL".into()),_=>()}
+    if let Some(s)=query.get("startDate").filter(|s|!s.trim().is_empty()){let d=chrono::NaiveDate::parse_from_str(s.trim(),"%Y-%m-%d").map_err(|_|status_message(StatusCode::BAD_REQUEST,"Format tanggal transaksi seller tidak valid"))?;binds.push(d.and_hms_opt(0,0,0).unwrap().and_utc().to_rfc3339());clauses.push(format!("o.created_at>=${}::timestamptz",binds.len()));}if let Some(s)=query.get("endDate").filter(|s|!s.trim().is_empty()){let d=chrono::NaiveDate::parse_from_str(s.trim(),"%Y-%m-%d").map_err(|_|status_message(StatusCode::BAD_REQUEST,"Format tanggal transaksi seller tidak valid"))?;binds.push((d+chrono::Duration::days(1)).and_hms_opt(0,0,0).unwrap().and_utc().to_rfc3339());clauses.push(format!("o.created_at<${}::timestamptz",binds.len()));}
+    if let Some(keyword)=query.get("search").map(|s|s.trim()).filter(|s|!s.is_empty()){binds.push(format!("%{}%",keyword.replace('%',"\\%").replace('_',"\\_")));let p=binds.len();clauses.push(format!("(o.reference_id ILIKE ${p} OR o.snapshot->>'trId' ILIKE ${p} OR o.buyer_sku_code ILIKE ${p} OR o.customer_no ILIKE ${p} OR o.vendor_reference ILIKE ${p} OR o.snapshot::text ILIKE ${p} OR p.name ILIKE ${p} OR p.code ILIKE ${p} OR p.id::text ILIKE ${p} OR cat.name ILIKE ${p})"));}
+    Ok((if clauses.is_empty(){"true".into()}else{clauses.join(" AND ")},binds))
 }
-
-pub async fn admin_orders_export(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<HashMap<String, String>>,
-) -> Response {
-    if let Err(response) = require_proxy_context(&headers, &state) {
-        return response;
-    }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let db = client.database(&state.mongo_db);
-    let filter = match build_admin_orders_filter(&db, &query).await {
-        Ok(filter) => filter,
-        Err(response) => return response,
-    };
-    let collection = db.collection::<Document>("digiflazzsellerorders");
-    let docs = match collection
-        .find(filter)
-        .sort(doc! { "createdAt": -1 })
-        .limit(SELLER_ORDER_EXPORT_LIMIT)
-        .await
-    {
-        Ok(cursor) => match cursor.try_collect::<Vec<_>>().await {
-            Ok(docs) => docs,
-            Err(_) => return internal_error(),
-        },
-        Err(_) => return internal_error(),
-    };
-    let product_map = seller_order_products(&db, &docs).await;
-    let items = docs
-        .into_iter()
-        .map(|doc| seller_admin_order_from_doc(doc, &product_map))
-        .collect::<Vec<_>>();
-    let csv = build_seller_orders_csv(&items);
-    let filename = format!("digiflazz-seller-orders-{}.csv", date_key(DateTime::now()));
-    let mut response_headers = HeaderMap::new();
-    response_headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/csv; charset=utf-8"),
-    );
-    if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
-        response_headers.insert(header::CONTENT_DISPOSITION, value);
-    }
-
-    (StatusCode::OK, response_headers, format!("\u{FEFF}{csv}")).into_response()
-}
-
-async fn build_admin_orders_filter(
-    db: &mongodb::Database,
-    query: &HashMap<String, String>,
-) -> Result<Document, Response> {
-    let mut filter = Document::new();
-    let mut and_conditions = Vec::<Document>::new();
-    let status = query
-        .get("status")
-        .map(|value| value.trim())
-        .unwrap_or_default();
-    if !status.is_empty() {
-        if !matches!(status, "pending" | "success" | "failed") {
-            return Err(status_message(
-                axum::http::StatusCode::BAD_REQUEST,
-                "Status transaksi seller tidak valid",
-            ));
-        }
-        filter.insert("status", status);
-    }
-
-    let callback = query
-        .get("callback")
-        .map(|value| value.trim())
-        .unwrap_or_default();
-    if !callback.is_empty() && !matches!(callback, "pending" | "due" | "delivered") {
-        return Err(status_message(
-            axum::http::StatusCode::BAD_REQUEST,
-            "Filter callback seller tidak valid",
-        ));
-    }
-    if callback == "pending" {
-        and_conditions.push(callback_pending_query());
-    } else if callback == "due" {
-        and_conditions.push(callback_due_retry_query());
-    } else if callback == "delivered" {
-        and_conditions.push(doc! { "callbackDeliveredAt": { "$exists": true, "$ne": Bson::Null } });
-    }
-
-    let start = parse_date_boundary(query.get("startDate"), false)?;
-    let end = parse_date_boundary(query.get("endDate"), true)?;
-    if start.is_some() || end.is_some() {
-        let mut created_at = Document::new();
-        if let Some(start) = start {
-            created_at.insert("$gte", start);
-        }
-        if let Some(end) = end {
-            created_at.insert("$lte", end);
-        }
-        filter.insert("createdAt", created_at);
-    }
-
-    if let Some(keyword) = query
-        .get("search")
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-    {
-        let regex = doc! { "$regex": escape_regex(keyword), "$options": "i" };
-        let product_ids = product_ids_for_seller_order_search(db, regex.clone()).await?;
-        let mut search_or = vec![
-            doc! { "refId": regex.clone() },
-            doc! { "trId": regex.clone() },
-            doc! { "pulsaCode": regex.clone() },
-            doc! { "target": regex.clone() },
-            doc! { "vendorTrxId": regex.clone() },
-            doc! { "vendorName": regex.clone() },
-            doc! { "vendorSku": regex.clone() },
-            doc! { "sn": regex.clone() },
-            doc! { "message": regex.clone() },
-            doc! { "requestIp": regex },
-        ];
-        if !product_ids.is_empty() {
-            search_or.push(doc! { "product": { "$in": product_ids } });
-        }
-        and_conditions.push(doc! { "$or": search_or });
-    }
-
-    if !and_conditions.is_empty() {
-        filter.insert("$and", and_conditions);
-    }
-
-    Ok(filter)
-}
-
-async fn product_ids_for_seller_order_search(
-    db: &mongodb::Database,
-    regex: Document,
-) -> Result<Vec<Bson>, Response> {
-    let cursor = db
-        .collection::<Document>("products")
-        .find(doc! { "$or": [
-            { "name": regex.clone() },
-            { "code": regex.clone() },
-            { "brand": regex.clone() },
-            { "category": regex.clone() },
-            { "vendor.name": regex.clone() },
-            { "vendor.sku": regex }
-        ] })
-        .projection(doc! { "_id": 1 })
-        .await
-        .map_err(|_| internal_error())?;
-    let docs = cursor
-        .try_collect::<Vec<_>>()
-        .await
-        .map_err(|_| internal_error())?;
-    Ok(docs
-        .into_iter()
-        .filter_map(|doc| doc.get_object_id("_id").ok().map(Bson::ObjectId))
-        .collect())
-}
-
-fn parse_date_boundary(
-    value: Option<&String>,
-    end_of_day: bool,
-) -> Result<Option<DateTime>, Response> {
-    let Some(value) = value
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(None);
-    };
-    let suffix = if end_of_day {
-        "T23:59:59.999Z"
-    } else {
-        "T00:00:00.000Z"
-    };
-    let date = DateTime::parse_rfc3339_str(format!("{value}{suffix}")).map_err(|_| {
-        status_message(
-            axum::http::StatusCode::BAD_REQUEST,
-            "Format tanggal transaksi seller tidak valid",
-        )
-    })?;
-    Ok(Some(date))
-}
-
-async fn admin_orders_summary(
-    collection: &mongodb::Collection<Document>,
-    filter: Document,
-) -> SellerAdminOrdersSummary {
-    match collection
-        .aggregate(vec![
-            doc! { "$match": filter },
-            doc! { "$group": {
-                "_id": Bson::Null,
-                "total": { "$sum": 1 },
-                "pending": { "$sum": { "$cond": [ { "$eq": ["$status", "pending"] }, 1, 0 ] } },
-                "success": { "$sum": { "$cond": [ { "$eq": ["$status", "success"] }, 1, 0 ] } },
-                "failed": { "$sum": { "$cond": [ { "$eq": ["$status", "failed"] }, 1, 0 ] } },
-                "callbackPending": { "$sum": { "$cond": [ callback_pending_expression(), 1, 0 ] } },
-                "callbackDueRetry": { "$sum": { "$cond": [ callback_due_retry_expression(), 1, 0 ] } },
-                "amountTotal": { "$sum": "$digiflazzPrice" }
-            } },
-        ])
-        .await
-    {
-        Ok(cursor) => cursor
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .next()
-            .map(|doc| SellerAdminOrdersSummary {
-                total: read_i64(&doc, "total"),
-                pending: read_i64(&doc, "pending"),
-                success: read_i64(&doc, "success"),
-                failed: read_i64(&doc, "failed"),
-                callback_pending: read_i64(&doc, "callbackPending"),
-                callback_due_retry: read_i64(&doc, "callbackDueRetry"),
-                amount_total: read_i64(&doc, "amountTotal"),
-            })
-            .unwrap_or_default(),
-        Err(_) => SellerAdminOrdersSummary::default(),
-    }
-}
-
-fn parse_positive_i64(value: Option<&String>, fallback: i64, max: i64) -> i64 {
-    value
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .map(|value| (value.floor() as i64).min(max))
-        .unwrap_or(fallback)
-}
-
-async fn count_documents(db: &mongodb::Database, collection: &str, filter: Document) -> i64 {
-    db.collection::<Document>(collection)
-        .count_documents(filter)
-        .await
-        .unwrap_or_default() as i64
-}
-
-async fn seller_order_products(
-    db: &mongodb::Database,
-    orders: &[Document],
-) -> HashMap<String, SellerOrderProduct> {
-    let mut ids = orders
-        .iter()
-        .filter_map(|doc| doc.get_object_id("product").ok())
-        .collect::<Vec<_>>();
-    ids.sort_by_key(|id| id.to_hex());
-    ids.dedup();
-    if ids.is_empty() {
-        return HashMap::new();
-    }
-
-    match db
-        .collection::<Document>("products")
-        .find(doc! { "_id": { "$in": ids } })
-        .await
-    {
-        Ok(cursor) => cursor
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|doc| {
-                let id = document_id(&doc);
-                let vendor = doc.get_document("vendor").ok();
-                (
-                    id.clone(),
-                    SellerOrderProduct {
-                        id,
-                        name: document_string(&doc, "name"),
-                        code: document_string(&doc, "code"),
-                        brand: document_string(&doc, "brand"),
-                        category: document_string(&doc, "category"),
-                        vendor_name: vendor
-                            .map(|value| document_string(value, "name"))
-                            .unwrap_or_default(),
-                        vendor_sku: vendor
-                            .map(|value| document_string(value, "sku"))
-                            .unwrap_or_default(),
-                    },
-                )
-            })
-            .collect(),
-        Err(_) => HashMap::new(),
-    }
-}
-
-fn seller_admin_order_from_doc(
-    document: Document,
-    products: &HashMap<String, SellerOrderProduct>,
-) -> SellerAdminOrderItem {
-    let product_id = document
-        .get_object_id("product")
-        .map(|id| id.to_hex())
-        .unwrap_or_default();
-    SellerAdminOrderItem {
-        id: document_id(&document),
-        ref_id: document_string(&document, "refId"),
-        tr_id: document_string(&document, "trId"),
-        pulsa_code: document_string(&document, "pulsaCode"),
-        target: document_string(&document, "target"),
-        price: read_i64(&document, "digiflazzPrice"),
-        status: document_string(&document, "status"),
-        rc: document_string(&document, "rc"),
-        message: document_string(&document, "message"),
-        sn: document_string(&document, "sn"),
-        vendor_name: document_string(&document, "vendorName"),
-        vendor_sku: document_string(&document, "vendorSku"),
-        vendor_trx_id: document_string(&document, "vendorTrxId"),
-        callback_required: document.get_bool("callbackRequired").unwrap_or(false),
-        callback_attempt_count: read_i64(&document, "callbackAttemptCount"),
-        callback_delivered_at: optional_date_string(&document, "callbackDeliveredAt"),
-        callback_last_attempt_at: optional_date_string(&document, "callbackLastAttemptAt"),
-        callback_next_retry_at: optional_date_string(&document, "callbackNextRetryAt"),
-        callback_last_status_code: optional_i64(&document, "callbackLastStatusCode"),
-        callback_last_message: document_string(&document, "callbackLastMessage"),
-        request_ip: document_string(&document, "requestIp"),
-        created_at: date_string(&document, "createdAt"),
-        updated_at: date_string(&document, "updatedAt"),
-        product: products
-            .get(&product_id)
-            .map(|product| SellerAdminOrderProduct {
-                id: product.id.clone(),
-                name: product.name.clone(),
-                code: product.code.clone(),
-                brand: product.brand.clone(),
-                category: product.category.clone(),
-                vendor_name: product.vendor_name.clone(),
-                vendor_sku: product.vendor_sku.clone(),
-                active: true,
-            }),
-    }
-}
+fn parse_positive_i64(value:Option<&String>,fallback:i64,max:i64)->i64{value.and_then(|v|v.parse::<f64>().ok()).filter(|v|v.is_finite()&&*v>0.0).map(|v|(v.floor() as i64).min(max)).unwrap_or(fallback)}
+fn seller_admin_order_from_value(v:Value)->SellerAdminOrderItem{let get=|k:&str|v.get(k);let text=|k:&str|get(k).and_then(Value::as_str).unwrap_or("").to_string();let prod=get("product_data").filter(|p|p.get("id").is_some_and(|x|!x.is_null())).map(|p|SellerAdminOrderProduct{id:p["id"].as_str().unwrap_or("").into(),name:p["name"].as_str().unwrap_or("").into(),code:p["code"].as_str().unwrap_or("").into(),brand:p["brand"].as_str().unwrap_or("").into(),category:p["category"].as_str().unwrap_or("").into(),vendor_name:p["vendor_name"].as_str().unwrap_or("").into(),vendor_sku:p["vendor_sku"].as_str().unwrap_or("").into(),active:true});SellerAdminOrderItem{id:text("id"),ref_id:text("reference_id"),tr_id:v["snapshot"]["trId"].as_str().unwrap_or("").into(),pulsa_code:text("buyer_sku_code"),target:text("customer_no"),price:v["amount"].as_i64().unwrap_or(0),status:text("status"),rc:v["response"]["data"]["rc"].as_str().unwrap_or("").into(),message:v["response"]["data"]["message"].as_str().unwrap_or("").into(),sn:v["response"]["data"]["sn"].as_str().unwrap_or("").into(),vendor_name:v["snapshot"]["vendorName"].as_str().unwrap_or("").into(),vendor_sku:v["snapshot"]["vendorSku"].as_str().unwrap_or("").into(),vendor_trx_id:text("vendor_reference"),callback_required:!text("callback_url").is_empty(),callback_attempt_count:v["callback_attempt_count"].as_i64().unwrap_or(0),callback_delivered_at:json_date(get("callback_delivered_at")),callback_last_attempt_at:json_date(get("callback_last_attempt_at")),callback_next_retry_at:json_date(get("callback_next_retry_at")),callback_last_status_code:get("callback_last_status_code").and_then(Value::as_i64),callback_last_message:text("callback_last_message"),request_ip:v["snapshot"]["requestIp"].as_str().unwrap_or("").into(),created_at:text("created_at"),updated_at:text("updated_at"),product:prod}}
+fn seller_order_from_value(v:Value)->SellerOrderItem{let a=seller_admin_order_from_value(v);SellerOrderItem{id:a.id,ref_id:a.ref_id,tr_id:a.tr_id,pulsa_code:a.pulsa_code,target:a.target,price:a.price,status:a.status,rc:a.rc,message:a.message,sn:a.sn,vendor_trx_id:a.vendor_trx_id,callback_required:a.callback_required,callback_attempt_count:a.callback_attempt_count,callback_delivered_at:a.callback_delivered_at,callback_last_attempt_at:a.callback_last_attempt_at,callback_next_retry_at:a.callback_next_retry_at,callback_last_status_code:a.callback_last_status_code,callback_last_message:a.callback_last_message,request_ip:a.request_ip,created_at:a.created_at,updated_at:a.updated_at,product:a.product.map(|p|SellerOrderProduct{id:p.id,name:p.name,code:p.code,brand:p.brand,category:p.category,vendor_name:p.vendor_name,vendor_sku:p.vendor_sku})}}
+fn json_date(v:Option<&Value>)->Option<String>{v.filter(|v|!v.is_null()).and_then(Value::as_str).map(str::to_owned)}
 
 fn build_seller_orders_csv(items: &[SellerAdminOrderItem]) -> String {
     let mut rows = vec![vec![
@@ -817,61 +234,6 @@ fn csv_escape(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
-fn bson_to_json(value: &Bson) -> Value {
-    match value {
-        Bson::String(value) => Value::String(value.clone()),
-        Bson::Boolean(value) => Value::Bool(*value),
-        Bson::Int32(value) => serde_json::json!(*value),
-        Bson::Int64(value) => serde_json::json!(*value),
-        Bson::Double(value) => serde_json::json!(*value),
-        Bson::DateTime(value) => Value::String(date_to_string(value)),
-        Bson::ObjectId(value) => Value::String(value.to_hex()),
-        Bson::Document(document) => {
-            let mut map = serde_json::Map::new();
-            for (key, value) in document.iter() {
-                map.insert(key.clone(), bson_to_json(value));
-            }
-            Value::Object(map)
-        }
-        Bson::Array(values) => Value::Array(values.iter().map(bson_to_json).collect()),
-        Bson::Null => Value::Null,
-        _ => Value::String(value.to_string()),
-    }
-}
-
-fn seller_order_from_doc(
-    document: Document,
-    products: &HashMap<String, SellerOrderProduct>,
-) -> SellerOrderItem {
-    let product_id = document
-        .get_object_id("product")
-        .map(|id| id.to_hex())
-        .unwrap_or_default();
-    SellerOrderItem {
-        id: document_id(&document),
-        ref_id: document_string(&document, "refId"),
-        tr_id: document_string(&document, "trId"),
-        pulsa_code: document_string(&document, "pulsaCode"),
-        target: document_string(&document, "target"),
-        price: read_i64(&document, "digiflazzPrice"),
-        status: document_string(&document, "status"),
-        rc: document_string(&document, "rc"),
-        message: document_string(&document, "message"),
-        sn: document_string(&document, "sn"),
-        vendor_trx_id: document_string(&document, "vendorTrxId"),
-        callback_required: document.get_bool("callbackRequired").unwrap_or(false),
-        callback_attempt_count: read_i64(&document, "callbackAttemptCount"),
-        callback_delivered_at: optional_date_string(&document, "callbackDeliveredAt"),
-        callback_last_attempt_at: optional_date_string(&document, "callbackLastAttemptAt"),
-        callback_next_retry_at: optional_date_string(&document, "callbackNextRetryAt"),
-        callback_last_status_code: optional_i64(&document, "callbackLastStatusCode"),
-        callback_last_message: document_string(&document, "callbackLastMessage"),
-        request_ip: document_string(&document, "requestIp"),
-        created_at: date_string(&document, "createdAt"),
-        updated_at: date_string(&document, "updatedAt"),
-        product: products.get(&product_id).cloned(),
-    }
-}
 
 fn save_settings_error(code: &'static str) -> Response {
     let message = match code {

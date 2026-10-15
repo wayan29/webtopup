@@ -1,71 +1,12 @@
 use axum::response::Response;
 use serde_json::{json, Map, Value};
+use super::responses::{status_message, string_message};
 use url::Url;
 
-use super::{
-    defaults::default_site_settings,
-    responses::{status_message, string_message},
-    store::load_settings,
-};
 use crate::services::managed_assets::{
     ensure_managed_field_for_update, ManagedFieldFolderPolicy,
 };
 
-pub async fn validate_update_payload(
-    client: &mongodb::Client,
-    db_name: &str,
-    payload: &Map<String, Value>,
-) -> Result<(Map<String, Value>, Map<String, Value>, Map<String, Value>), Response> {
-    let defaults = default_site_settings();
-    let invalid_keys = payload
-        .keys()
-        .filter(|key| !defaults.contains_key(*key))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !invalid_keys.is_empty() {
-        return Err(string_message(
-            axum::http::StatusCode::BAD_REQUEST,
-            format!("Key pengaturan tidak dikenali: {}", invalid_keys.join(", ")),
-        ));
-    }
-    let selected_keys = defaults.keys().map(String::as_str).collect::<Vec<_>>();
-    let mut next_settings = load_settings(client, db_name, &selected_keys)
-        .await
-        .map_err(|error| {
-            eprintln!("Failed to load settings for validation: {error}");
-            status_message(
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Internal Server Error",
-            )
-        })?;
-    let previous_settings = next_settings.clone();
-    let mut changed_values = Map::new();
-    for (key, value) in payload {
-        let normalized = validate_setting_json_value(key, value)?;
-        next_settings.insert(key.clone(), normalized.clone());
-        changed_values.insert(key.clone(), normalized);
-    }
-    validate_cross_field_settings(&next_settings)?;
-    for (key, policy) in [
-        ("favicon", ManagedFieldFolderPolicy::Icons),
-        ("logo", ManagedFieldFolderPolicy::Icons),
-        ("popupBannerImage", ManagedFieldFolderPolicy::Popups),
-    ] {
-        if let Some(Value::String(path)) = next_settings.get(key) {
-            let previous_path = previous_settings.get(key).and_then(Value::as_str);
-            ensure_managed_field_for_update(
-                &crate::routes::uploads::upload_root(),
-                path,
-                policy,
-                crate::services::managed_assets::effectively_changed_managed_field(
-                    previous_path,
-                    path,
-                ),
-            )?;
-        }
-    }
-    Ok((next_settings, changed_values, previous_settings))
-}
 
 fn validate_cross_field_settings(next_settings: &Map<String, Value>) -> Result<(), Response> {
     let min_deposit = next_settings

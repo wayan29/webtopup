@@ -1,670 +1,94 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{str::FromStr, sync::Arc};
 
-use axum::{
-    extract::{Path, Query, State},
-    response::{IntoResponse, Response},
-    Json,
-};
-use futures_util::TryStreamExt;
-use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime, Document};
+use axum::{extract::{Path, Query, State}, response::{IntoResponse, Response}, Json};
+use serde_json::{json, Value};
+use sqlx::{postgres::PgRow, Row};
+use uuid::Uuid;
 
-use crate::{
-    security::require_proxy_context,
-    state::AppState,
-    utils::bson::{escape_regex, read_i64},
-};
+use crate::{security::require_proxy_context, state::AppState};
 
 use super::{
-    bool_from_value, date_string, document_id, document_string, insert_optional_i64,
-    internal_error, is_valid_pulsa_code, non_negative_i64, optional_bool, optional_date_string,
-    optional_i64, seller_config, status_message, text_from_value, unavailable, LimitPayload,
-    MappingItem, MappingListMeta, MappingListResponse, MappingListSummary, MappingProductItem,
-    MappingQuery, SaveMappingPayload, SaveMappingResponse, SavedMappingItem, SellerConfig,
-    SellerMappingBulkSyncResponse, SellerMappingSyncItem, SellerMappingSyncResult,
+    bool_from_value, internal_error, is_valid_pulsa_code, non_negative_i64,
+    status_message, text_from_value, LimitPayload, MappingItem, MappingListMeta,
+    MappingListResponse, MappingListSummary, MappingProductItem, MappingQuery, SaveMappingPayload,
+    SaveMappingResponse, SavedMappingItem, SellerConfig, SellerMappingBulkSyncResponse,
+    SellerMappingSyncItem, SellerMappingSyncResult,
 };
 
-pub async fn mappings(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<MappingQuery>,
-) -> Response {
-    if let Err(response) = require_proxy_context(&headers, &state) {
-        return response;
-    }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let db = client.database(&state.mongo_db);
-    let config = seller_config(&db).await;
-    let current_page = query.page.unwrap_or(1).clamp(1, 100_000);
-    let page_size = query.limit.unwrap_or(20).clamp(1, 100);
-    let keyword = query.search.unwrap_or_default().trim().to_string();
-    let mapped_filter = query
-        .mapped
-        .unwrap_or_else(|| "all".to_string())
-        .trim()
-        .to_lowercase();
-
-    let mut product_query = doc! {};
-    if !keyword.is_empty() {
-        let regex = Bson::RegularExpression(mongodb::bson::Regex {
-            pattern: escape_regex(&keyword),
-            options: "i".to_string(),
-        });
-        product_query.insert(
-            "$or",
-            vec![
-                doc! { "name": regex.clone() },
-                doc! { "code": regex.clone() },
-                doc! { "brand": regex.clone() },
-                doc! { "category": regex },
-            ],
-        );
-    }
-
-    let products = match db
-        .collection::<Document>("products")
-        .find(product_query)
-        .projection(doc! {
-            "name": 1,
-            "code": 1,
-            "brand": 1,
-            "category": 1,
-            "status": 1,
-            "vendor": 1,
-            "price": 1,
-            "costPrice": 1,
-            "updatedAt": 1,
-        })
-        .sort(doc! { "updatedAt": -1, "name": 1 })
-        .await
-    {
-        Ok(cursor) => match cursor.try_collect::<Vec<_>>().await {
-            Ok(docs) => docs,
-            Err(_) => return internal_error(),
-        },
-        Err(_) => return internal_error(),
-    };
-
-    let product_ids = products
-        .iter()
-        .filter_map(|product| product.get_object_id("_id").ok())
-        .collect::<Vec<_>>();
-    let mappings_by_product = if product_ids.is_empty() {
-        HashMap::new()
-    } else {
-        match db
-            .collection::<Document>("digiflazzsellerproductmaps")
-            .find(doc! { "product": { "$in": product_ids } })
-            .projection(doc! {
-                "product": 1,
-                "pulsaCode": 1,
-                "price": 1,
-                "sellerMarginFlat": 1,
-                "isActive": 1,
-                "lastSyncStatus": 1,
-                "lastSyncRc": 1,
-                "lastSyncMessage": 1,
-                "lastSyncAt": 1,
-                "updatedAt": 1,
-            })
-            .await
-        {
-            Ok(cursor) => cursor
-                .try_collect::<Vec<_>>()
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|mapping| {
-                    let product_id = mapping.get_object_id("product").ok()?.to_hex();
-                    Some((product_id, mapping))
-                })
-                .collect::<HashMap<_, _>>(),
-            Err(_) => HashMap::new(),
-        }
-    };
-
-    let merged_items = products
-        .into_iter()
-        .map(|product| mapping_product_from_doc(product, &mappings_by_product, &config))
-        .filter(|item| match mapped_filter.as_str() {
-            "mapped" => item
-                .mapping
-                .as_ref()
-                .map(|mapping| !mapping.id.is_empty())
-                .unwrap_or(false),
-            "unmapped" => item
-                .mapping
-                .as_ref()
-                .map(|mapping| mapping.id.is_empty())
-                .unwrap_or(true),
-            _ => true,
-        })
-        .collect::<Vec<_>>();
-
-    let total = merged_items.len() as i64;
-    let total_pages = if total > 0 {
-        ((total as f64) / (page_size as f64)).ceil() as i64
-    } else {
-        1
-    };
-    let start = ((current_page - 1) * page_size).max(0) as usize;
-    let end = (start + page_size as usize).min(merged_items.len());
-    let items = if start < merged_items.len() {
-        merged_items[start..end].to_vec()
-    } else {
-        Vec::new()
-    };
-    let mapped_products = merged_items
-        .iter()
-        .filter(|item| {
-            item.mapping
-                .as_ref()
-                .map(|mapping| !mapping.id.is_empty())
-                .unwrap_or(false)
-        })
-        .count() as i64;
-    let active_mappings = merged_items
-        .iter()
-        .filter(|item| {
-            item.mapping
-                .as_ref()
-                .map(|mapping| mapping.is_active)
-                .unwrap_or(false)
-        })
-        .count() as i64;
-
-    Json(MappingListResponse {
-        items,
-        meta: MappingListMeta {
-            page: current_page,
-            limit: page_size,
-            total,
-            total_pages,
-        },
-        summary: MappingListSummary {
-            total_products: total,
-            mapped_products,
-            active_mappings,
-        },
-    })
-    .into_response()
+pub async fn mappings(headers: axum::http::HeaderMap, State(state): State<Arc<AppState>>, Query(query): Query<MappingQuery>) -> Response {
+    if let Err(response)=require_proxy_context(&headers,&state){return response;}
+    let config=super::seller_config(&state.pg_pool).await;
+    let rows=match sqlx::query("SELECT p.id,p.name,p.code,p.status,p.price_basic,trunc(p.cost_price)::bigint AS cost_price,p.vendor_name,p.updated_at,COALESCE(c.name,p.category,'') AS category,COALESCE(o.name,p.brand,'') AS brand,m.id AS mapping_id,m.buyer_sku_code,m.enabled,m.data AS mapping_data,m.updated_at AS mapping_updated_at FROM products p LEFT JOIN operators o ON o.id=p.operator_id LEFT JOIN categories c ON c.id=o.category_id LEFT JOIN seller_mappings m ON m.channel='digiflazz' AND m.product_id=p.id ORDER BY p.updated_at DESC,p.name ASC").fetch_all(&state.pg_pool).await{Ok(rows)=>rows,Err(_)=>return internal_error()};
+    let search=query.search.unwrap_or_default().trim().to_lowercase();
+    let mapped_filter=query.mapped.unwrap_or_else(||"all".into()).trim().to_lowercase();
+    let mut products=rows.into_iter().filter_map(|row|{
+        let name=row.try_get::<String,_>("name").ok()?;let code=row.try_get::<String,_>("code").ok()?;let brand=row.try_get::<String,_>("brand").ok()?;let category=row.try_get::<String,_>("category").ok()?;
+        if !search.is_empty() && ![&name,&code,&brand,&category].iter().any(|v|v.to_lowercase().contains(&search)){return None;}
+        let item=mapping_product_from_row(&row,&config);
+        let is_mapped=item.mapping.as_ref().is_some_and(|m|!m.id.is_empty());
+        if mapped_filter=="mapped"&&!is_mapped || mapped_filter=="unmapped"&&is_mapped{return None;}
+        Some(item)
+    }).collect::<Vec<_>>();
+    let total=products.len() as i64;let page=query.page.unwrap_or(1).clamp(1,100_000);let limit=query.limit.unwrap_or(20).clamp(1,100);let total_pages=if total==0{1}else{(total+limit-1)/limit};
+    let mapped_products=products.iter().filter(|p|p.mapping.as_ref().is_some_and(|m|!m.id.is_empty())).count() as i64;
+    let active_mappings=products.iter().filter(|p|p.mapping.as_ref().is_some_and(|m|m.is_active)).count() as i64;
+    let start=((page-1)*limit) as usize;let items=if start<products.len(){let end=(start+limit as usize).min(products.len());products.drain(start..end).collect()}else{Vec::new()};
+    Json(MappingListResponse{items,meta:MappingListMeta{page,limit,total,total_pages},summary:MappingListSummary{total_products:total,mapped_products,active_mappings}}).into_response()
 }
 
-pub async fn save_mapping(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<SaveMappingPayload>,
-) -> Response {
-    if let Err(response) = require_proxy_context(&headers, &state) {
-        return response;
-    }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-
-    let product_id_text = payload
-        .product_id
-        .as_ref()
-        .map(text_from_value)
-        .unwrap_or_default();
-    let Ok(product_id) = ObjectId::parse_str(&product_id_text) else {
-        return status_message(axum::http::StatusCode::BAD_REQUEST, "Produk tidak valid");
-    };
-    let pulsa_code = payload
-        .pulsa_code
-        .as_ref()
-        .map(text_from_value)
-        .unwrap_or_default()
-        .to_lowercase();
-    if pulsa_code.is_empty() || !is_valid_pulsa_code(&pulsa_code) {
-        return status_message(
-            axum::http::StatusCode::BAD_REQUEST,
-            "Pulsa code wajib huruf kecil, angka, titik, underscore, atau dash",
-        );
-    }
-
-    let db = client.database(&state.mongo_db);
-    let config = seller_config(&db).await;
-    let products = db.collection::<Document>("products");
-    let product = match products
-        .find_one(doc! { "_id": product_id })
-        .projection(doc! { "name": 1, "code": 1, "brand": 1, "category": 1, "price": 1, "costPrice": 1, "vendor": 1, "status": 1 })
-        .await
-    {
-        Ok(Some(product)) => product,
-        Ok(None) => return status_message(axum::http::StatusCode::NOT_FOUND, "Produk tidak ditemukan"),
-        Err(_) => return internal_error(),
-    };
-
-    let mappings = db.collection::<Document>("digiflazzsellerproductmaps");
-    if let Ok(Some(existing_by_code)) = mappings.find_one(doc! { "pulsaCode": &pulsa_code }).await {
-        if existing_by_code
-            .get_object_id("product")
-            .map(|id| id != product_id)
-            .unwrap_or(true)
-        {
-            return status_message(
-                axum::http::StatusCode::CONFLICT,
-                "Pulsa code sudah dipakai produk lain",
-            );
-        }
-    }
-
-    let existing_mapping = match mappings.find_one(doc! { "product": product_id }).await {
-        Ok(mapping) => mapping,
-        Err(_) => return internal_error(),
-    };
-    let cost_price = read_i64(&product, "costPrice").max(0);
-    let raw_margin_provided = payload
-        .seller_margin_flat
-        .as_ref()
-        .map(|value| !text_from_value(value).is_empty())
-        .unwrap_or(false);
-    let raw_price_provided = payload
-        .price
-        .as_ref()
-        .map(|value| !text_from_value(value).is_empty())
-        .unwrap_or(false);
-    let next_custom_margin = if raw_margin_provided {
-        Some(non_negative_i64(payload.seller_margin_flat.as_ref(), 0))
-    } else if raw_price_provided {
-        Some((non_negative_i64(payload.price.as_ref(), 0) - cost_price).max(0))
-    } else {
-        existing_mapping
-            .as_ref()
-            .and_then(|mapping| optional_i64(mapping, "sellerMarginFlat"))
-    };
-    let recommended_price =
-        seller_recommended_price(cost_price, config.seller_margin_flat, next_custom_margin);
-    let next_status = bool_from_value(payload.is_active.as_ref()).unwrap_or_else(|| {
-        existing_mapping
-            .as_ref()
-            .and_then(|mapping| optional_bool(mapping, "isActive"))
-            .unwrap_or(true)
-    });
-    let now = DateTime::now();
-
-    let mapping_id = if let Some(existing) = existing_mapping {
-        let Some(id) = existing.get_object_id("_id").ok() else {
-            return internal_error();
-        };
-        let mut set_doc = doc! {
-            "pulsaCode": &pulsa_code,
-            "price": recommended_price,
-            "isActive": next_status,
-            "updatedAt": now,
-        };
-        insert_optional_i64(&mut set_doc, "sellerMarginFlat", next_custom_margin);
-        if mappings
-            .update_one(doc! { "_id": id }, doc! { "$set": set_doc })
-            .await
-            .is_err()
-        {
-            return internal_error();
-        }
-        id
-    } else {
-        let id = ObjectId::new();
-        let mut document = doc! {
-            "_id": id,
-            "product": product_id,
-            "pulsaCode": &pulsa_code,
-            "price": recommended_price,
-            "isActive": next_status,
-            "lastSyncStatus": "never",
-            "createdAt": now,
-            "updatedAt": now,
-        };
-        insert_optional_i64(&mut document, "sellerMarginFlat", next_custom_margin);
-        if mappings.insert_one(document).await.is_err() {
-            return internal_error();
-        }
-        id
-    };
-
-    let saved_mapping = match mappings.find_one(doc! { "_id": mapping_id }).await {
-        Ok(Some(mapping)) => mapping,
-        _ => return internal_error(),
-    };
-    Json(SaveMappingResponse {
-        success: true,
-        message: "Mapping Digiflazz Seller berhasil disimpan",
-        mapping: saved_mapping_response(
-            &saved_mapping,
-            &product,
-            cost_price,
-            recommended_price,
-            &config,
-        ),
-        sync_result: None,
-    })
-    .into_response()
+pub async fn save_mapping(headers:axum::http::HeaderMap,State(state):State<Arc<AppState>>,Json(payload):Json<SaveMappingPayload>)->Response{
+    if let Err(response)=require_proxy_context(&headers,&state){return response;}
+    let product_id=payload.product_id.as_ref().map(text_from_value).and_then(|v|Uuid::from_str(&v).ok());let Some(product_id)=product_id else{return status_message(axum::http::StatusCode::BAD_REQUEST,"Produk tidak valid")};
+    let pulsa_code=payload.pulsa_code.as_ref().map(text_from_value).unwrap_or_default().to_lowercase();if pulsa_code.is_empty()||!is_valid_pulsa_code(&pulsa_code){return status_message(axum::http::StatusCode::BAD_REQUEST,"Pulsa code wajib huruf kecil, angka, titik, underscore, atau dash");}
+    let product=match sqlx::query("SELECT id,name,code,trunc(cost_price)::bigint AS cost_price,status FROM products WHERE id=$1").bind(product_id).fetch_optional(&state.pg_pool).await{Ok(Some(row))=>row,Ok(None)=>return status_message(axum::http::StatusCode::NOT_FOUND,"Produk tidak ditemukan"),Err(_)=>return internal_error()};
+    let existing=match sqlx::query("SELECT id,buyer_sku_code,enabled,data,updated_at FROM seller_mappings WHERE channel='digiflazz' AND product_id=$1").bind(product_id).fetch_optional(&state.pg_pool).await{Ok(value)=>value,Err(_)=>return internal_error()};
+    let config=super::seller_config(&state.pg_pool).await;let cost=product.get::<i64,_>("cost_price").max(0);
+    let old_data=existing.as_ref().map(|r|r.get::<Value,_>("data")).unwrap_or_else(||json!({}));
+    let margin_supplied=payload.seller_margin_flat.as_ref().is_some_and(|v|!text_from_value(v).is_empty());let price_supplied=payload.price.as_ref().is_some_and(|v|!text_from_value(v).is_empty());
+    let margin=if margin_supplied{Some(non_negative_i64(payload.seller_margin_flat.as_ref(),0))}else if price_supplied{Some((non_negative_i64(payload.price.as_ref(),0)-cost).max(0))}else{old_data.get("sellerMarginFlat").and_then(Value::as_i64)};
+    let price=seller_recommended_price(cost,config.seller_margin_flat,margin);let enabled=bool_from_value(payload.is_active.as_ref()).unwrap_or_else(||existing.as_ref().map(|r|r.get::<bool,_>("enabled")).unwrap_or(true));
+    let data=json!({"sellerMarginFlat":margin,"lastSyncStatus":old_data.get("lastSyncStatus").and_then(Value::as_str).unwrap_or("never"),"lastSyncRc":old_data.get("lastSyncRc").and_then(Value::as_str).unwrap_or(""),"lastSyncMessage":old_data.get("lastSyncMessage").and_then(Value::as_str).unwrap_or(""),"lastSyncAt":old_data.get("lastSyncAt").cloned().unwrap_or(Value::Null),"price":price});
+    let saved=sqlx::query("INSERT INTO seller_mappings(channel,product_id,buyer_sku_code,enabled,data) VALUES('digiflazz',$1,$2,$3,$4) ON CONFLICT(channel,product_id) DO UPDATE SET buyer_sku_code=EXCLUDED.buyer_sku_code,enabled=EXCLUDED.enabled,data=EXCLUDED.data,updated_at=now() RETURNING id,buyer_sku_code,enabled,data,updated_at").bind(product_id).bind(&pulsa_code).bind(enabled).bind(&data).fetch_one(&state.pg_pool).await;
+    let saved=match saved{Ok(row)=>row,Err(e) if e.as_database_error().is_some_and(|d|d.code().as_deref()==Some("23505"))=>return status_message(axum::http::StatusCode::CONFLICT,"Pulsa code sudah dipakai produk lain"),Err(_)=>return internal_error()};
+    let margin=saved.get::<Value,_>("data").get("sellerMarginFlat").and_then(Value::as_i64);let map_data=saved.get::<Value,_>("data");
+    Json(SaveMappingResponse{success:true,message:"Mapping Digiflazz Seller berhasil disimpan",mapping:SavedMappingItem{id:saved.get::<Uuid,_>("id").to_string(),product_id:product_id.to_string(),product_name:product.get("name"),product_code:product.get("code"),cost_price:cost,recommended_price:price,seller_margin_flat:margin,effective_margin_flat:effective_margin(config.seller_margin_flat,margin),pulsa_code:saved.get("buyer_sku_code"),price,is_active:saved.get("enabled"),last_sync_status:string_value(&map_data,"lastSyncStatus"),last_sync_rc:string_value(&map_data,"lastSyncRc"),last_sync_message:string_value(&map_data,"lastSyncMessage"),last_sync_at:date_value(&map_data,"lastSyncAt")},sync_result:None}).into_response()
 }
 
-pub async fn delete_mapping(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Response {
-    if let Err(response) = require_proxy_context(&headers, &state) {
-        return response;
-    }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let Ok(mapping_id) = ObjectId::parse_str(&id) else {
-        return status_message(axum::http::StatusCode::BAD_REQUEST, "Mapping tidak valid");
-    };
-    let mappings = client
-        .database(&state.mongo_db)
-        .collection::<Document>("digiflazzsellerproductmaps");
-    match mappings.delete_one(doc! { "_id": mapping_id }).await {
-        Ok(result) if result.deleted_count > 0 => Json(serde_json::json!({
-            "success": true,
-            "message": "Mapping Digiflazz Seller berhasil dihapus"
-        }))
-        .into_response(),
-        Ok(_) => status_message(axum::http::StatusCode::NOT_FOUND, "Mapping tidak ditemukan"),
-        Err(_) => internal_error(),
-    }
+pub async fn delete_mapping(headers:axum::http::HeaderMap,State(state):State<Arc<AppState>>,Path(id):Path<String>)->Response{
+    if let Err(response)=require_proxy_context(&headers,&state){return response;}let Some(id)=Uuid::parse_str(&id).ok()else{return status_message(axum::http::StatusCode::BAD_REQUEST,"Mapping tidak valid")};
+    match sqlx::query("DELETE FROM seller_mappings WHERE id=$1 AND channel='digiflazz'").bind(id).execute(&state.pg_pool).await{Ok(r) if r.rows_affected()>0=>Json(json!({"success":true,"message":"Mapping Digiflazz Seller berhasil dihapus"})).into_response(),Ok(_)=>status_message(axum::http::StatusCode::NOT_FOUND,"Mapping tidak ditemukan"),Err(_)=>internal_error()}
 }
 
-pub async fn sync_mapping_by_id(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Response {
-    if let Err(response) = require_proxy_context(&headers, &state) {
-        return response;
-    }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let Ok(mapping_id) = ObjectId::parse_str(&id) else {
-        return status_message(axum::http::StatusCode::BAD_REQUEST, "Mapping tidak valid");
-    };
-    let db = client.database(&state.mongo_db);
-    let mappings = db.collection::<Document>("digiflazzsellerproductmaps");
-    let mapping = match mappings.find_one(doc! { "_id": mapping_id }).await {
-        Ok(Some(mapping)) => mapping,
-        Ok(None) => {
-            return status_message(axum::http::StatusCode::NOT_FOUND, "Mapping tidak ditemukan")
-        }
-        Err(_) => return internal_error(),
-    };
-    match sync_seller_product_mapping(&db, &mapping).await {
-        Ok(result) => Json(result).into_response(),
-        Err(SyncMappingError::CredentialsRequired) => status_message(
-            axum::http::StatusCode::BAD_REQUEST,
-            "Konfigurasi Digiflazz Seller belum lengkap",
-        ),
-        Err(SyncMappingError::Database) => internal_error(),
-    }
+pub async fn sync_mapping_by_id(headers:axum::http::HeaderMap,State(state):State<Arc<AppState>>,Path(id):Path<String>)->Response{
+    if let Err(response)=require_proxy_context(&headers,&state){return response;}let Some(id)=Uuid::parse_str(&id).ok()else{return status_message(axum::http::StatusCode::BAD_REQUEST,"Mapping tidak valid")};
+    let row=match sqlx::query("SELECT m.id,m.product_id,m.buyer_sku_code,m.enabled,m.data,trunc(p.cost_price)::bigint AS cost_price FROM seller_mappings m JOIN products p ON p.id=m.product_id WHERE m.id=$1 AND m.channel='digiflazz'").bind(id).fetch_optional(&state.pg_pool).await{Ok(Some(row))=>row,Ok(None)=>return status_message(axum::http::StatusCode::NOT_FOUND,"Mapping tidak ditemukan"),Err(_)=>return internal_error()};
+    match sync_seller_product_mapping(&state.pg_pool,&row).await{Ok(result)=>Json(result).into_response(),Err(SyncMappingError::CredentialsRequired)=>status_message(axum::http::StatusCode::BAD_REQUEST,"Konfigurasi Digiflazz Seller belum lengkap"),Err(SyncMappingError::Database)=>internal_error()}
 }
 
-pub async fn sync_all_mappings(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Json(payload): Json<LimitPayload>,
-) -> Response {
-    if let Err(response) = require_proxy_context(&headers, &state) {
-        return response;
-    }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let db = client.database(&state.mongo_db);
-    let limit = non_negative_i64(payload.limit.as_ref(), 50).clamp(1, 60);
-    let mappings = match db
-        .collection::<Document>("digiflazzsellerproductmaps")
-        .find(doc! {})
-        .sort(doc! { "updatedAt": -1 })
-        .limit(limit)
-        .await
-    {
-        Ok(cursor) => cursor.try_collect::<Vec<_>>().await.unwrap_or_default(),
-        Err(_) => return internal_error(),
-    };
-    let mut results = Vec::new();
-    for mapping in mappings {
-        let id = document_id(&mapping);
-        let pulsa_code = document_string(&mapping, "pulsaCode");
-        match sync_seller_product_mapping(&db, &mapping).await {
-            Ok(result) => results.push(SellerMappingSyncItem {
-                id,
-                pulsa_code,
-                success: result.success,
-                rc: result.rc,
-                message: result.message,
-            }),
-            Err(SyncMappingError::CredentialsRequired) => {
-                return status_message(
-                    axum::http::StatusCode::BAD_REQUEST,
-                    "Konfigurasi Digiflazz Seller belum lengkap",
-                )
-            }
-            Err(SyncMappingError::Database) => return internal_error(),
-        }
-    }
-    let success_count = results.iter().filter(|item| item.success).count();
-    Json(SellerMappingBulkSyncResponse {
-        success: true,
-        total: results.len(),
-        success_count,
-        failed_count: results.len().saturating_sub(success_count),
-        results,
-    })
-    .into_response()
+pub async fn sync_all_mappings(headers:axum::http::HeaderMap,State(state):State<Arc<AppState>>,Json(payload):Json<LimitPayload>)->Response{
+    if let Err(response)=require_proxy_context(&headers,&state){return response;}let limit=non_negative_i64(payload.limit.as_ref(),50).clamp(1,60);
+    let rows=match sqlx::query("SELECT m.id,m.product_id,m.buyer_sku_code,m.enabled,m.data,p.cost_price FROM seller_mappings m JOIN products p ON p.id=m.product_id WHERE m.channel='digiflazz' ORDER BY m.updated_at DESC LIMIT $1").bind(limit).fetch_all(&state.pg_pool).await{Ok(rows)=>rows,Err(_)=>return internal_error()};
+    let mut results=Vec::new();for row in rows{let id=row.get::<Uuid,_>("id").to_string();let pulsa_code=row.get::<String,_>("buyer_sku_code");match sync_seller_product_mapping(&state.pg_pool,&row).await{Ok(r)=>results.push(SellerMappingSyncItem{id,pulsa_code,success:r.success,rc:r.rc,message:r.message}),Err(SyncMappingError::CredentialsRequired)=>return status_message(axum::http::StatusCode::BAD_REQUEST,"Konfigurasi Digiflazz Seller belum lengkap"),Err(SyncMappingError::Database)=>return internal_error()}}
+    let success_count=results.iter().filter(|item|item.success).count();Json(SellerMappingBulkSyncResponse{success:true,total:results.len(),success_count,failed_count:results.len().saturating_sub(success_count),results}).into_response()
 }
 
-#[derive(Debug)]
-pub(super) enum SyncMappingError {
-    CredentialsRequired,
-    Database,
+#[derive(Debug)]pub(super) enum SyncMappingError{CredentialsRequired,Database}
+pub(super) async fn sync_seller_product_mapping(pool:&sqlx::PgPool,mapping:&PgRow)->Result<SellerMappingSyncResult,SyncMappingError>{
+    let config=super::seller_config(pool).await;if config.username.is_empty()||config.api_key.is_empty(){return Err(SyncMappingError::CredentialsRequired)}
+    let cost=mapping.get::<i64,_>("cost_price").max(0);let data=mapping.get::<Value,_>("data");let margin=data.get("sellerMarginFlat").and_then(Value::as_i64);let price=seller_recommended_price(cost,config.seller_margin_flat,margin);let code=mapping.get::<String,_>("buyer_sku_code");let enabled=mapping.get::<bool,_>("enabled");
+    let sign=format!("{:x}",md5::compute(format!("{}{}{}update_product",config.username,code,config.api_key)));
+    let result=match reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).build().map_err(|_|SyncMappingError::Database)?.post("https://api.digiflazz.com/v1/seller/api/prepaid/product/update").json(&json!({"username":config.username,"pulsa_code":code,"price":price,"status":if enabled{1}else{0},"sign":sign})).send().await{
+        Ok(response)=>{let body=response.json::<Value>().await.unwrap_or_default();let item=body.get("data").unwrap_or(&Value::Null);let rc=item.get("rc").and_then(Value::as_str).unwrap_or("00").trim().to_string();let message=item.get("message").and_then(Value::as_str).unwrap_or("Success").trim().to_string();SellerMappingSyncResult{success:rc=="00",rc,message}},Err(error)=>SellerMappingSyncResult{success:false,rc:"07".into(),message:error.to_string()}};
+    let status=if result.success{"success"}else{"failed"};let mut update=data;update["price"]=json!(price);update["lastSyncStatus"]=json!(status);update["lastSyncRc"]=json!(result.rc);update["lastSyncMessage"]=json!(result.message);update["lastSyncAt"]=json!(chrono::Utc::now().to_rfc3339());
+    if sqlx::query("UPDATE seller_mappings SET data=$2,updated_at=now() WHERE id=$1 AND channel='digiflazz'").bind(mapping.get::<Uuid,_>("id")).bind(update).execute(pool).await.is_err(){return Err(SyncMappingError::Database)}Ok(result)
 }
 
-pub(super) async fn sync_seller_product_mapping(
-    db: &mongodb::Database,
-    mapping: &Document,
-) -> Result<SellerMappingSyncResult, SyncMappingError> {
-    let config = seller_config(db).await;
-    if config.username.is_empty() || config.api_key.is_empty() {
-        return Err(SyncMappingError::CredentialsRequired);
-    }
-    let product_id = mapping.get_object_id("product").ok();
-    let product = if let Some(product_id) = product_id {
-        db.collection::<Document>("products")
-            .find_one(doc! { "_id": product_id })
-            .projection(doc! { "costPrice": 1 })
-            .await
-            .map_err(|_| SyncMappingError::Database)?
-    } else {
-        None
-    };
-    let cost_price = product
-        .as_ref()
-        .map(|doc| read_i64(doc, "costPrice"))
-        .unwrap_or(0);
-    let price = seller_recommended_price(
-        cost_price,
-        config.seller_margin_flat,
-        optional_i64(mapping, "sellerMarginFlat"),
-    );
-    let pulsa_code = document_string(mapping, "pulsaCode");
-    let is_active = mapping.get_bool("isActive").unwrap_or(false);
-    let sign = format!(
-        "{:x}",
-        md5::compute(format!(
-            "{}{}{}update_product",
-            config.username, pulsa_code, config.api_key
-        ))
-    );
-    let payload = serde_json::json!({
-        "username": config.username,
-        "pulsa_code": pulsa_code,
-        "price": price,
-        "status": if is_active { 1 } else { 0 },
-        "sign": sign,
-    });
-
-    let result = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .map_err(|_| SyncMappingError::Database)?
-        .post("https://api.digiflazz.com/v1/seller/api/prepaid/product/update")
-        .json(&payload)
-        .send()
-        .await
-    {
-        Ok(response) => {
-            let data = response
-                .json::<serde_json::Value>()
-                .await
-                .unwrap_or_default();
-            let response_data = data
-                .get("data")
-                .and_then(|value| value.as_object())
-                .cloned()
-                .unwrap_or_default();
-            let rc = response_data
-                .get("rc")
-                .and_then(|value| value.as_str())
-                .unwrap_or("00")
-                .trim()
-                .to_string();
-            let message = response_data
-                .get("message")
-                .and_then(|value| value.as_str())
-                .unwrap_or("Success")
-                .trim()
-                .to_string();
-            SellerMappingSyncResult {
-                success: rc == "00",
-                rc,
-                message,
-            }
-        }
-        Err(error) => SellerMappingSyncResult {
-            success: false,
-            rc: "07".to_string(),
-            message: error.to_string(),
-        },
-    };
-
-    let mapping_id = mapping
-        .get_object_id("_id")
-        .map_err(|_| SyncMappingError::Database)?;
-    db.collection::<Document>("digiflazzsellerproductmaps")
-        .update_one(
-            doc! { "_id": mapping_id },
-            doc! { "$set": {
-                "price": price,
-                "lastSyncStatus": if result.success { "success" } else { "failed" },
-                "lastSyncRc": &result.rc,
-                "lastSyncMessage": &result.message,
-                "lastSyncAt": DateTime::now(),
-                "updatedAt": DateTime::now(),
-            } },
-        )
-        .await
-        .map_err(|_| SyncMappingError::Database)?;
-
-    Ok(result)
+fn mapping_product_from_row(row:&PgRow,config:&SellerConfig)->MappingProductItem{
+    let id=row.get::<Uuid,_>("id");let cost=row.get::<i64,_>("cost_price").max(0);
+    let mapping=if let Ok(mapping_id)=row.try_get::<Uuid,_>("mapping_id"){let data=row.get::<Value,_>("mapping_data");let margin=data.get("sellerMarginFlat").and_then(Value::as_i64);Some(MappingItem{id:mapping_id.to_string(),pulsa_code:row.get("buyer_sku_code"),price:seller_recommended_price(cost,config.seller_margin_flat,margin),seller_margin_flat:margin,effective_margin_flat:effective_margin(config.seller_margin_flat,margin),is_active:row.get("enabled"),last_sync_status:string_value(&data,"lastSyncStatus"),last_sync_rc:string_value(&data,"lastSyncRc"),last_sync_message:string_value(&data,"lastSyncMessage"),last_sync_at:date_value(&data,"lastSyncAt"),updated_at:row.try_get::<chrono::DateTime<chrono::Utc>,_>("mapping_updated_at").map(|d|d.to_rfc3339()).unwrap_or_default()})}else{None};
+    MappingProductItem{id:id.to_string(),name:row.get("name"),code:row.get("code"),brand:row.get("brand"),category:row.get("category"),status:row.get("status"),vendor:row.get("vendor_name"),price:row.get("price_basic"),cost_price:cost,recommended_price:seller_recommended_price(cost,config.seller_margin_flat,None),updated_at:row.try_get::<chrono::DateTime<chrono::Utc>,_>("updated_at").map(|d|d.to_rfc3339()).unwrap_or_default(),mapping}
 }
-
-fn mapping_product_from_doc(
-    product: Document,
-    mappings_by_product: &HashMap<String, Document>,
-    config: &SellerConfig,
-) -> MappingProductItem {
-    let product_id = document_id(&product);
-    let cost_price = read_i64(&product, "costPrice");
-    let mapping = mappings_by_product
-        .get(&product_id)
-        .map(|mapping| mapping_item_from_doc(mapping, cost_price, config));
-
-    MappingProductItem {
-        id: product_id,
-        name: document_string(&product, "name"),
-        code: document_string(&product, "code"),
-        brand: document_string(&product, "brand"),
-        category: document_string(&product, "category"),
-        status: product.get_bool("status").unwrap_or(false),
-        vendor: document_string(&product, "vendor"),
-        price: read_i64(&product, "price"),
-        cost_price,
-        recommended_price: seller_recommended_price(cost_price, config.seller_margin_flat, None),
-        updated_at: date_string(&product, "updatedAt"),
-        mapping,
-    }
-}
-
-fn mapping_item_from_doc(
-    mapping: &Document,
-    cost_price: i64,
-    config: &SellerConfig,
-) -> MappingItem {
-    let seller_margin_flat = optional_i64(mapping, "sellerMarginFlat");
-    MappingItem {
-        id: document_id(mapping),
-        pulsa_code: document_string(mapping, "pulsaCode"),
-        price: seller_recommended_price(cost_price, config.seller_margin_flat, seller_margin_flat),
-        seller_margin_flat,
-        effective_margin_flat: seller_effective_margin(
-            config.seller_margin_flat,
-            seller_margin_flat,
-        ),
-        is_active: mapping.get_bool("isActive").unwrap_or(false),
-        last_sync_status: document_string(mapping, "lastSyncStatus"),
-        last_sync_rc: document_string(mapping, "lastSyncRc"),
-        last_sync_message: document_string(mapping, "lastSyncMessage"),
-        last_sync_at: optional_date_string(mapping, "lastSyncAt"),
-        updated_at: date_string(mapping, "updatedAt"),
-    }
-}
-
-pub(super) fn seller_recommended_price(
-    cost_price: i64,
-    default_margin_flat: i64,
-    override_margin_flat: Option<i64>,
-) -> i64 {
-    cost_price + seller_effective_margin(default_margin_flat, override_margin_flat)
-}
-
-fn seller_effective_margin(default_margin_flat: i64, override_margin_flat: Option<i64>) -> i64 {
-    override_margin_flat.unwrap_or(default_margin_flat).max(0)
-}
-
-fn saved_mapping_response(
-    mapping: &Document,
-    product: &Document,
-    cost_price: i64,
-    recommended_price: i64,
-    config: &SellerConfig,
-) -> SavedMappingItem {
-    let seller_margin_flat = optional_i64(mapping, "sellerMarginFlat");
-    SavedMappingItem {
-        id: document_id(mapping),
-        product_id: product
-            .get_object_id("_id")
-            .map(|id| id.to_hex())
-            .unwrap_or_default(),
-        product_name: document_string(product, "name"),
-        product_code: document_string(product, "code"),
-        cost_price,
-        recommended_price,
-        seller_margin_flat,
-        effective_margin_flat: seller_effective_margin(
-            config.seller_margin_flat,
-            seller_margin_flat,
-        ),
-        pulsa_code: document_string(mapping, "pulsaCode"),
-        price: read_i64(mapping, "price"),
-        is_active: mapping.get_bool("isActive").unwrap_or(false),
-        last_sync_status: document_string(mapping, "lastSyncStatus"),
-        last_sync_rc: document_string(mapping, "lastSyncRc"),
-        last_sync_message: document_string(mapping, "lastSyncMessage"),
-        last_sync_at: optional_date_string(mapping, "lastSyncAt"),
-    }
-}
+pub(super) fn seller_recommended_price(cost:i64,default:i64,override_margin:Option<i64>)->i64{cost.saturating_add(effective_margin(default,override_margin))}
+fn effective_margin(default:i64,custom:Option<i64>)->i64{custom.unwrap_or(default).max(0)}
+fn string_value(value:&Value,key:&str)->String{value.get(key).and_then(Value::as_str).unwrap_or_default().to_string()}
+fn date_value(value:&Value,key:&str)->Option<String>{value.get(key).and_then(Value::as_str).filter(|s|!s.is_empty()).map(str::to_string)}

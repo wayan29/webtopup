@@ -1,4 +1,3 @@
-use mongodb::bson::{oid::ObjectId, Document};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -90,50 +89,6 @@ pub(super) struct TeamAuditLogItem {
     pub(super) created_at: String,
     #[serde(rename = "updatedAt")]
     pub(super) updated_at: String,
-}
-
-#[derive(Serialize)]
-pub(super) struct LoginLogsResponse {
-    pub(super) logs: Vec<LoginLogItem>,
-    #[serde(rename = "currentPage")]
-    pub(super) current_page: i64,
-    #[serde(rename = "totalPages")]
-    pub(super) total_pages: i64,
-    #[serde(rename = "totalLogs")]
-    pub(super) total_logs: i64,
-    #[serde(rename = "pageSize")]
-    pub(super) page_size: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) scope: Option<String>,
-}
-
-#[derive(Serialize)]
-pub(super) struct LoginLogItem {
-    #[serde(rename = "_id")]
-    pub(super) id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) user: Option<String>,
-    pub(super) email: String,
-    pub(super) role: String,
-    pub(super) ip: String,
-    #[serde(rename = "userAgent")]
-    pub(super) user_agent: String,
-    pub(super) status: String,
-    #[serde(rename = "failReason", skip_serializing_if = "Option::is_none")]
-    pub(super) fail_reason: Option<String>,
-    #[serde(rename = "createdAt")]
-    pub(super) created_at: String,
-    #[serde(rename = "updatedAt")]
-    pub(super) updated_at: String,
-}
-
-pub(super) struct ActorScope {
-    pub(super) id: ObjectId,
-    pub(super) name: String,
-    pub(super) email: String,
-    pub(super) role: String,
-    pub(super) is_owner: bool,
-    pub(super) permissions: Document,
 }
 
 #[derive(Deserialize)]

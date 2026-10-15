@@ -1,53 +1,31 @@
 use std::sync::Arc;
 
 use axum::{extract::State, response::IntoResponse, response::Response, Json};
-use futures_util::TryStreamExt;
-use mongodb::bson::{doc, Document};
+use sqlx::Row;
 
 use crate::{security::require_proxy_context, state::AppState};
 
-use super::{
-    date_string, document_id, document_string, unavailable, EmptyStringFallback, SellerLogItem,
-};
+use super::SellerLogItem;
 
 pub async fn logs(headers: axum::http::HeaderMap, State(state): State<Arc<AppState>>) -> Response {
     if let Err(response) = require_proxy_context(&headers, &state) {
         return response;
     }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let docs = match client
-        .database(&state.mongo_db)
-        .collection::<Document>("webhookeventlogs")
-        .find(doc! { "provider": "digiflazz_seller" })
-        .sort(doc! { "createdAt": -1 })
-        .limit(100)
+    let rows = match sqlx::query("SELECT id::text AS id, created_at, event, reference_id, status, message, verified FROM seller_event_logs WHERE channel = 'digiflazz' ORDER BY created_at DESC LIMIT 100")
+        .fetch_all(&state.pg_pool)
         .await
     {
-        Ok(cursor) => match cursor.try_collect::<Vec<_>>().await {
-            Ok(docs) => docs,
-            Err(_) => return super::internal_error(),
-        },
+        Ok(rows) => rows,
         Err(_) => return super::internal_error(),
     };
-
-    Json(
-        docs.into_iter()
-            .map(seller_log_from_doc)
-            .collect::<Vec<_>>(),
-    )
-    .into_response()
+    Json(rows.into_iter().map(|row| SellerLogItem {
+        id: row.try_get("id").unwrap_or_default(),
+        timestamp: row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at").map(|value| value.to_rfc3339()).unwrap_or_default(),
+        event: row.try_get::<String, _>("event").unwrap_or_else(|_| "digiflazz_seller".to_string()),
+        ref_id: row.try_get("reference_id").unwrap_or_default(),
+        status: row.try_get("status").unwrap_or_default(),
+        message: row.try_get("message").unwrap_or_default(),
+        delivered: row.try_get("verified").unwrap_or(false),
+    }).collect::<Vec<_>>()).into_response()
 }
 
-fn seller_log_from_doc(document: Document) -> SellerLogItem {
-    SellerLogItem {
-        id: document_id(&document),
-        timestamp: date_string(&document, "createdAt"),
-        event: document_string(&document, "event").if_empty("digiflazz_seller"),
-        ref_id: document_string(&document, "refId"),
-        status: document_string(&document, "status"),
-        message: document_string(&document, "message"),
-        delivered: document.get_bool("verified").unwrap_or(false),
-    }
-}

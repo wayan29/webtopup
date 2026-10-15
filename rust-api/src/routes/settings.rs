@@ -20,16 +20,16 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 use crate::{
-    security::require_permission,
+    security::require_sql_permission,
     services::bot_protection::kill_switch_enabled,
     state::AppState,
 };
 
 use defaults::default_site_settings;
-use responses::{internal_error, status_message, unavailable};
+use responses::{internal_error, status_message};
 use snapshot::{
     apply_public_bot_protection, load_consistent_snapshot, matches_site_settings_etag,
     site_settings_etag, with_admin_bot_protection_metadata, with_revision_field,
@@ -40,128 +40,45 @@ pub async fn admin_all(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    if let Err(response) = require_permission(&headers, &state, "manageSettings").await {
-        return response;
-    }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
+    if let Err(response) = require_sql_permission(&headers, &state, "manageSettings").await { return response; }
     let defaults = default_site_settings();
-    let selected_keys = defaults.keys().map(String::as_str).collect::<Vec<_>>();
-    let snapshot = match load_consistent_snapshot(client, &state.mongo_db, &selected_keys).await {
+    let keys = defaults.keys().map(String::as_str).collect::<Vec<_>>();
+    let snapshot = match load_consistent_snapshot(&state.pg_pool, &keys).await {
         Ok(snapshot) => snapshot,
-        Err(error) => {
-            eprintln!("Failed to load admin site settings snapshot: {error:?}");
-            return snapshot_error_response(error);
-        }
+        Err(error) => return snapshot_error_response(error),
     };
     let kill_switch = kill_switch_enabled(env::var("TURNSTILE_DISABLED").ok().as_deref());
-    Json(Value::Object(with_admin_bot_protection_metadata(
-        snapshot.settings,
-        snapshot.revision,
-        kill_switch,
-    )))
-    .into_response()
+    Json(Value::Object(with_admin_bot_protection_metadata(snapshot.settings, snapshot.revision, kill_switch))).into_response()
 }
 
-pub async fn public_settings(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> Response {
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    let mut snapshot = match load_consistent_snapshot(
-        client,
-        &state.mongo_db,
-        defaults::public_site_setting_keys(),
-    )
-    .await
-    {
+pub async fn public_settings(headers: HeaderMap, State(state): State<Arc<AppState>>) -> Response {
+    let mut snapshot = match load_consistent_snapshot(&state.pg_pool, defaults::public_site_setting_keys()).await {
         Ok(snapshot) => snapshot,
-        Err(error) => {
-            eprintln!("Failed to load public site settings snapshot: {error:?}");
-            return snapshot_error_response(error);
-        }
+        Err(error) => return snapshot_error_response(error),
     };
-    apply_public_bot_protection(
-        &mut snapshot.settings,
-        kill_switch_enabled(env::var("TURNSTILE_DISABLED").ok().as_deref()),
-    );
+    apply_public_bot_protection(&mut snapshot.settings, kill_switch_enabled(env::var("TURNSTILE_DISABLED").ok().as_deref()));
     let etag = site_settings_etag(snapshot.revision);
     if matches_site_settings_etag(headers.get(header::IF_NONE_MATCH), snapshot.revision) {
-        return (
-            StatusCode::NOT_MODIFIED,
-            [
-                (header::CACHE_CONTROL, "no-cache".to_string()),
-                (header::ETAG, etag),
-            ],
-        )
-            .into_response();
+        return (StatusCode::NOT_MODIFIED, [(header::CACHE_CONTROL, "no-cache".to_string()), (header::ETAG, etag)]).into_response();
     }
-    (
-        StatusCode::OK,
-        [
-            (header::CACHE_CONTROL, "no-cache".to_string()),
-            (header::ETAG, etag),
-        ],
-        Json(Value::Object(with_revision_field(
-            snapshot.settings,
-            snapshot.revision,
-        ))),
-    )
-        .into_response()
+    (StatusCode::OK, [(header::CACHE_CONTROL, "no-cache".to_string()), (header::ETAG, etag)], Json(Value::Object(with_revision_field(snapshot.settings, snapshot.revision)))).into_response()
 }
 
-pub async fn admin_detail(
-    headers: axum::http::HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Path(key): Path<String>,
-) -> Response {
-    if let Err(response) = require_permission(&headers, &state, "manageSettings").await {
-        return response;
-    }
-    let Some(client) = &state.mongo_client else {
-        return unavailable();
-    };
-    if key == SITE_CONFIG_REVISION_KEY {
-        return status_message(StatusCode::NOT_FOUND, "Setting not found");
-    }
+pub async fn admin_detail(headers: HeaderMap, State(state): State<Arc<AppState>>, Path(key): Path<String>) -> Response {
+    if let Err(response) = require_sql_permission(&headers, &state, "manageSettings").await { return response; }
+    if key == SITE_CONFIG_REVISION_KEY { return status_message(StatusCode::NOT_FOUND, "Setting not found"); }
     let defaults = default_site_settings();
-    if !defaults.contains_key(&key) {
-        return status_message(StatusCode::NOT_FOUND, "Setting not found");
-    }
-    let snapshot =
-        match load_consistent_snapshot(client, &state.mongo_db, &[key.as_str()]).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                eprintln!("Failed to load site setting {key}: {error:?}");
-                return snapshot_error_response(error);
-            }
-        };
-    let value = snapshot
-        .settings
-        .get(&key)
-        .cloned()
-        .unwrap_or_else(|| defaults.get(&key).cloned().unwrap_or(Value::Null));
-    Json(json!({ "key": key, "value": value, "revision": snapshot.revision })).into_response()
+    if !defaults.contains_key(&key) { return status_message(StatusCode::NOT_FOUND, "Setting not found"); }
+    let snapshot = match load_consistent_snapshot(&state.pg_pool, &[key.as_str()]).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return snapshot_error_response(error),
+    };
+    let value = snapshot.settings.get(&key).cloned().unwrap_or_else(|| defaults.get(&key).cloned().unwrap_or(Value::Null));
+    Json(json!({"key":key,"value":value,"revision":snapshot.revision})).into_response()
 }
 
-fn snapshot_error_response(error: SnapshotError) -> Response {
-    match error {
-        SnapshotError::Unstable => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "message": "Snapshot pengaturan tidak stabil",
-                "error": {
-                    "code": error.code(),
-                    "message": "Snapshot pengaturan tidak stabil"
-                }
-            })),
-        )
-            .into_response(),
-        SnapshotError::Unavailable => internal_error(),
-    }
+fn snapshot_error_response(_error: SnapshotError) -> Response {
+    internal_error()
 }
 
 pub async fn admin_update(

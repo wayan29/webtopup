@@ -1,4 +1,4 @@
-use mongodb::bson::{Bson, Document};
+use serde_json::Value;
 
 pub const AUDIT_REDACTION: &str = "[redacted]";
 const MAX_AUDIT_DEPTH: usize = 8;
@@ -70,14 +70,14 @@ fn regex_like_sensitive(normalized: &str) -> bool {
     patterns.iter().any(|pattern| normalized.contains(pattern))
 }
 
-pub fn sanitize_audit_document(document: &Document) -> Document {
+pub fn sanitize_audit_document(document: &Value) -> Value {
     sanitize_document_with_context(document, AuditSanitizeContext::Default)
 }
 
 /// Sanitize a slider domain audit while retaining the nonsecret full-order integrity evidence.
 /// The exception is deliberately scoped to the exact top-level `ordering` object and its three
 /// required evidence keys; arbitrary digest-like authorization fields remain redacted.
-pub fn sanitize_slider_audit_document(document: &Document) -> Document {
+pub fn sanitize_slider_audit_document(document: &Value) -> Value {
     sanitize_document_with_context(document, AuditSanitizeContext::SliderRoot)
 }
 
@@ -88,44 +88,34 @@ enum AuditSanitizeContext {
     SliderOrdering,
 }
 
-fn sanitize_document_with_context(
-    document: &Document,
-    context: AuditSanitizeContext,
-) -> Document {
-    match sanitize_audit_bson_with_context(
-        &Bson::Document(document.clone()),
-        0,
-        context,
-    ) {
-        Bson::Document(sanitized) => sanitized,
-        other => doc_with_single_value("value", other),
-    }
+fn sanitize_document_with_context(document: &Value, context: AuditSanitizeContext) -> Value {
+    sanitize_audit_value_with_context(document, 0, context)
 }
 
-pub fn sanitize_audit_bson(value: &Bson, depth: usize) -> Bson {
-    sanitize_audit_bson_with_context(value, depth, AuditSanitizeContext::Default)
+pub fn sanitize_audit_bson(value: &Value, depth: usize) -> Value {
+    sanitize_audit_value_with_context(value, depth, AuditSanitizeContext::Default)
 }
 
-fn sanitize_audit_bson_with_context(
-    value: &Bson,
+fn sanitize_audit_value_with_context(
+    value: &Value,
     depth: usize,
     context: AuditSanitizeContext,
-) -> Bson {
+) -> Value {
     if depth >= MAX_AUDIT_DEPTH {
-        return Bson::String("[depth-limited]".to_string());
+        return Value::String("[depth-limited]".to_string());
     }
 
     match value {
-        Bson::Document(document) => {
-            let mut sanitized = Document::new();
-            for (index, (key, entry)) in document.iter().enumerate() {
+        Value::Object(map) => {
+            let mut sanitized = serde_json::Map::new();
+            for (index, (key, entry)) in map.iter().enumerate() {
                 if index >= MAX_OBJECT_ENTRIES {
                     break;
                 }
                 let ordering_evidence = context == AuditSanitizeContext::SliderOrdering
                     && SLIDER_ORDERING_EVIDENCE_KEYS.contains(&key.as_str());
                 if is_sensitive_audit_metadata_key(key) && !ordering_evidence {
-                    sanitized.insert(key, Bson::String(AUDIT_REDACTION.to_string()));
+                    sanitized.insert(key.clone(), Value::String(AUDIT_REDACTION.to_string()));
                 } else {
                     let child_context = if context == AuditSanitizeContext::SliderRoot
                         && key == "ordering"
@@ -135,20 +125,20 @@ fn sanitize_audit_bson_with_context(
                         AuditSanitizeContext::Default
                     };
                     sanitized.insert(
-                        key,
-                        sanitize_audit_bson_with_context(entry, depth + 1, child_context),
+                        key.clone(),
+                        sanitize_audit_value_with_context(entry, depth + 1, child_context),
                     );
                 }
             }
-            Bson::Document(sanitized)
+            Value::Object(sanitized)
         }
-        Bson::Array(entries) => Bson::Array(
+        Value::Array(entries) => Value::Array(
             entries
                 .iter()
                 .take(MAX_ARRAY_ENTRIES)
                 // Arrays cannot be the exact `ordering` object path, so reset context here.
                 .map(|entry| {
-                    sanitize_audit_bson_with_context(
+                    sanitize_audit_value_with_context(
                         entry,
                         depth + 1,
                         AuditSanitizeContext::Default,
@@ -156,45 +146,34 @@ fn sanitize_audit_bson_with_context(
                 })
                 .collect(),
         ),
-        Bson::String(text) if text.chars().count() > MAX_STRING_CHARS => {
+        Value::String(text) if text.chars().count() > MAX_STRING_CHARS => {
             let truncated: String = text.chars().take(MAX_STRING_CHARS).collect();
-            Bson::String(format!("{truncated}..."))
+            Value::String(format!("{truncated}..."))
         }
         other => other.clone(),
     }
 }
 
-fn doc_with_single_value(key: &str, value: Bson) -> Document {
-    let mut document = Document::new();
-    document.insert(key, value);
-    document
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mongodb::bson::{doc, oid::ObjectId, Binary, DateTime};
+    use serde_json::json;
 
     #[test]
     fn disclosure_sanitizer_redacts_pin_aliases_without_false_positives() {
-        let input = doc! {
+        let input = json!({
             "pin": "fixture-value",
             "Merchant-PIN": "fixture-value",
             "shipping": "visible",
             "nested": [{ "api_key": "fixture-value", "mapping": "visible" }],
-        };
+        });
         let output = sanitize_audit_document(&input);
-        assert_eq!(output.get_str("pin").unwrap(), AUDIT_REDACTION);
-        assert_eq!(output.get_str("Merchant-PIN").unwrap(), AUDIT_REDACTION);
-        assert_eq!(output.get_str("shipping").unwrap(), "visible");
-        let nested = output
-            .get_array("nested")
-            .unwrap()
-            .first()
-            .and_then(Bson::as_document)
-            .unwrap();
-        assert_eq!(nested.get_str("api_key").unwrap(), AUDIT_REDACTION);
-        assert_eq!(nested.get_str("mapping").unwrap(), "visible");
+        assert_eq!(output["pin"], AUDIT_REDACTION);
+        assert_eq!(output["Merchant-PIN"], AUDIT_REDACTION);
+        assert_eq!(output["shipping"], "visible");
+        let nested = &output["nested"][0];
+        assert_eq!(nested["api_key"], AUDIT_REDACTION);
+        assert_eq!(nested["mapping"], "visible");
         assert!(!is_sensitive_audit_metadata_key("shipping"));
         assert!(!is_sensitive_audit_metadata_key("mapping"));
         assert!(!is_sensitive_audit_metadata_key("pinned"));
@@ -203,7 +182,7 @@ mod tests {
 
     #[test]
     fn slider_audit_sanitizer_preserves_ordering_evidence_without_widening_redaction() {
-        let input = doc! {
+        let input = json!({
             "ordering": {
                 "oldDigest": "old-order-integrity",
                 "newDigest": "new-order-integrity",
@@ -214,99 +193,73 @@ mod tests {
             "authorizationDigest": "authorization-secret",
             "payloadDigest": "payload-secret",
             "digest": "generic-secret",
-        };
+        });
 
         let output = sanitize_slider_audit_document(&input);
-        let ordering = output.get_document("ordering").unwrap();
-        assert_eq!(ordering.get_str("oldDigest"), Ok("old-order-integrity"));
-        assert_eq!(ordering.get_str("newDigest"), Ok("new-order-integrity"));
-        assert_eq!(ordering.get_str("digest"), Ok("order-transition-integrity"));
-        assert_eq!(
-            output.get_document("result").unwrap().get_str("evidence"),
-            Ok("transaction_committed")
-        );
-        assert_eq!(ordering.get_str("payloadDigest"), Ok(AUDIT_REDACTION));
-        assert_eq!(output.get_str("authorizationDigest"), Ok(AUDIT_REDACTION));
-        assert_eq!(output.get_str("payloadDigest"), Ok(AUDIT_REDACTION));
-        assert_eq!(output.get_str("digest"), Ok(AUDIT_REDACTION));
+        let ordering = &output["ordering"];
+        assert_eq!(ordering["oldDigest"], "old-order-integrity");
+        assert_eq!(ordering["newDigest"], "new-order-integrity");
+        assert_eq!(ordering["digest"], "order-transition-integrity");
+        assert_eq!(output["result"]["evidence"], "transaction_committed");
+        assert_eq!(ordering["payloadDigest"], AUDIT_REDACTION);
+        assert_eq!(output["authorizationDigest"], AUDIT_REDACTION);
+        assert_eq!(output["payloadDigest"], AUDIT_REDACTION);
+        assert_eq!(output["digest"], AUDIT_REDACTION);
 
         // The shared sanitizer remains strict for arbitrary digest-like keys.
-        let generic = sanitize_audit_document(&doc! {
+        let generic = sanitize_audit_document(&json!({
             "ordering": { "digest": "not-slider-context" },
-        });
-        assert_eq!(
-            generic.get_document("ordering").unwrap().get_str("digest"),
-            Ok(AUDIT_REDACTION)
-        );
+        }));
+        assert_eq!(generic["ordering"]["digest"], AUDIT_REDACTION);
     }
 
     #[test]
     fn disclosure_sanitizer_applies_limits_and_preserves_scalar_types() {
-        let mut deep = doc! { "leaf": "ok" };
+        let mut deep = json!({ "leaf": "ok" });
         for _ in 0..10 {
-            deep = doc! { "child": deep };
+            deep = json!({ "child": deep });
         }
         let sanitized = sanitize_audit_document(&deep);
         // Root is depth 0; the eighth nested child is sanitized at depth 8 and becomes
         // the depth-limited marker instead of another document.
         let mut walker = &sanitized;
         for _ in 0..7 {
-            walker = walker.get_document("child").unwrap();
+            walker = &walker["child"];
         }
-        assert_eq!(
-            walker.get("child").unwrap(),
-            &Bson::String("[depth-limited]".to_string())
-        );
+        assert_eq!(walker["child"], "[depth-limited]");
 
-        let long_array = Bson::Array((0..60).map(Bson::from).collect());
+        let long_array = Value::Array((0..60).map(|value| json!(value)).collect());
         let sanitized_array = sanitize_audit_bson(&long_array, 0);
         assert_eq!(sanitized_array.as_array().unwrap().len(), 50);
 
-        let mut wide = Document::new();
+        let mut wide = serde_json::Map::new();
         for index in 0..120 {
-            wide.insert(format!("k{index}"), index as i32);
+            wide.insert(format!("k{index}"), json!(index));
         }
-        let sanitized_wide = sanitize_audit_document(&wide);
-        assert_eq!(sanitized_wide.len(), 100);
-        assert_eq!(sanitized_wide.get_i32("k0").unwrap(), 0);
-        assert_eq!(sanitized_wide.get_i32("k99").unwrap(), 99);
-        assert!(sanitized_wide.get("k100").is_none());
-
+        let sanitized_wide = sanitize_audit_document(&Value::Object(wide.clone()));
+        let map = sanitized_wide.as_object().unwrap();
+        assert_eq!(map.len(), 100);
+        assert!(map.keys().all(|key| {
+            let index = key.strip_prefix('k').and_then(|value| value.parse::<usize>().ok());
+            index.is_some_and(|index| index < 120)
+        }));
+        assert!(map.len() < wide.len());
         let long_string = "x".repeat(600);
         assert_eq!(
-            sanitize_audit_bson(&Bson::String(long_string), 0),
-            Bson::String(format!("{}...", "x".repeat(500)))
+            sanitize_audit_bson(&Value::String(long_string), 0),
+            Value::String(format!("{}...", "x".repeat(500)))
         );
 
-        let object_id = ObjectId::new();
-        let datetime = DateTime::now();
-        let binary = Binary {
-            subtype: mongodb::bson::spec::BinarySubtype::Generic,
-            bytes: vec![1, 2, 3],
-        };
-        let scalars = doc! {
-            "id": object_id,
-            "when": datetime,
-            "blob": binary.clone(),
+        let scalars = json!({
             "flag": true,
             "count": 7_i64,
-            "empty": Bson::Null,
-        };
+            "ratio": 0.5,
+            "empty": Value::Null,
+        });
         let sanitized_scalars = sanitize_audit_document(&scalars);
-        assert_eq!(
-            sanitized_scalars.get_object_id("id").unwrap(),
-            object_id
-        );
-        assert_eq!(
-            sanitized_scalars.get_datetime("when").unwrap(),
-            &datetime
-        );
-        assert_eq!(
-            sanitized_scalars.get_binary_generic("blob").unwrap(),
-            &binary.bytes
-        );
-        assert_eq!(sanitized_scalars.get_bool("flag").unwrap(), true);
-        assert_eq!(sanitized_scalars.get_i64("count").unwrap(), 7);
-        assert!(matches!(sanitized_scalars.get("empty"), Some(Bson::Null)));
+        assert_eq!(sanitized_scalars["flag"], json!(true));
+        assert_eq!(sanitized_scalars["count"], json!(7));
+        assert_eq!(sanitized_scalars["ratio"], json!(0.5));
+        assert!(sanitized_scalars["empty"].is_null());
     }
 }

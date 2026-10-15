@@ -1,12 +1,13 @@
 pub mod audit_sanitize;
 pub mod bot_protection;
 pub mod correlation;
+pub mod flash_sales;
 pub mod identifier_integrity;
 pub mod idempotency;
 pub mod local_fault;
 pub mod managed_asset_registry;
 pub mod managed_assets;
-pub mod product_id;
-pub mod seller_integrity;
+pub mod seller_sql;
 pub mod seller_secrecy;
+pub mod seller_secrets;
 pub mod slider_readiness;

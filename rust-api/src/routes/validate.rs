@@ -5,4 +5,5 @@ pub(in crate::routes) mod operators;
 pub(in crate::routes) mod provider;
 pub(in crate::routes) mod types;
 
+pub use cache::invalidate_validation_cache;
 pub use handlers::{freefire, mobilelegends, operator};

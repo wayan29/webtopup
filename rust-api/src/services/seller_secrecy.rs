@@ -4,8 +4,7 @@
 //! allowlisted operational fields. Credentials, signatures, raw request
 //! bodies, and unknown nested keys must never be persisted.
 
-use mongodb::bson::{doc, DateTime, Document};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// Policy table for tests/hygiene verification only; the request path never
 /// needs detector-based redaction because builders are allowlist-only.
@@ -42,9 +41,9 @@ pub fn safe_seller_event_document(
     message: &str,
     verified: bool,
     request_ip: &str,
-) -> Document {
-    let now = DateTime::now();
-    doc! {
+) -> Value {
+    let now = chrono::Utc::now().to_rfc3339();
+    json!({
         "provider": provider,
         "event": event,
         "refId": bounded(ref_id, MAX_REF_ID_CHARS),
@@ -54,7 +53,7 @@ pub fn safe_seller_event_document(
         "requestIp": bounded(request_ip, MAX_REQUEST_IP_CHARS),
         "createdAt": now,
         "updatedAt": now,
-    }
+    })
 }
 
 /// Detector used by secrecy policy tests and hygiene verification. Runtime
@@ -87,7 +86,7 @@ mod tests {
             "127.0.0.1",
         );
         assert_eq!(
-            event.keys().cloned().collect::<std::collections::BTreeSet<_>>(),
+            event.as_object().unwrap().keys().cloned().collect::<std::collections::BTreeSet<_>>(),
             [
                 "provider",
                 "event",
@@ -103,8 +102,8 @@ mod tests {
             .map(str::to_string)
             .collect(),
         );
-        assert!(!event.contains_key("raw"));
-        assert!(!event.contains_key("rawRequest"));
+        assert!(!event.as_object().unwrap().contains_key("raw"));
+        assert!(!event.as_object().unwrap().contains_key("rawRequest"));
     }
 
     #[test]
