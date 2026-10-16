@@ -13,7 +13,6 @@
     "api-v2:check": "cd rust-api && . \"$HOME/.cargo/env\" && cargo fmt --check && cargo check",
     "api-v2:build": "cd rust-api && . \"$HOME/.cargo/env\" && cargo build",
     "api-v2:smoke": "node scripts/smoke/api-v2-read-smoke.js",
-    "api-v2:seed:ci": "node scripts/smoke/seed-api-v2-ci-fixtures.js",
     "api-v2:smoke:sql": "node scripts/smoke/sql-financial-smoke.js",
     "api-v2:smoke:sql-profile": "node scripts/smoke/sql-member-profile-smoke.js",
     "api-v2:smoke:sql-owner": "node scripts/smoke/sql-owner-bootstrap-smoke.js",
@@ -29,22 +28,11 @@
     "api-v2:smoke:sql-margin": "node scripts/smoke/sql-margin-vendor-smoke.js",
     "api-v2:smoke:sql-deposits": "node scripts/smoke/sql-deposits-smoke.js",
     "api-v2:smoke:guards": "API_V2_DIRECT_URL=http://127.0.0.1:9010 npm run api-v2:smoke",
-    "api-v2:smoke:mutations": "node scripts/smoke/api-v2-mutation-smoke.js",
-    "api-v2:smoke:providers": "node scripts/smoke/api-v2-provider-smoke.js",
     "api-v2:verify:local": "npm run api-v2:check && git diff --check && npm run build && npm run api-v2:smoke",
     "api-v2:verify:local:read": "npm run api-v2:verify:local",
     "api-v2:verify:local:read:guarded": "npm run api-v2:check && git diff --check && npm run build && npm run api-v2:smoke:guards",
     "api-v2:verify:local:guards": "npm run api-v2:smoke:guards",
-    "api-v2:verify:local:mutations": "API_V2_DIRECT_URL=http://127.0.0.1:9010 RUN_API_V2_MUTATION_SMOKE=1 REQUIRE_MUTATION_SMOKE_MONGO=1 npm run api-v2:smoke:mutations",
-    "api-v2:verify:local:full": "npm run api-v2:verify:local:read && npm run api-v2:verify:local:mutations",
     "api-v2:gateway-order:check": "node scripts/smoke/check-api-v2-gateway-order.js",
-    "api-v2:dry-run:transaction-create": "node scripts/smoke/api-v2-transaction-create-dry-run.js",
-    "api-v2:smoke:transaction-create-readiness": "REQUIRE_TRANSACTION_CREATE_READINESS=1 node scripts/smoke/api-v2-provider-smoke.js",
-    "staging:check": "node scripts/smoke/api-v2-staging-readiness.js smoke",
-    "staging:smoke": "node scripts/smoke/run-api-v2-staging.js smoke",
-    "staging:smoke:mutations": "node scripts/smoke/run-api-v2-staging.js mutation",
-    "staging:smoke:providers": "node scripts/smoke/run-api-v2-staging.js provider",
-    "staging:dry-run:transaction-create": "node scripts/smoke/run-api-v2-staging.js dryRun",
     "api-v1:removal-readiness": "node scripts/smoke/api-v1-removal-readiness.js",
     "api-v1:usage-report": "node scripts/smoke/api-v1-usage-report.js",
     "build:client:transaction-create-v2": "cd client && VITE_TRANSACTION_CREATE_V2_ONLY=true npm run build",
@@ -72,9 +60,7 @@
     "dev-verify:reset": "npm run dev-verify -- reset",
     "dev-verify:down": "npm run dev-verify -- down",
     "dev-verify:status": "npm run dev-verify -- status",
-    "test:dev-verify:unit": "node --import tsx --test tools/dev-verification/unit/*.test.ts client/src/lib/auditLogQuery.test.ts client/src/lib/siteConfigMutation.test.ts client/src/lib/adminNav.test.ts client/src/lib/sliderPresentation.test.ts client/src/lib/vendorHealth.test.ts client/src/lib/digiflazzSellerCenter.test.ts client/src/lib/openApiSettings.test.ts client/src/lib/botProtection.test.ts && node --test scripts/security/*.test.js",
-    "site-config:identifier-readiness": "cd rust-api && cargo run --bin site_config_identifier_readiness --",
-    "seller-center:hygiene": "node scripts/security/scrub-seller-secrets.js"
+    "site-config:identifier-readiness": "cd rust-api && cargo run --bin site_config_identifier_readiness --"
   },
   "keywords": [
     "ppob",
@@ -85,7 +71,6 @@
   "devDependencies": {
     "@playwright/test": "^1.61.0",
     "concurrently": "^8.2.2",
-    "mongodb": "^6.21.0",
     "tsx": "^4.23.1"
   }
 }
